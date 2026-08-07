@@ -1,0 +1,42 @@
+schema: spec-driven
+
+context: |
+  Project: exchange-sync
+
+  Architecture:
+  - Simple android app. Sync system calendar with exchange server
+  - latest gradle, kotlin and java versions
+
+  Development:
+  - Prefer the simplest implementation satisfying the specification
+  - Avoid adding production dependencies without justification
+  - Never commit secrets, credentials, tokens, or private keys
+
+  Testing:
+  - Unit tests only
+  - Every bug fix must include a regression test
+
+  Git:
+  - Conventional Commits
+  - One OpenSpec change normally maps to one branch or worktree
+
+rules:
+  proposal:
+    - Clearly state the problem and expected outcome
+    - Include explicit non-goals
+
+  specs:
+    - Use observable behavior rather than implementation details
+    - Cover success, validation, authorization, error, and boundary scenarios
+    - Use WHEN and THEN scenarios
+    - Avoid vague words such as fast, convenient, reliable, or secure without criteria
+
+  design:
+    - Explain important alternatives and why they were rejected
+    - Identify trust boundaries and sensitive data flows
+    - Reuse existing project patterns where possible
+
+  tasks:
+    - Make every task independently verifiable
+    - Include tests in the same task group as the behavior
+    - Order tasks so the project remains buildable
