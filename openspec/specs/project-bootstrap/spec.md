@@ -7,7 +7,7 @@ Defines the runnable, locally verifiable Android project foundation on which lat
 ## Requirements
 
 ### Requirement: Reproducible local build
-The project SHALL provide a checked-in build launcher and pinned dependency versions that produce an installable debug APK on a machine with JDK 21 and the Android 16 SDK, without requiring a separately installed Gradle executable.
+The project SHALL provide a checked-in build launcher and pinned dependency versions that produce an installable debug APK on a machine with JDK 21 and the Android 16 SDK, without requiring a separately installed Gradle executable or locally supplied private-CA files.
 
 #### Scenario: Clean debug build
 - **WHEN** a developer checks out the repository, provides the local Android SDK path, and runs the documented debug build command
@@ -16,6 +16,10 @@ The project SHALL provide a checked-in build launcher and pinned dependency vers
 #### Scenario: Machine-local SDK configuration is absent
 - **WHEN** the build is run without an Android SDK path available to Gradle
 - **THEN** the build fails without modifying tracked project files or substituting a bundled SDK
+
+#### Scenario: Machine-local private CA assets are absent
+- **WHEN** the build runs without the ignored local private-CA asset directory
+- **THEN** the build still produces the application and the resulting application retains Android system certificate trust
 
 ### Requirement: Android 16 application boundary
 The application SHALL declare Android 16 as its minimum and target platform and SHALL be installable directly on an Android 16 device without any Google Play publishing step.
@@ -27,17 +31,6 @@ The application SHALL declare Android 16 as its minimum and target platform and 
 #### Scenario: Older Android device
 - **WHEN** installation is attempted on a device below Android 16
 - **THEN** Android rejects the package as incompatible
-
-### Requirement: Minimal launchable vertical slice
-The bootstrap application SHALL open a single settings-oriented shell that identifies the application and reports that no Exchange connection is configured, without contacting a server or requesting certificate, calendar, account, or notification access.
-
-#### Scenario: First launch
-- **WHEN** the user launches the newly installed bootstrap application
-- **THEN** the application displays the settings shell and an unconfigured status without requiring credentials or permissions
-
-#### Scenario: Bootstrap remains offline and side-effect free
-- **WHEN** the settings shell is opened or recreated
-- **THEN** the application performs no Exchange request, writes no calendar data, schedules no background synchronization, and persists no connection profile
 
 ### Requirement: Unit-only automated verification
 The project SHALL provide JVM unit-test tasks for production logic and SHALL exclude instrumentation, emulator, connected-device, end-to-end, and integration tests from the bootstrap verification suite.
@@ -70,7 +63,7 @@ The project SHALL provide documented commands that compile all production and un
 - **THEN** aggregate verification fails and identifies the affected source or resource
 
 ### Requirement: Safe local project configuration
-The repository SHALL keep generated outputs, machine-local SDK configuration, caches, debug signing material, production signing material, credentials, private keys, client certificates, and server certificates out of tracked source files.
+The repository SHALL keep generated outputs, machine-local SDK configuration, caches, debug signing material, production signing material, credentials, private keys, client certificates, server certificates, and locally supplied private-CA assets out of tracked source files.
 
 #### Scenario: Local build generates machine state
 - **WHEN** a developer syncs, builds, tests, or installs the application locally
@@ -79,6 +72,10 @@ The repository SHALL keep generated outputs, machine-local SDK configuration, ca
 #### Scenario: Bootstrap is inspected for product secrets
 - **WHEN** the tracked bootstrap files are reviewed
 - **THEN** they contain no Exchange credentials, certificate material, signing secrets, or private server endpoints
+
+#### Scenario: Private CA assets are installed locally
+- **WHEN** private root or issuing CA files are placed in the documented Android asset location
+- **THEN** version control ignores those files and the original temporary certificate directory is no longer used
 
 ### Requirement: Documented SDD development contract
 The repository SHALL document its product boundary, module responsibilities, dependency direction, OpenSpec sources of truth, required SDD workflow, local prerequisites, and exact commands for build, unit tests, lint, aggregate verification, and device installation.

@@ -30,3 +30,6 @@ captures/
 *.crt
 *.der
 *.csr
+
+# Optional machine-local server trust anchors packaged as Android assets
+/infrastructure/src/main/assets/tls/

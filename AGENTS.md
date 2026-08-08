@@ -25,11 +25,11 @@ The explored first product stage has these constraints:
 - Android 16 is the only supported platform. Distribution is direct local
   installation, not Google Play.
 
-These are product constraints, not bootstrap functionality. The current
-bootstrap implements only a side-effect-free, not-configured settings shell.
-ActiveSync, mTLS, KeyChain selection, trust configuration, persistence,
-Calendar Provider writes, WorkManager scheduling, reminders, and notifications
-require later OpenSpec changes before production code is added.
+The current implemented boundary is connection configuration and verification:
+the app validates one profile, uses Android KeyChain for client-certificate
+selection, checks HTTPS/mTLS and ActiveSync `OPTIONS`, and persists settings only
+after success. Calendar Provider writes, WorkManager scheduling, reminders, and
+notifications still require later OpenSpec changes.
 
 ## Module structure and ownership
 
@@ -42,13 +42,14 @@ The permitted dependency direction is:
 
 - `:app` owns the application manifest, launcher activity, app resources, and
   manual dependency composition. Keep reusable logic out of this module.
-- `:core` is pure Kotlin/JVM and owns platform-independent state, models, and
-  contracts. It must not depend on Android and uses explicit public API mode.
-- `:feature:settings` owns settings presentation state and Compose UI. It may
-  depend on `:core` but must never depend on `:infrastructure`.
-- `:infrastructure` is the future home of Android and server adapters. During
-  bootstrap it intentionally contains no product classes or integration
-  libraries and depends only on `:core`.
+- `:core` is pure Kotlin/JVM and owns platform-independent connection models,
+  validation, failure types, use cases, and adapter contracts. It must not
+  depend on Android and uses explicit public API mode.
+- `:feature:settings` owns settings presentation state, ViewModel, and Compose
+  UI. It may depend on `:core` but must never depend on `:infrastructure`.
+- `:infrastructure` owns Android KeyChain access, DataStore persistence,
+  system-plus-local TLS trust, and the ActiveSync HTTP probe. It depends only on
+  `:core`.
 
 Do not split speculative Exchange, certificate, calendar, persistence, or sync
 modules before an active OpenSpec change identifies stable responsibilities.
@@ -70,6 +71,13 @@ Local prerequisites:
 - An Android 16 device connected through `adb` only when installing manually.
 - Network access on the first build to resolve the pinned wrapper and
   dependencies. A global Gradle installation is not required or supported.
+
+Optional private-CA trust anchors for a local build belong only in
+`infrastructure/src/main/assets/tls/`. The directory is ignored in full and may
+be absent. The loader accepts X.509 certificates encoded as PEM or DER; never
+place private keys or client certificates there. Without local anchors the app
+still builds and retains Android system trust, while private-CA validation
+reports a user-actionable configuration error.
 
 Create an untracked `local.properties` at the repository root when the Android
 SDK is not otherwise discoverable:
@@ -108,12 +116,11 @@ Android launch/install behavior is verified manually on an Android 16 device.
 
 Generated build outputs, Gradle/Kotlin/IDE state, APKs, SDK paths, debug
 keystores, production signing material, credentials, private keys, client
-certificates, and private server endpoints must not be tracked. The bootstrap
-contains no server certificate material. A later OpenSpec change may explicitly
-add public CA trust anchors only after verifying that they contain no private
-key and revising the certificate ignore rules deliberately. Ignore rules are
-only a guardrail: do not create secrets inside the repository, and inspect the
-tracked diff before completion.
+certificates, private server endpoints, and locally supplied public CA trust
+anchors must not be tracked. Local public CA anchors are packaged from the
+ignored asset directory at build time. Ignore rules are only a guardrail: do not
+create secrets inside the repository, and inspect the tracked diff before
+completion.
 
 ## Sources of truth
 

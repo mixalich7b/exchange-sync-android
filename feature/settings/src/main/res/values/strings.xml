@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="settings_title">Подключение к Exchange</string>
+    <string name="email_label">Адрес электронной почты</string>
+    <string name="account_label">Имя пользователя (domain\\login)</string>
+    <string name="server_label">Сервер</string>
+    <string name="server_supporting_text">HTTPS, порт 443</string>
+    <string name="client_certificate_label">Клиентский сертификат</string>
+    <string name="choose_certificate">Выбрать сертификат</string>
+    <string name="replace_certificate">Сменить сертификат</string>
+    <string name="no_certificate_selected">Сертификат не выбран</string>
+    <string name="save_connection">Сохранить</string>
+    <string name="connection_loading">Загрузка сохранённых настроек…</string>
+    <string name="connection_checking">Проверка подключения…</string>
+    <string name="connection_connected">Подключение проверено</string>
+    <string name="connection_not_configured">Подключение не настроено</string>
+    <string name="error_email">Укажите корректный адрес электронной почты</string>
+    <string name="error_account">Укажите имя в формате domain\\login</string>
+    <string name="error_server">Укажите hostname без схемы, пути и порта</string>
+    <string name="error_certificate_required">Выберите клиентский сертификат</string>
+    <string name="error_certificate_unavailable">Сертификат недоступен. Выберите его снова</string>
+    <string name="error_server_not_found">Сервер не найден. Проверьте его адрес</string>
+    <string name="error_connection">Не удалось подключиться к серверу</string>
+    <string name="error_timeout">Сервер не ответил вовремя</string>
+    <string name="error_server_trust">Не удалось проверить TLS-сертификат сервера</string>
+    <string name="error_hostname">TLS-сертификат выдан для другого имени сервера</string>
+    <string name="error_local_ca_missing">Для этого сервера отсутствуют локальные сертификаты частного УЦ</string>
+    <string name="error_local_ca_invalid">Локальные сертификаты частного УЦ повреждены или не поддерживаются</string>
+    <string name="error_mtls">Сервер отклонил клиентский сертификат</string>
+    <string name="error_access">Сервер отклонил аутентификацию или доступ</string>
+    <string name="error_endpoint">ActiveSync endpoint не найден или не поддерживает OPTIONS</string>
+    <string name="error_redirect">Сервер вернул небезопасную или некорректную цепочку редиректов</string>
+    <string name="error_server_response">На сервере произошла ошибка</string>
+    <string name="error_protocol">Сервер не поддерживает необходимые возможности ActiveSync</string>
+    <string name="error_persistence">Подключение проверено, но настройки сохранить не удалось</string>
+    <string name="error_unknown">Не удалось проверить подключение</string>
+</resources>
