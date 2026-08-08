@@ -129,8 +129,7 @@ tracked diff before completion.
 ## OpenSpec and Superpowers integration
 
 - Use OpenSpec for requirements, scenarios, design decisions, and task tracking.
-- Use Superpowers for worktree isolation, TDD, systematic debugging,
-  code review, and verification.
+- Use Superpowers for TDD, systematic debugging, code review, and verification.
 - Superpowers brainstorming may be used while exploring the problem, but its
   conclusions must be written into the active OpenSpec change.
 - Superpowers writing-plans must not create a second competing task plan.
@@ -144,13 +143,12 @@ tracked diff before completion.
 1. Explore the problem using `$openspec-explore` when requirements are unclear.
 2. Create or update the change using `$openspec-propose`.
 3. Review proposal, specs, design, and tasks before modifying production code.
-4. Use an isolated branch or worktree for implementation.
-5. Implement using `$test-driven-development`.
-6. Use `$systematic-debugging` for unexpected behavior instead of speculative fixes.
-7. Run all relevant tests, linting, type checks, and builds.
-8. Validate the implementation with `$openspec-verify-change`.
-9. Run Codex `/review` against the resulting diff.
-10. Sync accepted specifications and archive the completed change.
+4. Implement using `$test-driven-development`.
+5. Use `$systematic-debugging` for unexpected behavior instead of speculative fixes.
+6. Run all relevant tests, linting, type checks, and builds.
+7. Validate the implementation with `$openspec-verify-change`.
+8. Run Codex `/review` against the resulting diff.
+9. Sync accepted specifications and archive the completed change.
 
 ## Small-change exception
 
