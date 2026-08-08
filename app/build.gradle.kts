@@ -15,6 +15,27 @@ android {
         versionName = "0.1.0"
     }
 
+    val releaseStoreFile = providers.gradleProperty("EXCHANGE_SYNC_RELEASE_STORE_FILE").orNull
+    if (releaseStoreFile != null) {
+        signingConfigs {
+            create("release") {
+                storeFile = file(releaseStoreFile)
+                storePassword = providers.gradleProperty("EXCHANGE_SYNC_RELEASE_STORE_PASSWORD").get()
+                keyAlias = providers.gradleProperty("EXCHANGE_SYNC_RELEASE_KEY_ALIAS").get()
+                keyPassword = providers.gradleProperty("EXCHANGE_SYNC_RELEASE_KEY_PASSWORD").get()
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            isDebuggable = false
+            signingConfig = signingConfigs.findByName("release")
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
