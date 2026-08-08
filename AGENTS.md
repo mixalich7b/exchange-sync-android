@@ -1,5 +1,120 @@
 # Repository instructions
 
+## Product summary and current boundary
+
+The product is an Android 16 application that will synchronize the primary
+calendar from a private Microsoft Exchange server into the device calendar.
+The planned protocol is Exchange ActiveSync over HTTPS on port 443 with mTLS;
+the application must implement the integration itself and must not register or
+use Android's built-in Exchange account integration.
+
+The explored first product stage has these constraints:
+
+- One locally configured profile with email address, `domain\\login`, server
+  hostname, and a client-certificate alias selected from Android's installed
+  VPN and app certificates.
+- One-way, read-only synchronization from Exchange to Android for the primary
+  calendar only, retaining all history returned by the server and all future
+  events, including reminders.
+- Standard periodic background synchronization and a system notification for
+  a persistent user-actionable synchronization problem.
+- Server TLS trust combines app-bundled private root/issuing CA certificates
+  with the Android system trust store so a server can also use Let's Encrypt.
+  Private CA certificates must never be added to the system trust store, and
+  seamless server-certificate rollover is not required.
+- Android 16 is the only supported platform. Distribution is direct local
+  installation, not Google Play.
+
+These are product constraints, not bootstrap functionality. The current
+bootstrap implements only a side-effect-free, not-configured settings shell.
+ActiveSync, mTLS, KeyChain selection, trust configuration, persistence,
+Calendar Provider writes, WorkManager scheduling, reminders, and notifications
+require later OpenSpec changes before production code is added.
+
+## Module structure and ownership
+
+The permitted dependency direction is:
+
+```text
+:app -> :feature:settings -> :core
+     -> :infrastructure  -> :core
+```
+
+- `:app` owns the application manifest, launcher activity, app resources, and
+  manual dependency composition. Keep reusable logic out of this module.
+- `:core` is pure Kotlin/JVM and owns platform-independent state, models, and
+  contracts. It must not depend on Android and uses explicit public API mode.
+- `:feature:settings` owns settings presentation state and Compose UI. It may
+  depend on `:core` but must never depend on `:infrastructure`.
+- `:infrastructure` is the future home of Android and server adapters. During
+  bootstrap it intentionally contains no product classes or integration
+  libraries and depends only on `:core`.
+
+Do not split speculative Exchange, certificate, calendar, persistence, or sync
+modules before an active OpenSpec change identifies stable responsibilities.
+Do not add a dependency-injection framework for the current manual composition
+root.
+
+## Toolchain and local environment
+
+The supported, pinned build matrix is JDK 21, Java/Kotlin bytecode target 17,
+Gradle Wrapper 9.5.1, Android Gradle Plugin 9.1.1, Kotlin/Compose plugin 2.4.10,
+and Android API 36 for `minSdk`, `targetSdk`, and `compileSdk`. Dependency
+versions belong in `gradle/libs.versions.toml`; dynamic versions and
+project-local repositories are forbidden.
+
+Local prerequisites:
+
+- JDK 21 available to Gradle through `JAVA_HOME` or the active shell.
+- Android SDK Platform 36 and Build Tools 36.0.0.
+- An Android 16 device connected through `adb` only when installing manually.
+- Network access on the first build to resolve the pinned wrapper and
+  dependencies. A global Gradle installation is not required or supported.
+
+Create an untracked `local.properties` at the repository root when the Android
+SDK is not otherwise discoverable:
+
+```properties
+sdk.dir=/absolute/path/to/Android/sdk
+```
+
+Never commit `local.properties` or replace it with a repository-bundled SDK.
+
+## Build and verification commands
+
+Use the checked-in wrapper for every Gradle operation:
+
+- `./gradlew :app:assembleDebug` builds the installable debug APK.
+- `./gradlew test` runs every JVM/Android-local unit test.
+- `./gradlew lintDebug` runs Android Lint for all Android modules.
+- `./gradlew verifyBootstrap` compiles production and unit-test sources, runs
+  every local unit test and Android Lint task, and assembles the debug APK.
+- `./gradlew :app:installDebug` installs the debug APK on a connected Android
+  16 device; launching and inspecting the shell remains a manual check.
+
+The APK is written to `app/build/outputs/apk/debug/app-debug.apk`. Kotlin and
+Java compilation are the type checks. Kotlin/Java compiler warnings and Android
+Lint warnings are errors except for narrowly documented toolchain-version and
+adaptive-icon detector conflicts; there is no lint baseline, Detekt, or Ktlint.
+
+## Test policy and repository hygiene
+
+Automated tests in this stage are local JVM unit tests under `src/test` only.
+Do not add `src/androidTest`, instrumentation runners, emulator/connected test
+tasks, Robolectric, integration tests, or end-to-end tests. Every observable
+behavior and bug fix must follow test-first RED-GREEN-REFACTOR and include a
+unit regression test where the unit-only boundary can exercise the behavior.
+Android launch/install behavior is verified manually on an Android 16 device.
+
+Generated build outputs, Gradle/Kotlin/IDE state, APKs, SDK paths, debug
+keystores, production signing material, credentials, private keys, client
+certificates, and private server endpoints must not be tracked. The bootstrap
+contains no server certificate material. A later OpenSpec change may explicitly
+add public CA trust anchors only after verifying that they contain no private
+key and revising the certificate ignore rules deliberately. Ignore rules are
+only a guardrail: do not create secrets inside the repository, and inspect the
+tracked diff before completion.
+
 ## Sources of truth
 
 - `openspec/specs/` describes the currently accepted system behavior.
@@ -60,4 +175,3 @@ A task is not complete until:
 - Behavior matches the OpenSpec scenarios
 - Documentation and configuration are updated when needed
 - No secrets or generated local files are included
-

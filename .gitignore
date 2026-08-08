@@ -1,1 +1,32 @@
 .worktrees/
+
+# Machine-local Android and IDE configuration
+local.properties
+.idea/
+*.iml
+.DS_Store
+
+# Gradle and Kotlin state
+.gradle/
+.kotlin/
+**/build/
+
+# Android and native build outputs
+.externalNativeBuild/
+.cxx/
+captures/
+*.apk
+*.aab
+*.ap_
+
+# Signing keys, private keys, and certificates
+*.jks
+*.keystore
+*.key
+*.pem
+*.p12
+*.pfx
+*.cer
+*.crt
+*.der
+*.csr
