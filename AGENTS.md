@@ -126,6 +126,10 @@ completion.
 
 - `openspec/specs/` describes the currently accepted system behavior.
 - `openspec/changes/<change-name>/` describes an in-progress change.
+- `docs/` explains the currently implemented architecture and capabilities for
+  developers. It is not normative and must agree with `openspec/specs/`.
+- Archived OpenSpec changes preserve historical decisions and must not be
+  treated as current-state documentation.
 - For OpenSpec-managed changes, its `proposal.md`, `specs/`, `design.md`,
   and `tasks.md` are the canonical planning artifacts.
 - Do not create a parallel implementation plan or design document when the
@@ -155,7 +159,11 @@ completion.
 6. Run all relevant tests, linting, type checks, and builds.
 7. Validate the implementation with `$openspec-verify-change`.
 8. Run Codex `/review` against the resulting diff.
-9. Sync accepted specifications and archive the completed change.
+9. Immediately before archiving, update every affected file under `docs/` to
+   match the final implementation and accepted main specs, remove stale
+   statements, and verify that planned behavior is not presented as implemented.
+   Do not archive while affected developer documentation is knowingly stale.
+10. Sync accepted specifications and archive the completed change.
 
 ## Small-change exception
 
@@ -178,5 +186,7 @@ A task is not complete until:
 - Lint and type checks pass
 - The diff contains no unrelated modifications
 - Behavior matches the OpenSpec scenarios
-- Documentation and configuration are updated when needed
+- Affected developer documentation reflects the post-change implemented state
+  and contains no stale or prematurely documented behavior; configuration is
+  updated when needed
 - No secrets or generated local files are included
