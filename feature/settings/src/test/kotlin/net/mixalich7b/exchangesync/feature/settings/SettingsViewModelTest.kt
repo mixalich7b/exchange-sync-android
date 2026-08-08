@@ -1,5 +1,6 @@
 package net.mixalich7b.exchangesync.feature.settings
 
+import java.time.Instant
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -17,8 +18,13 @@ import net.mixalich7b.exchangesync.core.connection.ConnectionProfileRepository
 import net.mixalich7b.exchangesync.core.connection.FieldError
 import net.mixalich7b.exchangesync.core.connection.SaveConnectionAction
 import net.mixalich7b.exchangesync.core.connection.SaveConnectionResult
+import net.mixalich7b.exchangesync.core.connection.TlsCertificateDiagnostic
+import net.mixalich7b.exchangesync.core.connection.TlsConnectionDiagnostics
+import net.mixalich7b.exchangesync.core.connection.VerifyConnectionAction
+import net.mixalich7b.exchangesync.core.connection.VerifyConnectionResult
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
@@ -35,7 +41,8 @@ class SettingsViewModelTest {
                     override suspend fun replace(profile: ConnectionProfile) = Unit
                 }
             val save = RecordingSaveAction()
-            val viewModel = SettingsViewModel(repository, save)
+            val verify = RecordingVerifyAction()
+            val viewModel = SettingsViewModel(repository, save, verify)
 
             assertTrue(viewModel.state.value.isLoading)
             viewModel.onEmailChanged("overwritten@example.test")
@@ -43,9 +50,11 @@ class SettingsViewModelTest {
             viewModel.onServerChanged("overwritten.example.test")
             viewModel.onCertificateSelected("overwritten-certificate")
             viewModel.onSave()
+            viewModel.onRecheck()
 
             assertEquals(SettingsUiState(), viewModel.state.value)
             assertEquals(emptyList<ConnectionDraft>(), save.drafts)
+            assertEquals(emptyList<ConnectionDraft>(), verify.drafts)
 
             lookup.complete(profile())
             advanceUntilIdle()
@@ -57,6 +66,7 @@ class SettingsViewModelTest {
                     serverHost = "exchange.example.test",
                     clientCertificateAlias = "work-certificate",
                     status = ConnectionStatus.CONNECTED,
+                    hasSavedProfile = true,
                     isLoading = false,
                 ),
                 viewModel.state.value,
@@ -64,33 +74,36 @@ class SettingsViewModelTest {
         }
 
     @Test
-    fun `empty repository initializes an editable unconfigured form without probing`() =
+    fun `empty repository initializes an editable form without recheck or probing`() =
         runUiTest {
             val save = RecordingSaveAction()
-            val viewModel = SettingsViewModel(FakeRepository(null), save)
+            val verify = RecordingVerifyAction()
+            val viewModel = SettingsViewModel(FakeRepository(null), save, verify)
             advanceUntilIdle()
 
             assertEquals(SettingsUiState(isLoading = false), viewModel.state.value)
+            assertFalse(viewModel.state.value.isRecheckVisible)
+            assertFalse(viewModel.state.value.isRecheckEnabled)
             assertEquals(emptyList<ConnectionDraft>(), save.drafts)
+            assertEquals(emptyList<ConnectionDraft>(), verify.drafts)
         }
 
     @Test
-    fun `saved profile initializes populated connected form`() =
+    fun `saved profile enables recheck only while form matches the saved values`() =
         runUiTest {
-            val viewModel = SettingsViewModel(FakeRepository(profile()), RecordingSaveAction())
+            val verify = RecordingVerifyAction()
+            val viewModel = SettingsViewModel(FakeRepository(profile()), RecordingSaveAction(), verify)
             advanceUntilIdle()
 
-            assertEquals(
-                SettingsUiState(
-                    email = "calendar@example.test",
-                    account = "DOMAIN\\calendar",
-                    serverHost = "exchange.example.test",
-                    clientCertificateAlias = "work-certificate",
-                    status = ConnectionStatus.CONNECTED,
-                    isLoading = false,
-                ),
-                viewModel.state.value,
-            )
+            assertTrue(viewModel.state.value.isRecheckVisible)
+            assertTrue(viewModel.state.value.isRecheckEnabled)
+            viewModel.onServerChanged("draft.example.test")
+            assertTrue(viewModel.state.value.hasUnsavedChanges)
+            assertFalse(viewModel.state.value.isRecheckEnabled)
+            viewModel.onServerChanged("exchange.example.test")
+            assertFalse(viewModel.state.value.hasUnsavedChanges)
+            assertTrue(viewModel.state.value.isRecheckEnabled)
+            assertEquals(emptyList<ConnectionDraft>(), verify.drafts)
         }
 
     @Test
@@ -102,7 +115,7 @@ class SettingsViewModelTest {
 
                     override suspend fun replace(profile: ConnectionProfile) = Unit
                 }
-            val viewModel = SettingsViewModel(repository, RecordingSaveAction())
+            val viewModel = SettingsViewModel(repository, RecordingSaveAction(), RecordingVerifyAction())
             advanceUntilIdle()
 
             assertFalse(viewModel.state.value.isLoading)
@@ -110,28 +123,34 @@ class SettingsViewModelTest {
         }
 
     @Test
-    fun `control availability follows initial loading and save progress`() {
+    fun `control availability follows initial loading and either connection operation`() {
         val loading = SettingsUiState()
         assertFalse(loading.areFieldsEnabled)
         assertFalse(loading.isCertificateSelectionEnabled)
         assertFalse(loading.isSaveEnabled)
+        assertFalse(loading.isRecheckEnabled)
 
-        val ready = SettingsUiState(isLoading = false)
+        val ready = SettingsUiState(isLoading = false, hasSavedProfile = true)
         assertTrue(ready.areFieldsEnabled)
         assertTrue(ready.isCertificateSelectionEnabled)
         assertTrue(ready.isSaveEnabled)
+        assertTrue(ready.isRecheckEnabled)
 
-        val saving = SettingsUiState(isLoading = false, isSaving = true)
-        assertTrue(saving.areFieldsEnabled)
-        assertFalse(saving.isCertificateSelectionEnabled)
-        assertFalse(saving.isSaveEnabled)
+        ConnectionOperation.entries.forEach { operation ->
+            val inProgress = SettingsUiState(isLoading = false, hasSavedProfile = true, operation = operation)
+            assertFalse(inProgress.areFieldsEnabled)
+            assertFalse(inProgress.isCertificateSelectionEnabled)
+            assertFalse(inProgress.isSaveEnabled)
+            assertFalse(inProgress.isRecheckEnabled)
+        }
     }
 
     @Test
     fun `field edits and certificate cancellation do not save or probe`() =
         runUiTest {
             val save = RecordingSaveAction()
-            val viewModel = SettingsViewModel(FakeRepository(null), save)
+            val verify = RecordingVerifyAction()
+            val viewModel = SettingsViewModel(FakeRepository(null), save, verify)
             advanceUntilIdle()
 
             viewModel.onEmailChanged("draft@example.test")
@@ -145,13 +164,14 @@ class SettingsViewModelTest {
             assertEquals("draft.example.test", viewModel.state.value.serverHost)
             assertEquals("selected-alias", viewModel.state.value.clientCertificateAlias)
             assertEquals(emptyList<ConnectionDraft>(), save.drafts)
+            assertEquals(emptyList<ConnectionDraft>(), verify.drafts)
         }
 
     @Test
     fun `failed save retains attempted draft and exposes actionable error`() =
         runUiTest {
             val save = RecordingSaveAction(SaveConnectionResult.Failed(ConnectionFailure.TIMEOUT))
-            val viewModel = SettingsViewModel(FakeRepository(profile()), save)
+            val viewModel = SettingsViewModel(FakeRepository(profile()), save, RecordingVerifyAction())
             advanceUntilIdle()
             viewModel.onEmailChanged("draft@example.test")
             viewModel.onServerChanged("draft.example.test")
@@ -163,6 +183,7 @@ class SettingsViewModelTest {
             assertEquals("draft.example.test", viewModel.state.value.serverHost)
             assertEquals(SettingsConnectionError.TIMEOUT, viewModel.state.value.connectionError)
             assertEquals(ConnectionStatus.CONNECTED, viewModel.state.value.status)
+            assertNull(viewModel.state.value.tlsDiagnostics)
         }
 
     @Test
@@ -173,6 +194,7 @@ class SettingsViewModelTest {
                 SettingsViewModel(
                     FakeRepository(null),
                     RecordingSaveAction(SaveConnectionResult.Invalid(errors)),
+                    RecordingVerifyAction(),
                 )
             advanceUntilIdle()
 
@@ -180,7 +202,8 @@ class SettingsViewModelTest {
             advanceUntilIdle()
 
             assertEquals(errors, viewModel.state.value.fieldErrors)
-            assertEquals(null, viewModel.state.value.connectionError)
+            assertNull(viewModel.state.value.connectionError)
+            assertNull(viewModel.state.value.tlsDiagnostics)
         }
 
     @Test
@@ -201,6 +224,8 @@ class SettingsViewModelTest {
                 ConnectionFailure.REDIRECT_POLICY to SettingsConnectionError.REDIRECT,
                 ConnectionFailure.SERVER_ERROR to SettingsConnectionError.SERVER,
                 ConnectionFailure.PROTOCOL_INCOMPATIBLE to SettingsConnectionError.PROTOCOL,
+                ConnectionFailure.SERVER_CERTIFICATE_DIAGNOSTICS to
+                    SettingsConnectionError.SERVER_CERTIFICATE_DIAGNOSTICS,
                 ConnectionFailure.PERSISTENCE to SettingsConnectionError.PERSISTENCE,
                 ConnectionFailure.UNKNOWN to SettingsConnectionError.UNKNOWN,
             )
@@ -209,35 +234,84 @@ class SettingsViewModelTest {
     }
 
     @Test
-    fun `save progress prevents a second simultaneous attempt and success connects`() =
+    fun `active save blocks edits recheck and another save`() =
         runUiTest {
             val gate = CompletableDeferred<SaveConnectionResult>()
             val save = RecordingSaveAction(gate = gate)
-            val viewModel = SettingsViewModel(FakeRepository(null), save)
+            val verify = RecordingVerifyAction()
+            val viewModel = SettingsViewModel(FakeRepository(profile()), save, verify)
             advanceUntilIdle()
-            enterValidDraft(viewModel)
 
             viewModel.onSave()
-            assertTrue(viewModel.state.value.isSaving)
+            assertEquals(ConnectionOperation.SAVE, viewModel.state.value.operation)
+            viewModel.onEmailChanged("ignored@example.test")
+            viewModel.onRecheck()
             viewModel.onSave()
+
+            assertEquals("calendar@example.test", viewModel.state.value.email)
             assertEquals(1, save.drafts.size)
+            assertEquals(emptyList<ConnectionDraft>(), verify.drafts)
 
-            gate.complete(SaveConnectionResult.Saved(profile()))
+            gate.complete(SaveConnectionResult.Saved(profile(), diagnostics()))
             advanceUntilIdle()
 
-            assertFalse(viewModel.state.value.isSaving)
+            assertNull(viewModel.state.value.operation)
+            assertEquals(diagnostics(), viewModel.state.value.tlsDiagnostics)
+            assertTrue(viewModel.state.value.isRecheckEnabled)
+        }
+
+    @Test
+    fun `successful recheck returns current diagnostics without persistence`() =
+        runUiTest {
+            val repository = FakeRepository(profile())
+            val diagnostics = diagnostics()
+            val verify = RecordingVerifyAction(VerifyConnectionResult.Verified(profile(), diagnostics))
+            val viewModel = SettingsViewModel(repository, RecordingSaveAction(), verify)
+            advanceUntilIdle()
+
+            viewModel.onRecheck()
+            advanceUntilIdle()
+
+            assertEquals(listOf(validDraft()), verify.drafts)
+            assertEquals(0, repository.replaceAttempts)
             assertEquals(ConnectionStatus.CONNECTED, viewModel.state.value.status)
-            assertEquals(null, viewModel.state.value.connectionError)
-            assertEquals(emptyMap<ConnectionField, FieldError>(), viewModel.state.value.fieldErrors)
+            assertEquals(diagnostics, viewModel.state.value.tlsDiagnostics)
+            assertNull(viewModel.state.value.connectionError)
+        }
+
+    @Test
+    fun `failed recheck clears diagnostics and keeps saved profile unchanged`() =
+        runUiTest {
+            val repository = FakeRepository(profile())
+            val save = RecordingSaveAction(SaveConnectionResult.Saved(profile(), diagnostics()))
+            val verify = RecordingVerifyAction(VerifyConnectionResult.Failed(ConnectionFailure.SERVER_TRUST))
+            val viewModel = SettingsViewModel(repository, save, verify)
+            advanceUntilIdle()
+
+            viewModel.onSave()
+            advanceUntilIdle()
+            assertEquals(diagnostics(), viewModel.state.value.tlsDiagnostics)
+            viewModel.onRecheck()
+            advanceUntilIdle()
+
+            assertEquals(1, save.drafts.size)
+            assertEquals(listOf(validDraft()), verify.drafts)
+            assertEquals(0, repository.replaceAttempts)
+            assertEquals(profile(), repository.current)
+            assertNull(viewModel.state.value.tlsDiagnostics)
+            assertEquals(SettingsConnectionError.SERVER_TRUST, viewModel.state.value.connectionError)
         }
 
     private class FakeRepository(
-        private var profile: ConnectionProfile?,
+        var current: ConnectionProfile?,
     ) : ConnectionProfileRepository {
-        override suspend fun load(): ConnectionProfile? = profile
+        var replaceAttempts: Int = 0
+
+        override suspend fun load(): ConnectionProfile? = current
 
         override suspend fun replace(profile: ConnectionProfile) {
-            this.profile = profile
+            replaceAttempts += 1
+            current = profile
         }
     }
 
@@ -253,12 +327,24 @@ class SettingsViewModelTest {
         }
     }
 
-    private fun enterValidDraft(viewModel: SettingsViewModel) {
-        viewModel.onEmailChanged("calendar@example.test")
-        viewModel.onAccountChanged("DOMAIN\\calendar")
-        viewModel.onServerChanged("exchange.example.test")
-        viewModel.onCertificateSelected("work-certificate")
+    private class RecordingVerifyAction(
+        private val result: VerifyConnectionResult = VerifyConnectionResult.Failed(ConnectionFailure.UNKNOWN),
+    ) : VerifyConnectionAction {
+        val drafts = mutableListOf<ConnectionDraft>()
+
+        override suspend fun execute(draft: ConnectionDraft): VerifyConnectionResult {
+            drafts += draft
+            return result
+        }
     }
+
+    private fun validDraft(): ConnectionDraft =
+        ConnectionDraft(
+            email = "calendar@example.test",
+            account = "DOMAIN\\calendar",
+            serverHost = "exchange.example.test",
+            clientCertificateAlias = "work-certificate",
+        )
 
     private fun profile(): ConnectionProfile =
         ConnectionProfile(
@@ -266,6 +352,22 @@ class SettingsViewModelTest {
             account = "DOMAIN\\calendar",
             serverHost = "exchange.example.test",
             clientCertificateAlias = "work-certificate",
+        )
+
+    private fun diagnostics(): TlsConnectionDiagnostics =
+        TlsConnectionDiagnostics(
+            terminalHost = "exchange.example.test",
+            certificates =
+                listOf(
+                    TlsCertificateDiagnostic(
+                        subject = "CN=exchange.example.test",
+                        issuer = "CN=Example CA",
+                        serialNumber = "01",
+                        validFrom = Instant.parse("2026-01-01T00:00:00Z"),
+                        validUntil = Instant.parse("2027-01-01T00:00:00Z"),
+                        sha256Fingerprint = "AA:BB",
+                    ),
+                ),
         )
 
     private fun runUiTest(block: suspend TestScope.() -> Unit) =

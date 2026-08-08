@@ -85,6 +85,7 @@ private class OkHttpProbeTransport(
                                             response.header(name).orEmpty()
                                         },
                                     localCertificates = response.handshake?.localCertificates.orEmpty(),
+                                    peerCertificates = response.handshake?.peerCertificates.orEmpty(),
                                 ),
                             )
                         }

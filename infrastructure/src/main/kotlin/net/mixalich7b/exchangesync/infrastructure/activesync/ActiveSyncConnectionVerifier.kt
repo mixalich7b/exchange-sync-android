@@ -21,6 +21,7 @@ internal data class ProbeResponse(
     val statusCode: Int,
     val headers: Map<String, String>,
     val localCertificates: List<Certificate> = emptyList(),
+    val peerCertificates: List<Certificate> = emptyList(),
 ) {
     fun header(name: String): String? =
         headers.entries.firstOrNull { (key, _) -> key.equals(name, ignoreCase = true) }?.value
@@ -85,11 +86,17 @@ internal class ActiveSyncConnectionVerifier(
             if (!response.used(credential.leafCertificate)) {
                 return ConnectionCheckResult.Failure(ConnectionFailure.CLIENT_CERTIFICATE_REJECTED)
             }
-            return ActiveSyncResponseEvaluator.evaluate(
-                statusCode = response.statusCode,
-                protocolVersions = response.header("MS-ASProtocolVersions"),
-                protocolCommands = response.header("MS-ASProtocolCommands"),
-            )
+            val capabilityFailure =
+                ActiveSyncResponseEvaluator.evaluate(
+                    statusCode = response.statusCode,
+                    protocolVersions = response.header("MS-ASProtocolVersions"),
+                    protocolCommands = response.header("MS-ASProtocolCommands"),
+                )
+            if (capabilityFailure != null) return ConnectionCheckResult.Failure(capabilityFailure)
+            val diagnostics =
+                TlsCertificateDiagnosticsFactory.create(currentUrl.host, response.peerCertificates)
+                    ?: return ConnectionCheckResult.Failure(ConnectionFailure.SERVER_CERTIFICATE_DIAGNOSTICS)
+            return ConnectionCheckResult.Success(diagnostics)
         }
     }
 

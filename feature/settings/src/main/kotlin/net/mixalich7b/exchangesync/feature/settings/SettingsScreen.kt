@@ -14,6 +14,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -26,7 +27,13 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.time.format.FormatStyle
+import java.util.Locale
 import net.mixalich7b.exchangesync.core.connection.ConnectionField
+import net.mixalich7b.exchangesync.core.connection.TlsCertificateDiagnostic
 
 @Composable
 public fun SettingsRoute(
@@ -42,6 +49,7 @@ public fun SettingsRoute(
         onServerChanged = viewModel::onServerChanged,
         onSelectCertificate = onSelectCertificate,
         onSave = viewModel::onSave,
+        onRecheck = viewModel::onRecheck,
         modifier = modifier,
     )
 }
@@ -54,6 +62,7 @@ public fun SettingsScreen(
     onServerChanged: (String) -> Unit,
     onSelectCertificate: () -> Unit,
     onSave: () -> Unit,
+    onRecheck: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Surface(
@@ -149,31 +158,7 @@ public fun SettingsScreen(
                 )
             }
             Spacer(modifier = Modifier.height(20.dp))
-            Text(
-                text =
-                    stringResource(
-                        if (uiState.status == ConnectionStatus.CONNECTED) {
-                            R.string.connection_connected
-                        } else {
-                            R.string.connection_not_configured
-                        },
-                    ),
-                color =
-                    if (uiState.status == ConnectionStatus.CONNECTED) {
-                        MaterialTheme.colorScheme.primary
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    },
-                style = MaterialTheme.typography.bodyLarge,
-            )
-            uiState.connectionError?.let { error ->
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = stringResource(error.messageResource()),
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            }
+            ConnectionFeedback(uiState)
             Spacer(modifier = Modifier.height(24.dp))
             Button(
                 onClick = onSave,
@@ -184,7 +169,7 @@ public fun SettingsScreen(
                     horizontalArrangement = Arrangement.Center,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    if (uiState.isSaving) {
+                    if (uiState.operation == ConnectionOperation.SAVE) {
                         CircularProgressIndicator(
                             modifier = Modifier.height(20.dp),
                             strokeWidth = 2.dp,
@@ -196,8 +181,111 @@ public fun SettingsScreen(
                     }
                 }
             }
+            if (uiState.isRecheckVisible) {
+                Spacer(modifier = Modifier.height(12.dp))
+                OutlinedButton(
+                    onClick = onRecheck,
+                    enabled = uiState.isRecheckEnabled,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        if (uiState.operation == ConnectionOperation.RECHECK) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.height(20.dp),
+                                strokeWidth = 2.dp,
+                            )
+                            Spacer(modifier = Modifier.padding(horizontal = 6.dp))
+                            Text(stringResource(R.string.connection_rechecking))
+                        } else {
+                            Text(stringResource(R.string.recheck_connection))
+                        }
+                    }
+                }
+                if (uiState.hasUnsavedChanges) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = stringResource(R.string.save_changes_before_recheck),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
         }
     }
+}
+
+@Composable
+private fun ConnectionFeedback(uiState: SettingsUiState) {
+    Text(
+        text =
+            stringResource(
+                if (uiState.status == ConnectionStatus.CONNECTED) {
+                    R.string.connection_connected
+                } else {
+                    R.string.connection_not_configured
+                },
+            ),
+        color =
+            if (uiState.status == ConnectionStatus.CONNECTED) {
+                MaterialTheme.colorScheme.primary
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+        style = MaterialTheme.typography.bodyLarge,
+    )
+    uiState.connectionError?.let { error ->
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = stringResource(error.messageResource()),
+            color = MaterialTheme.colorScheme.error,
+            style = MaterialTheme.typography.bodyMedium,
+        )
+    }
+    uiState.tlsDiagnostics?.let { diagnostics ->
+        Spacer(modifier = Modifier.height(16.dp))
+        Text(
+            text = stringResource(R.string.tls_diagnostics_title),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            text = stringResource(R.string.tls_terminal_host, diagnostics.terminalHost),
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        diagnostics.certificates.forEachIndexed { index, certificate ->
+            Spacer(modifier = Modifier.height(12.dp))
+            TlsCertificateFeedback(index + 1, certificate)
+        }
+    }
+}
+
+@Composable
+private fun TlsCertificateFeedback(
+    index: Int,
+    certificate: TlsCertificateDiagnostic,
+) {
+    Text(
+        text = stringResource(R.string.tls_certificate_number, index),
+        style = MaterialTheme.typography.titleSmall,
+    )
+    Text(stringResource(R.string.tls_subject, certificate.subject), style = MaterialTheme.typography.bodySmall)
+    Text(stringResource(R.string.tls_issuer, certificate.issuer), style = MaterialTheme.typography.bodySmall)
+    Text(stringResource(R.string.tls_serial_number, certificate.serialNumber), style = MaterialTheme.typography.bodySmall)
+    Text(
+        stringResource(R.string.tls_valid_from, certificate.validFrom.localizedDate()),
+        style = MaterialTheme.typography.bodySmall,
+    )
+    Text(
+        stringResource(R.string.tls_valid_until, certificate.validUntil.localizedDate()),
+        style = MaterialTheme.typography.bodySmall,
+    )
+    Text(
+        stringResource(R.string.tls_fingerprint, certificate.sha256Fingerprint),
+        style = MaterialTheme.typography.bodySmall,
+    )
 }
 
 @Composable
@@ -246,6 +334,15 @@ private fun SettingsConnectionError.messageResource(): Int =
         SettingsConnectionError.REDIRECT -> R.string.error_redirect
         SettingsConnectionError.SERVER -> R.string.error_server_response
         SettingsConnectionError.PROTOCOL -> R.string.error_protocol
+        SettingsConnectionError.SERVER_CERTIFICATE_DIAGNOSTICS ->
+            R.string.error_server_certificate_diagnostics
         SettingsConnectionError.PERSISTENCE -> R.string.error_persistence
         SettingsConnectionError.UNKNOWN -> R.string.error_unknown
     }
+
+private fun Instant.localizedDate(): String =
+    DateTimeFormatter
+        .ofLocalizedDate(FormatStyle.MEDIUM)
+        .withLocale(Locale.getDefault())
+        .withZone(ZoneId.systemDefault())
+        .format(this)

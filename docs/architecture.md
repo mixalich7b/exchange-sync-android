@@ -28,9 +28,9 @@
 | Модуль | Ответственность |
 |---|---|
 | `:app` | Launcher Activity, manifest, Android certificate chooser и ручная композиция зависимостей |
-| `:core` | Android-независимые модели профиля, валидация, категории ошибок, порты и сценарий сохранения |
-| `:feature:settings` | Immutable UI state, ViewModel, Compose-экран и отображение типизированных ошибок |
-| `:infrastructure` | DataStore, Android KeyChain, загрузка локальных CA, TLS trust managers и ActiveSync HTTP probe |
+| `:core` | Android-независимые модели профиля, валидация, категории ошибок, общая проверка draft и сценарий сохранения |
+| `:feature:settings` | Immutable UI state, ViewModel, Compose-экран, повторная проверка и отображение типизированных результатов |
+| `:infrastructure` | DataStore, Android KeyChain, загрузка локальных CA, TLS trust managers и ActiveSync HTTP probe с TLS-метаданными |
 
 `:feature:settings` не зависит от `:infrastructure`, а `:core` остаётся чистым
 Kotlin/JVM-модулем без Android и HTTP API. Такое разделение оставляет доменную
@@ -42,6 +42,8 @@ Kotlin/JVM-модулем без Android и HTTP API. Такое разделе�
 
 - единственный `DataStoreConnectionProfileRepository`;
 - Android-адаптер проверки ActiveSync;
+- один core-сценарий `VerifyConnection`, используемый и `SaveConnection`, и
+  ручной повторной проверкой;
 - core-сценарий `SaveConnection`;
 - `SettingsViewModel` через lifecycle-aware `ViewModelProvider`.
 
@@ -49,7 +51,7 @@ Dependency-injection framework не используется. Android KeyChain c
 остаётся на уровне Activity, поэтому feature-модуль получает только callback и
 alias выбранного сертификата.
 
-## Поток сохранения профиля
+## Потоки проверки профиля
 
 Сохранение реализовано как validate-probe-commit:
 
@@ -68,12 +70,25 @@ alias выбранного сертификата.
 изменяют сохранённый профиль. Повторный Save блокируется до завершения текущей
 проверки.
 
+Для неизменённого загруженного профиля ViewModel также запускает общий
+`VerifyConnection` без `SaveConnection`: результат проходит те же validation,
+mTLS, TLS, redirect и ActiveSync checks, но не вызывает repository replacement.
+После успеха ViewModel показывает terminal TLS certificate diagnostics; после
+изменения формы или неуспешной попытки эти diagnostics очищаются и не
+persistятся.
+
 ## Android и конкурентные границы
 
 Android API сосредоточены в `:app` и `:infrastructure`. Начальная загрузка
 профиля представлена отдельным состоянием: до её завершения поля, certificate
 chooser и Save заблокированы, поэтому позднее чтение DataStore не может
 перезаписать пользовательский draft.
+
+ViewModel хранит private snapshot последнего загруженного или успешно
+сохранённого профиля. Только равный ему draft может пройти ручную повторную
+проверку. Save и повторная проверка представлены одним operation state, поэтому
+во время любой проверки заблокированы все поля, chooser и оба действия; поздний
+результат не может быть показан для другого draft.
 
 Получение материала из KeyChain и создание TLS transport выполняются вне Main
 dispatcher. Создание trust managers, `SSLContext` и OkHttp-клиента синхронно и
@@ -90,8 +105,10 @@ Preferences DataStore содержит ровно один профиль:
 - hostname сервера;
 - непрозрачный KeyChain alias.
 
-Пароль, закрытый ключ, байты сертификата, ответы сервера и ошибки не
-сохраняются. Android продолжает владеть закрытым ключом, а backup приложения
+Пароль, закрытый ключ, байты сертификата, ответы сервера, TLS-диагностика и
+ошибки не сохраняются. Успешная TLS-диагностика содержит только public metadata
+terminal peer chain: hostname, subject/issuer, serial, validity и SHA-256
+fingerprint. Android продолжает владеть закрытым ключом, а backup приложения
 отключён.
 
 ## Проверка реализации

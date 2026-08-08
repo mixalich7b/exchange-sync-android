@@ -23,6 +23,7 @@ class ConnectionFailureTest {
                 ConnectionFailure.REDIRECT_POLICY to "redirect_policy",
                 ConnectionFailure.SERVER_ERROR to "server_error",
                 ConnectionFailure.PROTOCOL_INCOMPATIBLE to "protocol_incompatible",
+                ConnectionFailure.SERVER_CERTIFICATE_DIAGNOSTICS to "server_certificate_diagnostics",
                 ConnectionFailure.PERSISTENCE to "persistence",
                 ConnectionFailure.UNKNOWN to "unknown",
             )

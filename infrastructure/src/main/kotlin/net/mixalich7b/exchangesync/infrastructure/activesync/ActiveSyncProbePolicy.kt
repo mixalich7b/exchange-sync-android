@@ -1,6 +1,5 @@
 package net.mixalich7b.exchangesync.infrastructure.activesync
 
-import net.mixalich7b.exchangesync.core.connection.ConnectionCheckResult
 import net.mixalich7b.exchangesync.core.connection.ConnectionFailure
 import okhttp3.HttpUrl
 import okhttp3.Request
@@ -60,15 +59,15 @@ internal object ActiveSyncResponseEvaluator {
         statusCode: Int,
         protocolVersions: String?,
         protocolCommands: String?,
-    ): ConnectionCheckResult {
-        if (statusCode != 200) return ConnectionCheckResult.Failure(classifyStatus(statusCode))
+    ): ConnectionFailure? {
+        if (statusCode != 200) return classifyStatus(statusCode)
 
         val versions = tokens(protocolVersions)
         val commands = tokens(protocolCommands).map(String::lowercase).toSet()
         return if (versions.any(supportedVersions::contains) && commands.containsAll(requiredCommands)) {
-            ConnectionCheckResult.Success
+            null
         } else {
-            ConnectionCheckResult.Failure(ConnectionFailure.PROTOCOL_INCOMPATIBLE)
+            ConnectionFailure.PROTOCOL_INCOMPATIBLE
         }
     }
 

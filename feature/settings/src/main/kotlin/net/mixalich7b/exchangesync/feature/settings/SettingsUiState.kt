@@ -3,6 +3,7 @@ package net.mixalich7b.exchangesync.feature.settings
 import net.mixalich7b.exchangesync.core.connection.ConnectionFailure
 import net.mixalich7b.exchangesync.core.connection.ConnectionField
 import net.mixalich7b.exchangesync.core.connection.FieldError
+import net.mixalich7b.exchangesync.core.connection.TlsConnectionDiagnostics
 
 public data class SettingsUiState(
     public val email: String = "",
@@ -11,23 +12,40 @@ public data class SettingsUiState(
     public val clientCertificateAlias: String? = null,
     public val fieldErrors: Map<ConnectionField, FieldError> = emptyMap(),
     public val connectionError: SettingsConnectionError? = null,
+    public val tlsDiagnostics: TlsConnectionDiagnostics? = null,
     public val status: ConnectionStatus = ConnectionStatus.UNCONFIGURED,
+    public val hasSavedProfile: Boolean = false,
+    public val hasUnsavedChanges: Boolean = false,
     public val isLoading: Boolean = true,
-    public val isSaving: Boolean = false,
+    public val operation: ConnectionOperation? = null,
 ) {
     public val areFieldsEnabled: Boolean
-        get() = !isLoading
+        get() = !isLoading && operation == null
 
     public val isCertificateSelectionEnabled: Boolean
-        get() = !isLoading && !isSaving
+        get() = !isLoading && operation == null
 
     public val isSaveEnabled: Boolean
-        get() = !isLoading && !isSaving
+        get() = !isLoading && operation == null
+
+    public val isRecheckVisible: Boolean
+        get() = hasSavedProfile
+
+    public val isRecheckEnabled: Boolean
+        get() = !isLoading && operation == null && hasSavedProfile && !hasUnsavedChanges
+
+    public val isSaving: Boolean
+        get() = operation != null
 }
 
 public enum class ConnectionStatus {
     UNCONFIGURED,
     CONNECTED,
+}
+
+public enum class ConnectionOperation {
+    SAVE,
+    RECHECK,
 }
 
 public enum class SettingsConnectionError {
@@ -45,6 +63,7 @@ public enum class SettingsConnectionError {
     REDIRECT,
     SERVER,
     PROTOCOL,
+    SERVER_CERTIFICATE_DIAGNOSTICS,
     PERSISTENCE,
     UNKNOWN,
 }
@@ -65,6 +84,8 @@ public fun toSettingsConnectionError(failure: ConnectionFailure): SettingsConnec
         ConnectionFailure.REDIRECT_POLICY -> SettingsConnectionError.REDIRECT
         ConnectionFailure.SERVER_ERROR -> SettingsConnectionError.SERVER
         ConnectionFailure.PROTOCOL_INCOMPATIBLE -> SettingsConnectionError.PROTOCOL
+        ConnectionFailure.SERVER_CERTIFICATE_DIAGNOSTICS ->
+            SettingsConnectionError.SERVER_CERTIFICATE_DIAGNOSTICS
         ConnectionFailure.PERSISTENCE -> SettingsConnectionError.PERSISTENCE
         ConnectionFailure.UNKNOWN -> SettingsConnectionError.UNKNOWN
     }

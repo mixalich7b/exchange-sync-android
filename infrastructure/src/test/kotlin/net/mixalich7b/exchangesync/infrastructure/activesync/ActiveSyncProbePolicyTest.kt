@@ -1,9 +1,9 @@
 package net.mixalich7b.exchangesync.infrastructure.activesync
 
-import net.mixalich7b.exchangesync.core.connection.ConnectionCheckResult
 import net.mixalich7b.exchangesync.core.connection.ConnectionFailure
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
@@ -81,7 +81,7 @@ class ActiveSyncProbePolicyTest {
                 protocolCommands = "SendMail, foldersync, SYNC",
             )
 
-        assertEquals(ConnectionCheckResult.Success, result)
+        assertNull(result)
     }
 
     @Test
@@ -95,7 +95,7 @@ class ActiveSyncProbePolicyTest {
             "16.1" to "FolderSync",
         ).forEach { (versions, commands) ->
             assertEquals(
-                ConnectionCheckResult.Failure(ConnectionFailure.PROTOCOL_INCOMPATIBLE),
+                ConnectionFailure.PROTOCOL_INCOMPATIBLE,
                 ActiveSyncResponseEvaluator.evaluate(200, versions, commands),
                 "$versions / $commands",
             )
@@ -117,7 +117,7 @@ class ActiveSyncProbePolicyTest {
 
         expected.forEach { (status, failure) ->
             assertEquals(
-                ConnectionCheckResult.Failure(failure),
+                failure,
                 ActiveSyncResponseEvaluator.evaluate(status, null, null),
                 status.toString(),
             )

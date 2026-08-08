@@ -23,6 +23,7 @@ public class MainActivity : ComponentActivity() {
                     SettingsViewModel(
                         repository = container.repository,
                         saveConnection = container.saveConnection,
+                        verifyConnection = container.verifyConnection,
                     )
                 }
             }

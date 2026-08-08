@@ -13,13 +13,17 @@ import net.mixalich7b.exchangesync.core.connection.ConnectionField
 import net.mixalich7b.exchangesync.core.connection.ConnectionProfileRepository
 import net.mixalich7b.exchangesync.core.connection.SaveConnectionAction
 import net.mixalich7b.exchangesync.core.connection.SaveConnectionResult
+import net.mixalich7b.exchangesync.core.connection.VerifyConnectionAction
+import net.mixalich7b.exchangesync.core.connection.VerifyConnectionResult
 
 public class SettingsViewModel(
     private val repository: ConnectionProfileRepository,
     private val saveConnection: SaveConnectionAction,
+    private val verifyConnection: VerifyConnectionAction,
 ) : ViewModel() {
     private val mutableState = MutableStateFlow(SettingsUiState())
     public val state: StateFlow<SettingsUiState> = mutableState.asStateFlow()
+    private var savedProfile: net.mixalich7b.exchangesync.core.connection.ConnectionProfile? = null
 
     init {
         viewModelScope.launch {
@@ -29,12 +33,14 @@ public class SettingsViewModel(
                     if (profile == null) {
                         SettingsUiState(isLoading = false)
                     } else {
+                        savedProfile = profile
                         SettingsUiState(
                             email = profile.email,
                             account = profile.account,
                             serverHost = profile.serverHost,
                             clientCertificateAlias = profile.clientCertificateAlias,
                             status = ConnectionStatus.CONNECTED,
+                            hasSavedProfile = true,
                             isLoading = false,
                         )
                     }
@@ -72,19 +78,32 @@ public class SettingsViewModel(
 
     public fun onSave() {
         val current = mutableState.value
-        if (current.isLoading || current.isSaving) return
-        val draft =
-            ConnectionDraft(
-                email = current.email,
-                account = current.account,
-                serverHost = current.serverHost,
-                clientCertificateAlias = current.clientCertificateAlias,
-            )
-        mutableState.value = current.copy(isSaving = true, fieldErrors = emptyMap(), connectionError = null)
+        if (current.isLoading || current.operation != null) return
+        val draft = current.toDraft()
+        mutableState.value = current.start(ConnectionOperation.SAVE)
 
         viewModelScope.launch {
             val result = saveConnection.execute(draft)
-            mutableState.update { state -> state.after(result) }
+            mutableState.update { state -> state.afterSave(result) }
+        }
+    }
+
+    public fun onRecheck() {
+        val current = mutableState.value
+        val profile = savedProfile
+        if (
+            current.isLoading ||
+                current.operation != null ||
+                profile == null ||
+                current.hasUnsavedChanges
+        ) {
+            return
+        }
+        mutableState.value = current.start(ConnectionOperation.RECHECK)
+
+        viewModelScope.launch {
+            val result = verifyConnection.execute(profile.toDraft())
+            mutableState.update { state -> state.afterRecheck(result) }
         }
     }
 
@@ -93,30 +112,98 @@ public class SettingsViewModel(
         transform: (SettingsUiState) -> SettingsUiState,
     ) {
         mutableState.update { current ->
-            if (current.isLoading) {
+            if (current.isLoading || current.operation != null) {
                 current
             } else {
-                transform(current).copy(fieldErrors = current.fieldErrors - field)
+                val updated = transform(current)
+                updated.copy(
+                    fieldErrors = current.fieldErrors - field,
+                    connectionError = null,
+                    tlsDiagnostics = null,
+                    hasUnsavedChanges = !updated.matches(savedProfile),
+                )
             }
         }
     }
 
-    private fun SettingsUiState.after(result: SaveConnectionResult): SettingsUiState =
-        when (result) {
+    private fun SettingsUiState.start(operation: ConnectionOperation): SettingsUiState =
+        copy(
+            operation = operation,
+            fieldErrors = emptyMap(),
+            connectionError = null,
+            tlsDiagnostics = null,
+        )
+
+    private fun SettingsUiState.afterSave(result: SaveConnectionResult): SettingsUiState {
+        if (operation != ConnectionOperation.SAVE) return this
+        return when (result) {
             is SaveConnectionResult.Invalid ->
-                copy(isSaving = false, fieldErrors = result.errors, connectionError = null)
+                copy(operation = null, fieldErrors = result.errors, connectionError = null, tlsDiagnostics = null)
             is SaveConnectionResult.Failed ->
                 copy(
-                    isSaving = false,
+                    operation = null,
                     fieldErrors = emptyMap(),
                     connectionError = toSettingsConnectionError(result.reason),
+                    tlsDiagnostics = null,
                 )
-            is SaveConnectionResult.Saved ->
+            is SaveConnectionResult.Saved -> {
+                savedProfile = result.profile
                 copy(
-                    isSaving = false,
+                    operation = null,
                     fieldErrors = emptyMap(),
                     connectionError = null,
+                    tlsDiagnostics = result.diagnostics,
+                    status = ConnectionStatus.CONNECTED,
+                    hasSavedProfile = true,
+                    hasUnsavedChanges = false,
+                )
+            }
+        }
+    }
+
+    private fun SettingsUiState.afterRecheck(result: VerifyConnectionResult): SettingsUiState {
+        if (operation != ConnectionOperation.RECHECK) return this
+        return when (result) {
+            is VerifyConnectionResult.Invalid ->
+                copy(operation = null, fieldErrors = result.errors, connectionError = null, tlsDiagnostics = null)
+            is VerifyConnectionResult.Failed ->
+                copy(
+                    operation = null,
+                    fieldErrors = emptyMap(),
+                    connectionError = toSettingsConnectionError(result.reason),
+                    tlsDiagnostics = null,
+                )
+            is VerifyConnectionResult.Verified ->
+                copy(
+                    operation = null,
+                    fieldErrors = emptyMap(),
+                    connectionError = null,
+                    tlsDiagnostics = result.diagnostics,
                     status = ConnectionStatus.CONNECTED,
                 )
         }
+    }
+
+    private fun SettingsUiState.toDraft(): ConnectionDraft =
+        ConnectionDraft(
+            email = email,
+            account = account,
+            serverHost = serverHost,
+            clientCertificateAlias = clientCertificateAlias,
+        )
+
+    private fun net.mixalich7b.exchangesync.core.connection.ConnectionProfile.toDraft(): ConnectionDraft =
+        ConnectionDraft(
+            email = email,
+            account = account,
+            serverHost = serverHost,
+            clientCertificateAlias = clientCertificateAlias,
+        )
+
+    private fun SettingsUiState.matches(profile: net.mixalich7b.exchangesync.core.connection.ConnectionProfile?): Boolean =
+        profile != null &&
+            email == profile.email &&
+            account == profile.account &&
+            serverHost == profile.serverHost &&
+            clientCertificateAlias == profile.clientCertificateAlias
 }

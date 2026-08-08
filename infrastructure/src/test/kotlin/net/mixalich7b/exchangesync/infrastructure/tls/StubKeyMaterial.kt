@@ -6,8 +6,10 @@ import java.math.BigInteger
 import java.security.Principal
 import java.security.PrivateKey
 import java.security.PublicKey
+import java.security.cert.Certificate
 import java.security.cert.X509Certificate
 import java.util.Date
+import javax.security.auth.x500.X500Principal
 
 internal class StubPrivateKey(
     private val keyAlgorithm: String = "RSA",
@@ -29,6 +31,11 @@ private class StubPublicKey : PublicKey {
 
 internal class StubX509Certificate(
     private val encoded: ByteArray = byteArrayOf(5),
+    private val serialNumber: BigInteger = BigInteger.ONE,
+    private val issuer: X500Principal = X500Principal("CN=test-issuer"),
+    private val subject: X500Principal = X500Principal("CN=test-subject"),
+    private val notBefore: Date = Date(0),
+    private val notAfter: Date = Date(Long.MAX_VALUE),
 ) : X509Certificate() {
     override fun checkValidity() = Unit
 
@@ -36,15 +43,19 @@ internal class StubX509Certificate(
 
     override fun getVersion(): Int = 3
 
-    override fun getSerialNumber(): BigInteger = BigInteger.ONE
+    override fun getSerialNumber(): BigInteger = serialNumber
 
-    override fun getIssuerDN(): Principal = Principal { "test-issuer" }
+    override fun getIssuerDN(): Principal = issuer
 
-    override fun getSubjectDN(): Principal = Principal { "test-subject" }
+    override fun getSubjectDN(): Principal = subject
 
-    override fun getNotBefore(): Date = Date(0)
+    override fun getIssuerX500Principal(): X500Principal = issuer
 
-    override fun getNotAfter(): Date = Date(Long.MAX_VALUE)
+    override fun getSubjectX500Principal(): X500Principal = subject
+
+    override fun getNotBefore(): Date = notBefore
+
+    override fun getNotAfter(): Date = notAfter
 
     override fun getTBSCertificate(): ByteArray = byteArrayOf(3)
 
@@ -81,4 +92,18 @@ internal class StubX509Certificate(
     override fun getNonCriticalExtensionOIDs(): Set<String>? = null
 
     override fun getExtensionValue(oid: String?): ByteArray? = null
+}
+
+internal class StubCertificate(
+    private val encoded: ByteArray = byteArrayOf(7),
+) : Certificate("stub") {
+    override fun getEncoded(): ByteArray = encoded.copyOf()
+
+    override fun verify(key: PublicKey?) = Unit
+
+    override fun verify(key: PublicKey?, sigProvider: String?) = Unit
+
+    override fun toString(): String = "stub-certificate"
+
+    override fun getPublicKey(): PublicKey = StubPublicKey()
 }

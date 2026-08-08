@@ -12,8 +12,20 @@
     <string name="save_connection">Сохранить</string>
     <string name="connection_loading">Загрузка сохранённых настроек…</string>
     <string name="connection_checking">Проверка подключения…</string>
+    <string name="connection_rechecking">Повторная проверка подключения…</string>
     <string name="connection_connected">Подключение проверено</string>
     <string name="connection_not_configured">Подключение не настроено</string>
+    <string name="recheck_connection">Проверить подключение повторно</string>
+    <string name="save_changes_before_recheck">Сохраните изменения, чтобы проверить этот профиль</string>
+    <string name="tls_diagnostics_title">TLS-сертификаты сервера</string>
+    <string name="tls_terminal_host">Конечный сервер: %1$s</string>
+    <string name="tls_certificate_number">Сертификат %1$d</string>
+    <string name="tls_subject">Субъект: %1$s</string>
+    <string name="tls_issuer">Издатель: %1$s</string>
+    <string name="tls_serial_number">Серийный номер: %1$s</string>
+    <string name="tls_valid_from">Действует с: %1$s</string>
+    <string name="tls_valid_until">Действует до: %1$s</string>
+    <string name="tls_fingerprint">SHA-256: %1$s</string>
     <string name="error_email">Укажите корректный адрес электронной почты</string>
     <string name="error_account">Укажите имя в формате domain\\login</string>
     <string name="error_server">Укажите hostname без схемы, пути и порта</string>
@@ -32,6 +44,7 @@
     <string name="error_redirect">Сервер вернул небезопасную или некорректную цепочку редиректов</string>
     <string name="error_server_response">На сервере произошла ошибка</string>
     <string name="error_protocol">Сервер не поддерживает необходимые возможности ActiveSync</string>
+    <string name="error_server_certificate_diagnostics">Не удалось получить данные TLS-сертификата сервера</string>
     <string name="error_persistence">Подключение проверено, но настройки сохранить не удалось</string>
     <string name="error_unknown">Не удалось проверить подключение</string>
 </resources>

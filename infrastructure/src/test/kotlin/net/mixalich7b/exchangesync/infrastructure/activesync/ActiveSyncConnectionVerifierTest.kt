@@ -12,6 +12,8 @@ import kotlinx.coroutines.test.runTest
 import net.mixalich7b.exchangesync.core.connection.ConnectionCheckResult
 import net.mixalich7b.exchangesync.core.connection.ConnectionFailure
 import net.mixalich7b.exchangesync.core.connection.ConnectionProfile
+import net.mixalich7b.exchangesync.core.connection.TlsCertificateDiagnostic
+import net.mixalich7b.exchangesync.core.connection.TlsConnectionDiagnostics
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredential
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredentialResolution
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredentialResolver
@@ -55,8 +57,9 @@ class ActiveSyncConnectionVerifierTest {
                                 mapOf(
                                     "MS-ASProtocolVersions" to "14.1,16.1",
                                     "MS-ASProtocolCommands" to "FolderSync,Sync",
-                                ),
+                            ),
                             localCertificates = listOf(credential.leafCertificate),
+                            peerCertificates = listOf(peerCertificate()),
                         ),
                     ),
                 )
@@ -64,7 +67,7 @@ class ActiveSyncConnectionVerifierTest {
 
             val result = verifier.verify(profile())
 
-            assertEquals(ConnectionCheckResult.Success, result)
+            assertEquals(ConnectionCheckResult.Success(expectedDiagnostics("exchange.example.test")), result)
             assertEquals(1, factory.createCalls)
             assertEquals(listOf("OPTIONS"), factory.transport.requests.map { request -> request.method })
         }
@@ -79,6 +82,7 @@ class ActiveSyncConnectionVerifierTest {
                         ProbeResponse(
                             statusCode = 302,
                             headers = mapOf("Location" to "https://mail.example.test/EAS"),
+                            peerCertificates = listOf(StubX509Certificate(byteArrayOf(99))),
                         ),
                         ProbeResponse(
                             statusCode = 200,
@@ -86,15 +90,16 @@ class ActiveSyncConnectionVerifierTest {
                                 mapOf(
                                     "MS-ASProtocolVersions" to "16.1",
                                     "MS-ASProtocolCommands" to "Sync,FolderSync",
-                                ),
+                            ),
                             localCertificates = listOf(credential.leafCertificate),
+                            peerCertificates = listOf(peerCertificate()),
                         ),
                     ),
                 )
 
             val result = verifier(credential, factory).verify(profile())
 
-            assertEquals(ConnectionCheckResult.Success, result)
+            assertEquals(ConnectionCheckResult.Success(expectedDiagnostics("mail.example.test")), result)
             assertEquals(listOf("OPTIONS", "OPTIONS"), factory.transport.requests.map { request -> request.method })
             assertEquals(
                 listOf("exchange.example.test", "mail.example.test"),
@@ -130,6 +135,33 @@ class ActiveSyncConnectionVerifierTest {
         }
 
     @Test
+    fun `terminal response without usable peer certificates fails instead of reporting success`() =
+        runTest {
+            val credential = credential()
+            val factory =
+                RecordingTransportFactory(
+                    listOf(
+                        ProbeResponse(
+                            statusCode = 200,
+                            headers =
+                                mapOf(
+                                    "MS-ASProtocolVersions" to "16.1",
+                                    "MS-ASProtocolCommands" to "FolderSync,Sync",
+                                ),
+                            localCertificates = listOf(credential.leafCertificate),
+                        ),
+                    ),
+                )
+
+            val result = verifier(credential, factory).verify(profile())
+
+            assertEquals(
+                ConnectionCheckResult.Failure(ConnectionFailure.SERVER_CERTIFICATE_DIAGNOSTICS),
+                result,
+            )
+        }
+
+    @Test
     fun `transport construction leaves the caller dispatcher`() {
         Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "ui-caller") }
             .asCoroutineDispatcher()
@@ -156,8 +188,9 @@ class ActiveSyncConnectionVerifierTest {
                                                     mapOf(
                                                         "MS-ASProtocolVersions" to "16.1",
                                                         "MS-ASProtocolCommands" to "FolderSync,Sync",
-                                                    ),
+                                                ),
                                                 localCertificates = listOf(credential.leafCertificate),
+                                                peerCertificates = listOf(peerCertificate()),
                                             )
                                         }
                                     },
@@ -170,7 +203,7 @@ class ActiveSyncConnectionVerifierTest {
                                 verifier.verify(profile())
                             }
 
-                        assertEquals(ConnectionCheckResult.Success, result)
+                        assertEquals(ConnectionCheckResult.Success(expectedDiagnostics("exchange.example.test")), result)
                         assertNotSame(callerThread, factoryThread)
                     }
             }
@@ -253,6 +286,25 @@ class ActiveSyncConnectionVerifierTest {
         val chain: Array<X509Certificate> = arrayOf(StubX509Certificate(byteArrayOf(42)))
         return ClientCredential("work-certificate", StubPrivateKey(), chain)
     }
+
+    private fun peerCertificate(): X509Certificate = StubX509Certificate(byteArrayOf())
+
+    private fun expectedDiagnostics(host: String): TlsConnectionDiagnostics =
+        TlsConnectionDiagnostics(
+            terminalHost = host,
+            certificates =
+                listOf(
+                    TlsCertificateDiagnostic(
+                        subject = "CN=test-subject",
+                        issuer = "CN=test-issuer",
+                        serialNumber = "1",
+                        validFrom = java.time.Instant.EPOCH,
+                        validUntil = java.time.Instant.ofEpochMilli(Long.MAX_VALUE),
+                        sha256Fingerprint =
+                            "E3:B0:C4:42:98:FC:1C:14:9A:FB:F4:C8:99:6F:B9:24:27:AE:41:E4:64:9B:93:4C:A4:95:99:1B:78:52:B8:55",
+                    ),
+                ),
+        )
 
     private fun profile(): ConnectionProfile =
         ConnectionProfile(
