@@ -26,13 +26,41 @@ import okhttp3.Callback
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody
+import okio.Buffer
+
+internal const val MAX_ACTIVE_SYNC_RESPONSE_BYTES: Int = 2 * 1024 * 1024
+
+internal class ActiveSyncResponseTooLargeException : IllegalArgumentException("ActiveSync response is too large")
+
+internal fun readBoundedActiveSyncBody(body: ResponseBody): ByteArray {
+    if (body.contentLength() > MAX_ACTIVE_SYNC_RESPONSE_BYTES) throw ActiveSyncResponseTooLargeException()
+    val source = body.source()
+    val buffer = Buffer()
+    var remaining = MAX_ACTIVE_SYNC_RESPONSE_BYTES.toLong() + 1
+    while (remaining > 0) {
+        val read = source.read(buffer, minOf(remaining, RESPONSE_READ_CHUNK_BYTES))
+        if (read == -1L) break
+        remaining -= read
+    }
+    if (buffer.size > MAX_ACTIVE_SYNC_RESPONSE_BYTES) throw ActiveSyncResponseTooLargeException()
+    return buffer.readByteArray()
+}
+
+internal fun readActiveSyncResponseBody(
+    requestMethod: String,
+    body: ResponseBody,
+): ByteArray =
+    if (requestMethod.equals("OPTIONS", ignoreCase = true)) byteArrayOf() else readBoundedActiveSyncBody(body)
+
+private const val RESPONSE_READ_CHUNK_BYTES: Long = 8 * 1024
 
 public class AndroidActiveSyncConnectionVerifier(context: Context) : ConnectionVerifier {
     private val delegate: ConnectionVerifier =
         ActiveSyncConnectionVerifier(
             credentialResolver = KeyChainClientCredentialResolver(context.applicationContext),
             transportFactory =
-                OkHttpProbeTransportFactory(
+                OkHttpSecureHttpTransportFactory(
                     CertificateAssetLoader(AndroidCertificateAssetSource(context.assets)),
                 ),
         )
@@ -40,7 +68,7 @@ public class AndroidActiveSyncConnectionVerifier(context: Context) : ConnectionV
     override suspend fun verify(profile: ConnectionProfile): ConnectionCheckResult = delegate.verify(profile)
 }
 
-private class OkHttpProbeTransportFactory(
+internal class OkHttpSecureHttpTransportFactory(
     private val certificateLoader: CertificateAssetLoader,
 ) : ProbeTransportFactory {
     override fun create(credential: ClientCredential): ProbeTransport {
@@ -58,11 +86,11 @@ private class OkHttpProbeTransportFactory(
                 .readTimeout(15, TimeUnit.SECONDS)
                 .callTimeout(30, TimeUnit.SECONDS)
                 .build()
-        return OkHttpProbeTransport(client)
+        return OkHttpSecureHttpTransport(client)
     }
 }
 
-private class OkHttpProbeTransport(
+private class OkHttpSecureHttpTransport(
     private val client: OkHttpClient,
 ) : ProbeTransport {
     override suspend fun execute(request: Request): ProbeResponse =
@@ -77,17 +105,22 @@ private class OkHttpProbeTransport(
 
                     override fun onResponse(call: Call, response: Response) {
                         response.use {
-                            continuation.resumeSafely(
-                                ProbeResponse(
-                                    statusCode = response.code,
-                                    headers =
-                                        response.headers.names().associateWith { name ->
-                                            response.header(name).orEmpty()
-                                        },
-                                    localCertificates = response.handshake?.localCertificates.orEmpty(),
-                                    peerCertificates = response.handshake?.peerCertificates.orEmpty(),
-                                ),
-                            )
+                            try {
+                                continuation.resumeSafely(
+                                    SecureHttpResponse(
+                                        statusCode = response.code,
+                                        headers =
+                                            response.headers.names().associateWith { name ->
+                                                response.header(name).orEmpty()
+                                            },
+                                        body = readActiveSyncResponseBody(request.method, response.body),
+                                        localCertificates = response.handshake?.localCertificates.orEmpty(),
+                                        peerCertificates = response.handshake?.peerCertificates.orEmpty(),
+                                    ),
+                                )
+                            } catch (failure: Exception) {
+                                if (continuation.isActive) continuation.resumeWith(Result.failure(failure))
+                            }
                         }
                     }
                 },

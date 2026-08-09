@@ -15,26 +15,41 @@ import net.mixalich7b.exchangesync.core.connection.SaveConnectionAction
 import net.mixalich7b.exchangesync.core.connection.SaveConnectionResult
 import net.mixalich7b.exchangesync.core.connection.VerifyConnectionAction
 import net.mixalich7b.exchangesync.core.connection.VerifyConnectionResult
+import net.mixalich7b.exchangesync.core.sync.RequestSynchronizationAction
+import net.mixalich7b.exchangesync.core.sync.SyncProblem
+import net.mixalich7b.exchangesync.core.sync.SyncState
+import net.mixalich7b.exchangesync.core.sync.SyncStateRepository
+import net.mixalich7b.exchangesync.core.sync.SynchronizationLifecycleActions
 
 public class SettingsViewModel(
     private val repository: ConnectionProfileRepository,
     private val saveConnection: SaveConnectionAction,
     private val verifyConnection: VerifyConnectionAction,
+    private val synchronizationStateRepository: SyncStateRepository? = null,
+    private val requestSynchronization: RequestSynchronizationAction? = null,
+    private val synchronizationLifecycle: SynchronizationLifecycleActions? = null,
 ) : ViewModel() {
     private val mutableState = MutableStateFlow(SettingsUiState())
     public val state: StateFlow<SettingsUiState> = mutableState.asStateFlow()
     private var savedProfile: net.mixalich7b.exchangesync.core.connection.ConnectionProfile? = null
 
     init {
+        synchronizationStateRepository?.let { syncRepository ->
+            viewModelScope.launch {
+                syncRepository.states.collect { syncState ->
+                    mutableState.update { current -> current.withSynchronization(syncState) }
+                }
+            }
+        }
         viewModelScope.launch {
             try {
                 val profile = repository.load()
-                mutableState.value =
+                mutableState.update { current ->
                     if (profile == null) {
-                        SettingsUiState(isLoading = false)
+                        current.copy(isLoading = false)
                     } else {
                         savedProfile = profile
-                        SettingsUiState(
+                        current.copy(
                             email = profile.email,
                             account = profile.account,
                             serverHost = profile.serverHost,
@@ -44,6 +59,7 @@ public class SettingsViewModel(
                             isLoading = false,
                         )
                     }
+                }
             } catch (cancellation: CancellationException) {
                 throw cancellation
             } catch (_: Exception) {
@@ -78,7 +94,7 @@ public class SettingsViewModel(
 
     public fun onSave() {
         val current = mutableState.value
-        if (current.isLoading || current.operation != null) return
+        if (current.isLoading || current.operation != null || current.syncControlOperation != null) return
         val draft = current.toDraft()
         mutableState.value = current.start(ConnectionOperation.SAVE)
 
@@ -94,6 +110,7 @@ public class SettingsViewModel(
         if (
             current.isLoading ||
                 current.operation != null ||
+                current.syncControlOperation != null ||
                 profile == null ||
                 current.hasUnsavedChanges
         ) {
@@ -107,12 +124,73 @@ public class SettingsViewModel(
         }
     }
 
+    public fun onSyncNow() {
+        val action = requestSynchronization ?: return
+        runSyncControl(SyncControlOperation.RUN_NOW, SettingsUiState::isSyncNowEnabled) {
+            action.execute()
+        }
+    }
+
+    public fun onCancelSynchronization() {
+        val lifecycle = synchronizationLifecycle ?: return
+        runSyncControl(SyncControlOperation.CANCEL, SettingsUiState::isCancelSyncEnabled) {
+            lifecycle.cancel()
+        }
+    }
+
+    public fun onDisableSynchronization() {
+        val lifecycle = synchronizationLifecycle ?: return
+        runSyncControl(SyncControlOperation.DISABLE, SettingsUiState::isDisableSyncEnabled) {
+            lifecycle.disable()
+        }
+    }
+
+    public fun onEnableSynchronization() {
+        val lifecycle = synchronizationLifecycle ?: return
+        runSyncControl(SyncControlOperation.ENABLE, SettingsUiState::isEnableSyncEnabled) {
+            lifecycle.enable()
+        }
+    }
+
+    private fun runSyncControl(
+        operation: SyncControlOperation,
+        isAllowed: (SettingsUiState) -> Boolean,
+        action: suspend () -> Any?,
+    ) {
+        val current = mutableState.value
+        if (!isAllowed(current)) return
+        mutableState.value = current.copy(syncControlOperation = operation)
+        viewModelScope.launch {
+            try {
+                action()
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (_: Exception) {
+                mutableState.update { latest ->
+                    if (latest.syncControlOperation == operation) {
+                        latest.copy(syncProblem = SyncProblem.BACKGROUND_SCHEDULING)
+                    } else {
+                        latest
+                    }
+                }
+            } finally {
+                mutableState.update { latest ->
+                    if (latest.syncControlOperation == operation) {
+                        latest.copy(syncControlOperation = null)
+                    } else {
+                        latest
+                    }
+                }
+            }
+        }
+    }
+
     private fun updateField(
         field: ConnectionField,
         transform: (SettingsUiState) -> SettingsUiState,
     ) {
         mutableState.update { current ->
-            if (current.isLoading || current.operation != null) {
+            if (current.isLoading || current.operation != null || current.syncControlOperation != null) {
                 current
             } else {
                 val updated = transform(current)
@@ -206,4 +284,13 @@ public class SettingsViewModel(
             account == profile.account &&
             serverHost == profile.serverHost &&
             clientCertificateAlias == profile.clientCertificateAlias
+
+    private fun SettingsUiState.withSynchronization(syncState: SyncState): SettingsUiState =
+        copy(
+            syncEnabled = syncState.enabled,
+            syncPhase = syncState.phase,
+            syncProblem = syncState.problem,
+            lastSuccessfulSyncEpochMillis = syncState.lastSuccessfulEpochMillis,
+            notificationPermissionDenied = syncState.notificationPermissionDenied,
+        )
 }

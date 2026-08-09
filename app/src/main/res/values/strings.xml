@@ -1,4 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Exchange Sync</string>
+    <string name="sync_problem_channel_name">Проблемы синхронизации</string>
+    <string name="sync_problem_channel_description">Ошибки синхронизации календаря, требующие внимания</string>
+    <string name="sync_problem_notification_title">Синхронизация календаря требует внимания</string>
+    <string name="sync_problem_certificate">Клиентский сертификат недоступен</string>
+    <string name="sync_problem_tls">Не удалось установить защищённое соединение</string>
+    <string name="sync_problem_access">Сервер отклонил доступ</string>
+    <string name="sync_problem_compatibility">Сервер не поддерживает необходимую синхронизацию</string>
+    <string name="sync_problem_primary_calendar">Основной календарь Exchange не найден</string>
+    <string name="sync_problem_protocol_data">Сервер вернул неподдерживаемые данные календаря</string>
+    <string name="sync_problem_calendar_permission">Разрешите доступ к календарю</string>
+    <string name="sync_problem_calendar_provider">Не удалось обновить системный календарь</string>
+    <string name="sync_problem_availability">Сервер временно недоступен после нескольких попыток</string>
 </resources>

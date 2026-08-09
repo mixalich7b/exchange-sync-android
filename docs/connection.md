@@ -3,9 +3,11 @@
 ## Область capability
 
 Capability `connection-settings` управляет единственным профилем подключения и
-проверяет, что указанный сервер доступен по HTTPS с выбранной mTLS identity и
-объявляет необходимые возможности Exchange ActiveSync. Она не читает mailbox
-или календарь и не создаёт фоновые задачи.
+проверяет, что сервер доступен по HTTPS с выбранной mTLS identity и объявляет
+необходимые возможности Exchange ActiveSync. Сам capability probe не читает
+mailbox. После успешного первого или изменённого Save реализация `calendar-sync`
+атомарно активирует новую generation, очищает owned calendar и создаёт фоновые
+задачи; неизменённый recheck этого не делает.
 
 Нормативные сценарии находятся в
 [`openspec/specs/connection-settings/spec.md`](../openspec/specs/connection-settings/spec.md).
@@ -70,7 +72,9 @@ Save выполняется в следующем порядке:
 2. разрешение KeyChain alias;
 3. создание TLS transport;
 4. HTTPS/mTLS и ActiveSync capability probe;
-5. атомарная замена профиля в DataStore.
+5. атомарная замена профиля вместе с увеличением synchronization
+   generation/run token и сбросом checkpoints;
+6. очистка owned calendar и durable WorkManager handoff.
 
 Любая ошибка до последнего шага оставляет предыдущий сохранённый профиль без
 изменений. Введённый draft остаётся на экране для исправления.
@@ -101,9 +105,13 @@ Probe завершается ошибкой redirect policy, если `Location`
 Успешный terminal response должен одновременно предоставить:
 
 - HTTP 200;
-- непустой `MS-ASProtocolVersions` хотя бы с одной версией `12.1`, `14.0`,
-  `14.1`, `16.0` или `16.1`;
+- непустой `MS-ASProtocolVersions` хотя бы с одной версией `14.0`, `14.1`,
+  `16.0` или `16.1`; сервер только с 12.1 отклоняется как несовместимый;
 - `MS-ASProtocolCommands` с командами `FolderSync` и `Sync`.
+
+Тело ответа `OPTIONS` не читается и не участвует в результате probe: для
+capability check значимы только terminal status, обязательные заголовки и TLS
+diagnostics.
 
 Токены заголовков разделяются запятыми и очищаются от пробелов; имена команд
 сопоставляются без учёта регистра. Terminal TLS handshake также должен содержать
@@ -159,12 +167,17 @@ Stack traces, закрытый ключ и другой key material в presenta
 
 ## Хранение и границы безопасности
 
-DataStore сохраняет только четыре поля профиля. TLS-диагностика существует
-только в памяти текущего ViewModel и после пересоздания приложения не
-восстанавливается. Пароль в модели отсутствует, а
-`domain\login` в текущем capability не превращается в HTTP Authorization header:
-probe подтверждает mTLS и возможности endpoint. Calendar operations, workers,
-reminders и notifications при любом исходе Save не запускаются.
+DataStore сохраняет четыре поля профиля и отдельную non-secret sync metadata:
+generation/run token, phase, safe problem, device ID и ActiveSync checkpoints.
+TLS-диагностика существует только в памяти текущего ViewModel и после
+пересоздания приложения не восстанавливается. Пароль в модели отсутствует.
+`OPTIONS` probe не создаёт HTTP Authorization header; календарные ActiveSync
+команды передают `domain\login` как percent-encoded `User` query parameter и
+используют ту же выбранную mTLS identity.
+
+Неуспешная проверка не изменяет профиль и не запускает cleanup/work. Успешный
+изменённый Save активирует полный sync; успешный неизменённый recheck не меняет
+профиль, generation, календарь или WorkManager schedules.
 
 ## Принятые ограничения
 
@@ -175,6 +188,7 @@ reminders и notifications при любом исходе Save не запуск
 - Синхронное создание trust managers, `SSLContext` и OkHttp-клиента выполняется
   вне Main dispatcher, но не имеет жёсткого deadline и может превысить
   номинальный probe timeout при блокировке security provider.
-- Парольная аутентификация и передача `domain\login` серверу не реализованы.
+- Парольная HTTP-аутентификация не реализована; calendar-команды используют
+  mTLS и передают `domain\login` только как ActiveSync query-параметр `User`.
 - Автоматическая бесшовная смена server certificates и certificate pinning не
   реализованы.

@@ -4,6 +4,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.mutablePreferencesOf
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -48,12 +49,13 @@ class DataStoreConnectionProfileRepositoryTest {
         }
 
     @Test
-    fun `replacement performs one atomic update containing only the profile`() =
+    fun `replacement updates only the profile namespace in the shared store`() =
         runTest {
             val initial =
                 mutablePreferencesOf(
                     stringPreferencesKey("connection_email") to "old@example.test",
                     stringPreferencesKey("unrelated") to "must-not-survive",
+                    longPreferencesKey("sync.generation") to 7L,
                 )
             val store = RecordingDataStore(initial)
             val repository = DataStoreConnectionProfileRepository(store)
@@ -67,6 +69,8 @@ class DataStoreConnectionProfileRepositoryTest {
                     "connection_account" to "DOMAIN\\calendar",
                     "connection_server_host" to "exchange.example.test",
                     "connection_client_certificate_alias" to "work-certificate",
+                    "unrelated" to "must-not-survive",
+                    "sync.generation" to 7L,
                 ),
                 store.current.asMap().mapKeys { (key, _) -> key.name },
             )

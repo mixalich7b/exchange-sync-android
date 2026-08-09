@@ -2,19 +2,25 @@
 
 ## Текущая граница
 
-Сейчас реализованы настройка единственного профиля Exchange и проверка
-подключения. Приложение собирает параметры, выбирает установленный в Android
-клиентский сертификат, проверяет HTTPS, mTLS и совместимость ActiveSync, после
-чего сохраняет подтверждённый профиль.
+Реализованы настройка единственного профиля Exchange, проверка HTTPS/mTLS и
+совместимости ActiveSync, а также одностороннее зеркало основного календаря
+Exchange в отдельный локальный календарь Android. Синхронизация переносит
+историю и будущие события, напоминания, attendees, recurrence и exceptions.
+Непринятые приглашения сохраняются как tentative и получают бледный
+event-color override; после принятия та же запись обновляется без смены
+ServerId identity и без дубликата.
 
-Чтение календаря с Exchange, запись через Android Calendar Provider, фоновая
-синхронизация, перенос напоминаний и системные уведомления не реализованы. Они
-остаются границей последующих OpenSpec changes.
+Ручная и 15-минутная периодическая синхронизация выполняются через WorkManager,
+продолжаются без Activity и используют retry/backoff. Постоянные проблемы
+сохраняются в DataStore и, при наличии разрешения, показываются одним системным
+уведомлением. Реализация не регистрирует Android Exchange account или
+SyncAdapter и не отправляет локальные изменения обратно на сервер.
 
 Нормативное поведение описано в
 [`openspec/specs/`](../openspec/specs/), прежде всего в спецификациях
-[`connection-settings`](../openspec/specs/connection-settings/spec.md) и
-[`project-bootstrap`](../openspec/specs/project-bootstrap/spec.md).
+[`connection-settings`](../openspec/specs/connection-settings/spec.md),
+[`calendar-sync`](../openspec/specs/calendar-sync/spec.md)
+и [`project-bootstrap`](../openspec/specs/project-bootstrap/spec.md).
 
 ## Модули и зависимости
 
@@ -27,10 +33,10 @@
 
 | Модуль | Ответственность |
 |---|---|
-| `:app` | Launcher Activity, manifest, Android certificate chooser и ручная композиция зависимостей |
-| `:core` | Android-независимые модели профиля, валидация, категории ошибок, общая проверка draft и сценарий сохранения |
-| `:feature:settings` | Immutable UI state, ViewModel, Compose-экран, повторная проверка и отображение типизированных результатов |
-| `:infrastructure` | DataStore, Android KeyChain, загрузка локальных CA, TLS trust managers и ActiveSync HTTP probe с TLS-метаданными |
+| `:app` | Application/Activity, manifest, permission и certificate launchers, ресурсы уведомления и ручная композиция |
+| `:core` | Android-независимые модели профиля/календаря, sync state machine, fencing, mapping и use cases |
+| `:feature:settings` | Immutable UI state, ViewModel, Compose-форма, статус синхронизации и управляющие действия |
+| `:infrastructure` | DataStore, KeyChain/TLS, ActiveSync/WBXML, Calendar Provider, WorkManager, permissions и notifications |
 
 `:feature:settings` не зависит от `:infrastructure`, а `:core` остаётся чистым
 Kotlin/JVM-модулем без Android и HTTP API. Такое разделение оставляет доменную
@@ -38,13 +44,18 @@ Kotlin/JVM-модулем без Android и HTTP API. Такое разделе�
 
 ## Композиция приложения
 
-`MainActivity` создаёт `AppContainer`, а контейнер вручную связывает:
+`ExchangeSyncApplication` создаёт один `AppContainer` на процесс, а контейнер
+вручную связывает:
 
-- единственный `DataStoreConnectionProfileRepository`;
-- Android-адаптер проверки ActiveSync;
+- общий Preferences DataStore для профиля и sync metadata;
+- Android-адаптеры проверки и календарных команд ActiveSync;
+- owned-only Calendar Provider adapter;
+- WorkManager scheduler и ручной `WorkerFactory`;
+- permission port и generation-aware notification reporter;
 - один core-сценарий `VerifyConnection`, используемый и `SaveConnection`, и
   ручной повторной проверкой;
-- core-сценарий `SaveConnection`;
+- core-сценарии `SaveConnection`, lifecycle, manual/periodic trigger и bounded
+  execution slice;
 - `SettingsViewModel` через lifecycle-aware `ViewModelProvider`.
 
 Dependency-injection framework не используется. Android KeyChain chooser
@@ -61,9 +72,11 @@ alias выбранного сертификата.
    сертификатов только на время проверки.
 4. Infrastructure создаёт объединённый TLS-контекст и выполняет ActiveSync
    `OPTIONS` probe.
-5. После полного успеха core одним вызовом заменяет единственный профиль в
-   DataStore.
-6. ViewModel показывает подключённое состояние либо сохраняет введённый draft
+5. После полного успеха profile replacement и новая synchronization generation
+   фиксируются одной DataStore-транзакцией.
+6. В non-cancellable post-commit handoff очищается только owned calendar,
+   восстанавливаются periodic/immediate work и запускается полный sync.
+7. ViewModel показывает подключённое состояние либо сохраняет введённый draft
    и отображает типизированную ошибку.
 
 Редактирование формы и выбор сертификата сами по себе не запускают сеть и не
@@ -90,6 +103,13 @@ ViewModel хранит private snapshot последнего загруженн�
 во время любой проверки заблокированы все поля, chooser и оба действия; поздний
 результат не может быть показан для другого draft.
 
+Provider mutations и изменения generation/run token сериализуются общим
+`SynchronizationMutationLock`. Поэтому старый worker либо завершает атомарный
+Calendar Provider batch до profile/cancel/disable fence, либо после fence
+становится obsolete до `resolveOwned`, cleanup или `applyBatch`. Calendar page
+фиксируется provider-first; новый SyncKey сохраняется только после успешного
+batch, поэтому повтор после crash идемпотентен по ServerId.
+
 Получение материала из KeyChain и создание TLS transport выполняются вне Main
 dispatcher. Создание trust managers, `SSLContext` и OkHttp-клиента синхронно и
 не получает отдельный жёсткий deadline. Если security provider блокируется,
@@ -105,18 +125,24 @@ Preferences DataStore содержит ровно один профиль:
 - hostname сервера;
 - непрозрачный KeyChain alias.
 
-Пароль, закрытый ключ, байты сертификата, ответы сервера, TLS-диагностика и
-ошибки не сохраняются. Успешная TLS-диагностика содержит только public metadata
+В том же DataStore, под отдельным `sync.` namespace, находятся non-secret
+generation/run token, phase, safe problem category, device ID, last-success и
+ActiveSync endpoint/version/folder/collection checkpoints. Пароль, закрытый
+ключ, байты сертификата, ответы сервера, event payload, exception text,
+TLS-диагностика и stack trace не сохраняются. Успешная TLS-диагностика содержит только public metadata
 terminal peer chain: hostname, subject/issuer, serial, validity и SHA-256
 fingerprint. Android продолжает владеть закрытым ключом, а backup приложения
 отключён.
 
 ## Проверка реализации
 
-Автоматическая граница ограничена JVM unit-тестами. Pure policy, persistence
-codec, TLS-композиция, ActiveSync policy, классификация ошибок и ViewModel
-проверяются с fakes. Android KeyChain, реальный TLS provider и сервер остаются
-тонкими интеграционными границами, которые подтверждаются компиляцией, Android
-Lint, debug-сборкой и при необходимости ручной проверкой на Android 16.
+Автоматическая граница ограничена JVM/Android-local unit-тестами без Robolectric
+и instrumentation. Pure policy, persistence codec, WBXML/ActiveSync fixtures,
+mapping, provider batch planning, worker policy, TLS, notifications и ViewModel
+проверяются с fakes. Android KeyChain, настоящий Calendar Provider, WorkManager
+runtime и живой Exchange/mTLS server остаются тонкими интеграционными границами:
+код для них проверяется компиляцией, Android Lint и debug-сборкой. Полный
+server-backed checklist должен отдельно выполняться вручную на Android 16; эта
+документация не утверждает, что такой прогон уже состоялся.
 
 Актуальные команды находятся в [`AGENTS.md`](../AGENTS.md).

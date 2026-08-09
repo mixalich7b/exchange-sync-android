@@ -10,6 +10,8 @@ import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import net.mixalich7b.exchangesync.core.connection.ConnectionDraft
 import net.mixalich7b.exchangesync.core.connection.ConnectionFailure
 import net.mixalich7b.exchangesync.core.connection.ConnectionField
@@ -22,6 +24,16 @@ import net.mixalich7b.exchangesync.core.connection.TlsCertificateDiagnostic
 import net.mixalich7b.exchangesync.core.connection.TlsConnectionDiagnostics
 import net.mixalich7b.exchangesync.core.connection.VerifyConnectionAction
 import net.mixalich7b.exchangesync.core.connection.VerifyConnectionResult
+import net.mixalich7b.exchangesync.core.sync.RequestSynchronizationAction
+import net.mixalich7b.exchangesync.core.sync.SyncCancellationOutcome
+import net.mixalich7b.exchangesync.core.sync.SyncDisableOutcome
+import net.mixalich7b.exchangesync.core.sync.SyncLifecycleOutcome
+import net.mixalich7b.exchangesync.core.sync.SyncPhase
+import net.mixalich7b.exchangesync.core.sync.SyncProblem
+import net.mixalich7b.exchangesync.core.sync.SyncRunRequest
+import net.mixalich7b.exchangesync.core.sync.SyncState
+import net.mixalich7b.exchangesync.core.sync.SyncStateRepository
+import net.mixalich7b.exchangesync.core.sync.SynchronizationLifecycleActions
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
@@ -302,6 +314,184 @@ class SettingsViewModelTest {
             assertEquals(SettingsConnectionError.SERVER_TRUST, viewModel.state.value.connectionError)
         }
 
+    @Test
+    fun `recovered synchronization state exposes status controls permissions and persistent problems`() =
+        runUiTest {
+            val syncRepository = FakeSyncStateRepository(SyncState.initial().copy(generation = 3, runToken = 4))
+            val viewModel =
+                SettingsViewModel(
+                    repository = FakeRepository(profile()),
+                    saveConnection = RecordingSaveAction(),
+                    verifyConnection = RecordingVerifyAction(),
+                    synchronizationStateRepository = syncRepository,
+                    requestSynchronization = RecordingSyncRequest(),
+                    synchronizationLifecycle = RecordingSyncLifecycle(),
+                )
+            advanceUntilIdle()
+
+            assertTrue(viewModel.state.value.isEnableSyncVisible)
+            assertFalse(viewModel.state.value.isSyncNowVisible)
+
+            syncRepository.replace(
+                SyncState.initial().copy(
+                    enabled = true,
+                    generation = 3,
+                    runToken = 4,
+                    phase = SyncPhase.IDLE,
+                    lastSuccessfulEpochMillis = 1_800_000_000_000,
+                ),
+            )
+            advanceUntilIdle()
+            assertTrue(viewModel.state.value.isSyncNowVisible)
+            assertTrue(viewModel.state.value.isSyncNowEnabled)
+            assertTrue(viewModel.state.value.isDisableSyncVisible)
+            assertEquals(1_800_000_000_000, viewModel.state.value.lastSuccessfulSyncEpochMillis)
+
+            syncRepository.replace(syncRepository.current.copy(phase = SyncPhase.DOWNLOADING))
+            advanceUntilIdle()
+            assertTrue(viewModel.state.value.isCancelSyncVisible)
+            assertEquals(SyncPhase.DOWNLOADING, viewModel.state.value.syncPhase)
+
+            syncRepository.replace(
+                syncRepository.current.copy(
+                    phase = SyncPhase.BLOCKED,
+                    problem = SyncProblem.CALENDAR_PERMISSION,
+                    notificationPermissionDenied = true,
+                ),
+            )
+            advanceUntilIdle()
+            assertEquals(SyncProblem.CALENDAR_PERMISSION, viewModel.state.value.syncProblem)
+            assertTrue(viewModel.state.value.isCalendarPermissionActionVisible)
+            assertTrue(viewModel.state.value.isNotificationPermissionActionVisible)
+        }
+
+    @Test
+    fun `synchronization controls delegate run cancel disable and enable actions`() =
+        runUiTest {
+            val syncRepository =
+                FakeSyncStateRepository(
+                    SyncState.initial().copy(enabled = true, generation = 3, runToken = 4, phase = SyncPhase.IDLE),
+                )
+            val request = RecordingSyncRequest()
+            val lifecycle = RecordingSyncLifecycle()
+            val viewModel =
+                SettingsViewModel(
+                    FakeRepository(profile()),
+                    RecordingSaveAction(),
+                    RecordingVerifyAction(),
+                    syncRepository,
+                    request,
+                    lifecycle,
+                )
+            advanceUntilIdle()
+
+            viewModel.onSyncNow()
+            advanceUntilIdle()
+            syncRepository.replace(syncRepository.current.copy(phase = SyncPhase.DOWNLOADING))
+            advanceUntilIdle()
+            viewModel.onCancelSynchronization()
+            advanceUntilIdle()
+            viewModel.onDisableSynchronization()
+            advanceUntilIdle()
+            syncRepository.replace(syncRepository.current.copy(enabled = false, phase = SyncPhase.DISABLED))
+            advanceUntilIdle()
+            viewModel.onEnableSynchronization()
+            advanceUntilIdle()
+
+            assertEquals(1, request.attempts)
+            assertEquals(1, lifecycle.cancelAttempts)
+            assertEquals(1, lifecycle.disableAttempts)
+            assertEquals(1, lifecycle.enableAttempts)
+        }
+
+    @Test
+    fun `synchronization control failure becomes an actionable UI problem`() =
+        runUiTest {
+            val lifecycle = RecordingSyncLifecycle(disableFailure = IllegalStateException("scheduler failed"))
+            val viewModel =
+                SettingsViewModel(
+                    FakeRepository(profile()),
+                    RecordingSaveAction(),
+                    RecordingVerifyAction(),
+                    FakeSyncStateRepository(
+                        SyncState.initial().copy(enabled = true, generation = 1, runToken = 1, phase = SyncPhase.IDLE),
+                    ),
+                    RecordingSyncRequest(),
+                    lifecycle,
+                )
+            advanceUntilIdle()
+
+            viewModel.onDisableSynchronization()
+            advanceUntilIdle()
+
+            assertEquals(1, lifecycle.disableAttempts)
+            assertNull(viewModel.state.value.syncControlOperation)
+            assertEquals(SyncProblem.BACKGROUND_SCHEDULING, viewModel.state.value.syncProblem)
+        }
+
+    @Test
+    fun `active save excludes synchronization control actions`() =
+        runUiTest {
+            val gate = CompletableDeferred<SaveConnectionResult>()
+            val request = RecordingSyncRequest()
+            val lifecycle = RecordingSyncLifecycle()
+            val viewModel =
+                SettingsViewModel(
+                    FakeRepository(profile()),
+                    RecordingSaveAction(gate = gate),
+                    RecordingVerifyAction(),
+                    FakeSyncStateRepository(
+                        SyncState.initial().copy(enabled = true, generation = 1, runToken = 1, phase = SyncPhase.IDLE),
+                    ),
+                    request,
+                    lifecycle,
+                )
+            advanceUntilIdle()
+
+            viewModel.onSave()
+            viewModel.onSyncNow()
+            viewModel.onDisableSynchronization()
+
+            assertFalse(viewModel.state.value.isSyncNowEnabled)
+            assertEquals(0, request.attempts)
+            assertEquals(0, lifecycle.disableAttempts)
+            gate.complete(SaveConnectionResult.Saved(profile(), diagnostics()))
+            advanceUntilIdle()
+        }
+
+    @Test
+    fun `active synchronization control excludes save recheck and profile editing`() =
+        runUiTest {
+            val disableGate = CompletableDeferred<Unit>()
+            val save = RecordingSaveAction()
+            val verify = RecordingVerifyAction()
+            val lifecycle = RecordingSyncLifecycle(disableGate)
+            val viewModel =
+                SettingsViewModel(
+                    FakeRepository(profile()),
+                    save,
+                    verify,
+                    FakeSyncStateRepository(
+                        SyncState.initial().copy(enabled = true, generation = 1, runToken = 1, phase = SyncPhase.IDLE),
+                    ),
+                    RecordingSyncRequest(),
+                    lifecycle,
+                )
+            advanceUntilIdle()
+            val email = viewModel.state.value.email
+
+            viewModel.onDisableSynchronization()
+            viewModel.onRecheck()
+            viewModel.onSave()
+            viewModel.onEmailChanged("other@example.test")
+
+            assertEquals(email, viewModel.state.value.email)
+            assertTrue(save.drafts.isEmpty())
+            assertTrue(verify.drafts.isEmpty())
+            disableGate.complete(Unit)
+            advanceUntilIdle()
+        }
+
     private class FakeRepository(
         var current: ConnectionProfile?,
     ) : ConnectionProfileRepository {
@@ -336,6 +526,61 @@ class SettingsViewModelTest {
             drafts += draft
             return result
         }
+    }
+
+    private class FakeSyncStateRepository(initial: SyncState) : SyncStateRepository {
+        private val mutableStates = MutableStateFlow(initial)
+        override val states: Flow<SyncState> = mutableStates
+        val current: SyncState
+            get() = mutableStates.value
+
+        override suspend fun load(): SyncState = current
+
+        override suspend fun update(transform: (SyncState) -> SyncState): SyncState =
+            transform(current).also { mutableStates.value = it }
+
+        fun replace(state: SyncState) {
+            mutableStates.value = state
+        }
+    }
+
+    private class RecordingSyncRequest : RequestSynchronizationAction {
+        var attempts = 0
+
+        override suspend fun execute(): SyncRunRequest {
+            attempts += 1
+            return SyncRunRequest.Ignored(SyncState.initial())
+        }
+    }
+
+    private class RecordingSyncLifecycle(
+        private val disableGate: CompletableDeferred<Unit>? = null,
+        private val disableFailure: Exception? = null,
+    ) : SynchronizationLifecycleActions {
+        var cancelAttempts = 0
+        var disableAttempts = 0
+        var enableAttempts = 0
+
+        override suspend fun cancel(): SyncCancellationOutcome {
+            cancelAttempts += 1
+            return SyncCancellationOutcome.Cancelled
+        }
+
+        override suspend fun disable(): SyncDisableOutcome {
+            disableAttempts += 1
+            disableGate?.await()
+            disableFailure?.let { failure -> throw failure }
+            return SyncDisableOutcome.Disabled
+        }
+
+        override suspend fun enable(): SyncLifecycleOutcome {
+            enableAttempts += 1
+            return SyncLifecycleOutcome.Ignored
+        }
+
+        override suspend fun onCalendarPermissionResult(): SyncLifecycleOutcome = SyncLifecycleOutcome.Ignored
+
+        override suspend fun onNotificationPermissionResult() = Unit
     }
 
     private fun validDraft(): ConnectionDraft =

@@ -1,6 +1,7 @@
 package net.mixalich7b.exchangesync.infrastructure.activesync
 
 import net.mixalich7b.exchangesync.core.connection.ConnectionFailure
+import net.mixalich7b.exchangesync.core.sync.ActiveSyncVersion
 import okhttp3.HttpUrl
 import okhttp3.Request
 
@@ -52,7 +53,6 @@ internal class RedirectTracker(
 }
 
 internal object ActiveSyncResponseEvaluator {
-    private val supportedVersions = setOf("12.1", "14.0", "14.1", "16.0", "16.1")
     private val requiredCommands = setOf("foldersync", "sync")
 
     fun evaluate(
@@ -62,9 +62,8 @@ internal object ActiveSyncResponseEvaluator {
     ): ConnectionFailure? {
         if (statusCode != 200) return classifyStatus(statusCode)
 
-        val versions = tokens(protocolVersions)
         val commands = tokens(protocolCommands).map(String::lowercase).toSet()
-        return if (versions.any(supportedVersions::contains) && commands.containsAll(requiredCommands)) {
+        return if (ActiveSyncVersionNegotiator.select(protocolVersions) != null && commands.containsAll(requiredCommands)) {
             null
         } else {
             ConnectionFailure.PROTOCOL_INCOMPATIBLE
@@ -87,4 +86,17 @@ internal object ActiveSyncResponseEvaluator {
             in 300..399 -> ConnectionFailure.REDIRECT_POLICY
             else -> ConnectionFailure.ENDPOINT_MISMATCH
         }
+}
+
+internal object ActiveSyncVersionNegotiator {
+    fun select(header: String?): ActiveSyncVersion? {
+        val offered =
+            header
+                ?.split(',')
+                ?.map(String::trim)
+                ?.filter(String::isNotEmpty)
+                ?.toSet()
+                .orEmpty()
+        return ActiveSyncVersion.entries.lastOrNull { version -> version.wireValue in offered }
+    }
 }

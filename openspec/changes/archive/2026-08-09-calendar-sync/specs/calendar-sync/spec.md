@@ -28,7 +28,11 @@ The application SHALL use the saved profile's HTTPS endpoint, selected mTLS iden
 - **THEN** the application writes no calendar changes and reports that the server policy is unsupported instead of registering a system Exchange account or accepting device-management policy
 
 ### Requirement: Complete initial calendar synchronization
-The application SHALL begin a full collection synchronization with an ActiveSync `SyncKey` of `0`, request changes without a past or future date filter, and continue requesting pages until the server reports no more available changes. It SHALL retain all history and all future events returned by the server rather than imposing an application time horizon.
+The application SHALL begin a full collection synchronization by priming the collection with an ActiveSync `SyncKey` of `0` without `GetChanges`, then use the synchronization key returned by that successful response to request changes without a past or future date filter. It SHALL continue requesting pages until the server reports no more available changes and retain all history and all future events returned by the server rather than imposing an application time horizon.
+
+#### Scenario: Full synchronization primes the collection key
+- **WHEN** a full synchronization has selected the primary Calendar collection
+- **THEN** the application first sends `SyncKey=0` without `GetChanges`, persists no calendar page from that priming response, and sends unfiltered `GetChanges` only with the nonzero key returned by the server
 
 #### Scenario: Full synchronization spans multiple pages
 - **WHEN** the server returns one or more pages marked as having more changes available

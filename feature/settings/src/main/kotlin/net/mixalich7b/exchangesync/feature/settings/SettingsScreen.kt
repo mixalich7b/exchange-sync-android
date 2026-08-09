@@ -34,11 +34,16 @@ import java.time.format.FormatStyle
 import java.util.Locale
 import net.mixalich7b.exchangesync.core.connection.ConnectionField
 import net.mixalich7b.exchangesync.core.connection.TlsCertificateDiagnostic
+import net.mixalich7b.exchangesync.core.sync.SyncPhase
+import net.mixalich7b.exchangesync.core.sync.SyncProblem
 
 @Composable
 public fun SettingsRoute(
     viewModel: SettingsViewModel,
     onSelectCertificate: () -> Unit,
+    onRequestCalendarPermission: () -> Unit,
+    onRequestNotificationPermission: () -> Unit,
+    onOpenNotificationSettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val uiState by viewModel.state.collectAsStateWithLifecycle()
@@ -50,6 +55,13 @@ public fun SettingsRoute(
         onSelectCertificate = onSelectCertificate,
         onSave = viewModel::onSave,
         onRecheck = viewModel::onRecheck,
+        onSyncNow = viewModel::onSyncNow,
+        onCancelSynchronization = viewModel::onCancelSynchronization,
+        onDisableSynchronization = viewModel::onDisableSynchronization,
+        onEnableSynchronization = viewModel::onEnableSynchronization,
+        onRequestCalendarPermission = onRequestCalendarPermission,
+        onRequestNotificationPermission = onRequestNotificationPermission,
+        onOpenNotificationSettings = onOpenNotificationSettings,
         modifier = modifier,
     )
 }
@@ -63,6 +75,13 @@ public fun SettingsScreen(
     onSelectCertificate: () -> Unit,
     onSave: () -> Unit,
     onRecheck: () -> Unit,
+    onSyncNow: () -> Unit,
+    onCancelSynchronization: () -> Unit,
+    onDisableSynchronization: () -> Unit,
+    onEnableSynchronization: () -> Unit,
+    onRequestCalendarPermission: () -> Unit,
+    onRequestNotificationPermission: () -> Unit,
+    onOpenNotificationSettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Surface(
@@ -213,6 +232,131 @@ public fun SettingsScreen(
                     )
                 }
             }
+            if (uiState.hasSavedProfile) {
+                Spacer(modifier = Modifier.height(32.dp))
+                SynchronizationSection(
+                    uiState = uiState,
+                    onSyncNow = onSyncNow,
+                    onCancelSynchronization = onCancelSynchronization,
+                    onDisableSynchronization = onDisableSynchronization,
+                    onEnableSynchronization = onEnableSynchronization,
+                    onRequestCalendarPermission = onRequestCalendarPermission,
+                    onRequestNotificationPermission = onRequestNotificationPermission,
+                    onOpenNotificationSettings = onOpenNotificationSettings,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SynchronizationSection(
+    uiState: SettingsUiState,
+    onSyncNow: () -> Unit,
+    onCancelSynchronization: () -> Unit,
+    onDisableSynchronization: () -> Unit,
+    onEnableSynchronization: () -> Unit,
+    onRequestCalendarPermission: () -> Unit,
+    onRequestNotificationPermission: () -> Unit,
+    onOpenNotificationSettings: () -> Unit,
+) {
+    Text(stringResource(R.string.sync_title), style = MaterialTheme.typography.headlineSmall)
+    Spacer(modifier = Modifier.height(8.dp))
+    Text(
+        text = stringResource(uiState.syncPhase.messageResource()),
+        color =
+            if (uiState.syncProblem == null) {
+                MaterialTheme.colorScheme.onSurface
+            } else {
+                MaterialTheme.colorScheme.error
+            },
+        style = MaterialTheme.typography.bodyLarge,
+    )
+    Spacer(modifier = Modifier.height(4.dp))
+    Text(
+        text =
+            uiState.lastSuccessfulSyncEpochMillis?.let { epochMillis ->
+                stringResource(R.string.sync_last_success, Instant.ofEpochMilli(epochMillis).localizedDateTime())
+            } ?: stringResource(R.string.sync_never_completed),
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    if (uiState.syncEnabled) {
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            stringResource(R.string.sync_periodic_hint),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    uiState.syncProblem?.let { problem ->
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            stringResource(problem.messageResource()),
+            color = MaterialTheme.colorScheme.error,
+            style = MaterialTheme.typography.bodyMedium,
+        )
+    }
+    if (uiState.isCalendarPermissionActionVisible) {
+        Spacer(modifier = Modifier.height(8.dp))
+        Button(
+            onClick = onRequestCalendarPermission,
+            enabled = uiState.operation == null && uiState.syncControlOperation == null,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(stringResource(R.string.sync_grant_calendar_access))
+        }
+    }
+    if (uiState.isNotificationPermissionActionVisible) {
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            stringResource(R.string.sync_notification_permission_denied),
+            color = MaterialTheme.colorScheme.error,
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Button(onClick = onRequestNotificationPermission, modifier = Modifier.fillMaxWidth()) {
+            Text(stringResource(R.string.sync_grant_notification_access))
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+        OutlinedButton(onClick = onOpenNotificationSettings, modifier = Modifier.fillMaxWidth()) {
+            Text(stringResource(R.string.sync_open_notification_settings))
+        }
+    }
+    if (uiState.isSyncNowVisible) {
+        Spacer(modifier = Modifier.height(12.dp))
+        Button(onClick = onSyncNow, enabled = uiState.isSyncNowEnabled, modifier = Modifier.fillMaxWidth()) {
+            Text(stringResource(R.string.sync_now))
+        }
+    }
+    if (uiState.isCancelSyncVisible) {
+        Spacer(modifier = Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = onCancelSynchronization,
+            enabled = uiState.isCancelSyncEnabled,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(stringResource(R.string.sync_cancel))
+        }
+    }
+    if (uiState.isDisableSyncVisible) {
+        Spacer(modifier = Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = onDisableSynchronization,
+            enabled = uiState.isDisableSyncEnabled,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(stringResource(R.string.sync_disable))
+        }
+    }
+    if (uiState.isEnableSyncVisible) {
+        Spacer(modifier = Modifier.height(12.dp))
+        Button(
+            onClick = onEnableSynchronization,
+            enabled = uiState.isEnableSyncEnabled,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(stringResource(R.string.sync_enable))
         }
     }
 }
@@ -346,3 +490,44 @@ private fun Instant.localizedDate(): String =
         .withLocale(Locale.getDefault())
         .withZone(ZoneId.systemDefault())
         .format(this)
+
+private fun Instant.localizedDateTime(): String =
+    DateTimeFormatter
+        .ofLocalizedDateTime(FormatStyle.MEDIUM)
+        .withLocale(Locale.getDefault())
+        .withZone(ZoneId.systemDefault())
+        .format(this)
+
+private fun SyncPhase.messageResource(): Int =
+    when (this) {
+        SyncPhase.DISABLED -> R.string.sync_disabled
+        SyncPhase.IDLE -> R.string.sync_idle
+        SyncPhase.QUEUED -> R.string.sync_queued
+        SyncPhase.DISCOVERING_PROTOCOL -> R.string.sync_discovering_protocol
+        SyncPhase.DISCOVERING_FOLDERS -> R.string.sync_discovering_folders
+        SyncPhase.DOWNLOADING -> R.string.sync_downloading
+        SyncPhase.APPLYING -> R.string.sync_applying
+        SyncPhase.CANCELLING -> R.string.sync_cancelling
+        SyncPhase.BLOCKED -> R.string.sync_blocked
+    }
+
+private fun SyncProblem.messageResource(): Int =
+    when (this) {
+        SyncProblem.CLIENT_CERTIFICATE -> R.string.sync_problem_certificate
+        SyncProblem.TLS -> R.string.sync_problem_tls
+        SyncProblem.ACCESS,
+        SyncProblem.REDIRECT,
+        -> R.string.sync_problem_access
+        SyncProblem.COMPATIBILITY,
+        SyncProblem.UNSUPPORTED_PROVISIONING,
+        -> R.string.sync_problem_compatibility
+        SyncProblem.PRIMARY_CALENDAR -> R.string.sync_problem_primary_calendar
+        SyncProblem.REPEATED_INVALID_KEY,
+        SyncProblem.PROTOCOL_DATA,
+        -> R.string.sync_problem_protocol_data
+        SyncProblem.CALENDAR_PERMISSION -> R.string.sync_problem_calendar_permission
+        SyncProblem.CALENDAR_PROVIDER,
+        SyncProblem.BACKGROUND_SCHEDULING,
+        -> R.string.sync_problem_calendar_provider
+        SyncProblem.TRANSIENT_EXHAUSTED -> R.string.sync_problem_availability
+    }

@@ -43,6 +43,7 @@ kotlin {
 dependencies {
     implementation(project(":core"))
     implementation(libs.androidx.datastore.preferences)
+    implementation(libs.androidx.work.runtime)
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.okhttp)
 

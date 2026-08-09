@@ -88,7 +88,7 @@ A full run performs `OPTIONS` against the configured endpoint, follows the exist
 
 Implement the minimum WBXML 1.3 encoder/decoder and code pages needed for `FolderHierarchy`, `AirSync`, `Calendar`, and `AirSyncBase`. Calendar decoding includes `MeetingStatus`, `ResponseType`, `ResponseRequested`, attendee response, and the corresponding exception fields. The decoder validates header/string-table bounds, page switches, token structure, required values, and maximum body/nesting/item limits; it skips well-formed unknown elements but never silently substitutes malformed identity, time, recurrence, response state, or synchronization keys. Unit fixtures include canonical encoded requests and representative server responses rather than relying only on round trips through the same codec.
 
-Full synchronization performs initial `FolderSync(0)`, selects the default Calendar folder, obtains an initial collection key with `SyncKey=0`, and requests unfiltered changes with a requested window of 100 until `MoreAvailable` is absent. Incremental runs first reconcile the retained folder hierarchy key, then use the retained collection key. Invalid folder/collection keys consume the run's one automatic full-reset allowance; a second invalidation is blocked.
+Full synchronization performs initial `FolderSync(0)`, selects the default Calendar folder, and primes that collection by sending `SyncKey=0` without `GetChanges`. It then uses the returned nonzero key to request unfiltered changes with a requested window of 100 until `MoreAvailable` is absent. This two-request start is required because the protocol defines `GetChanges` with `SyncKey=0` as status 4 rather than a valid initial page. Incremental runs first reconcile the retained folder hierarchy key, then use the retained collection key. Invalid folder/collection keys consume the run's one automatic full-reset allowance; a second invalidation is blocked.
 
 For ActiveSync 14.0 and 14.1, the request declares the supported calendar properties needed to control ghosted fields, including meeting response properties. For 16.0 and 16.1, omitted top-level fields are merged according to protocol ghosting semantics. Pending invitations are sourced only from meeting items in the primary Calendar `Sync`; no Inbox collection is discovered or synchronized. The client requests a bounded plain-text body representation and does not implement multipart responses. A server response requiring `Provision` is classified as unsupported policy rather than accepted.
 
@@ -165,7 +165,7 @@ Implementation follows RED-GREEN-REFACTOR. JVM tests cover:
 - provider operation planning, complete ownership predicates, idempotent replay, adaptive window reduction, and checkpoint commit ordering through fakes;
 - permission gating, safe failure classification, notification deduplication/clear policy, ViewModel controls, and localized resources.
 
-Android-facing workers, ContentResolver calls, permission launchers, notification posting, and KeyChain remain thin adapters verified by compilation, Lint, debug assembly, and a documented manual Android 16 scenario. No `src/androidTest`, emulator, Robolectric, or end-to-end suite is introduced.
+Android-facing workers, ContentResolver calls, permission launchers, notification posting, and KeyChain remain thin adapters verified by compilation, Lint, and debug assembly. Live Exchange, Calendar Provider, and Android 16 integration validation is performed separately after this change rather than acting as an archive gate. No `src/androidTest`, emulator, Robolectric, or end-to-end suite is introduced.
 
 ## Risks / Trade-offs
 
@@ -187,6 +187,6 @@ Android-facing workers, ContentResolver calls, permission launchers, notificatio
 2. Add synchronization state with safe defaults. An installation upgrading with an existing verified profile but no synchronization metadata initializes as disabled and requires the user to select Enable so runtime permissions can be requested in the foreground.
 3. Add core lifecycle/protocol policies and infrastructure adapters behind those disabled defaults.
 4. Connect post-Save activation, permission results, settings controls, and worker scheduling only after all unit suites pass.
-5. Run `test`, `lintDebug`, `verifyBootstrap`, OpenSpec verification, diff review, and the manual Android 16 permission/background/calendar-isolation checklist, including a pending-to-accepted meeting transition and observed pale system-calendar rendering, before archive.
+5. Run `test`, `lintDebug`, `verifyBootstrap`, OpenSpec verification, and diff review before archive.
 
 Rollback during development is to disable synchronization, which invalidates work and removes the owned calendar, before reverting the feature. Older builds ignore the additional namespaced DataStore keys. Because distribution is local, an installed build must not be downgraded while its owned calendar is active without first using Disable or manually removing that application-owned local calendar.

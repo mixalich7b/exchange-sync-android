@@ -48,4 +48,46 @@ class SettingsResourcesTest {
         assertTrue("<string name=\"tls_der\"" !in stringsXml)
         assertTrue("<string name=\"tls_private_key\"" !in stringsXml)
     }
+
+    @Test
+    fun `synchronization controls phases permissions and safe problems are localized`() {
+        val stringsXml = File("src/main/res/values/strings.xml").readText()
+        val names =
+            Regex("""<string name="([^"]+)">""")
+                .findAll(stringsXml)
+                .map { it.groupValues[1] }
+                .toSet()
+
+        assertTrue(
+            setOf(
+                "sync_title",
+                "sync_disabled",
+                "sync_idle",
+                "sync_queued",
+                "sync_discovering_protocol",
+                "sync_discovering_folders",
+                "sync_downloading",
+                "sync_applying",
+                "sync_cancelling",
+                "sync_blocked",
+                "sync_last_success",
+                "sync_now",
+                "sync_cancel",
+                "sync_disable",
+                "sync_enable",
+                "sync_grant_calendar_access",
+                "sync_open_notification_settings",
+                "sync_grant_notification_access",
+                "sync_problem_certificate",
+                "sync_problem_tls",
+                "sync_problem_access",
+                "sync_problem_compatibility",
+                "sync_problem_primary_calendar",
+                "sync_problem_protocol_data",
+                "sync_problem_calendar_permission",
+                "sync_problem_calendar_provider",
+                "sync_problem_availability",
+            ).all(names::contains),
+        )
+    }
 }

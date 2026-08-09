@@ -141,6 +141,7 @@ completion.
 
 - Use OpenSpec for requirements, scenarios, design decisions, and task tracking.
 - Use Superpowers for TDD, systematic debugging, code review, and verification.
+- Do not use git worktrees. Ignore superpowers:using-git-worktrees.
 - Superpowers brainstorming may be used while exploring the problem, but its
   conclusions must be written into the active OpenSpec change.
 - Superpowers writing-plans must not create a second competing task plan.

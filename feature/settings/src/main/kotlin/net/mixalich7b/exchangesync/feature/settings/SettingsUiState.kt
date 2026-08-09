@@ -4,6 +4,8 @@ import net.mixalich7b.exchangesync.core.connection.ConnectionFailure
 import net.mixalich7b.exchangesync.core.connection.ConnectionField
 import net.mixalich7b.exchangesync.core.connection.FieldError
 import net.mixalich7b.exchangesync.core.connection.TlsConnectionDiagnostics
+import net.mixalich7b.exchangesync.core.sync.SyncPhase
+import net.mixalich7b.exchangesync.core.sync.SyncProblem
 
 public data class SettingsUiState(
     public val email: String = "",
@@ -18,24 +20,68 @@ public data class SettingsUiState(
     public val hasUnsavedChanges: Boolean = false,
     public val isLoading: Boolean = true,
     public val operation: ConnectionOperation? = null,
+    public val syncEnabled: Boolean = false,
+    public val syncPhase: SyncPhase = SyncPhase.DISABLED,
+    public val syncProblem: SyncProblem? = null,
+    public val lastSuccessfulSyncEpochMillis: Long? = null,
+    public val notificationPermissionDenied: Boolean = false,
+    public val syncControlOperation: SyncControlOperation? = null,
 ) {
     public val areFieldsEnabled: Boolean
-        get() = !isLoading && operation == null
+        get() = !isLoading && operation == null && syncControlOperation == null
 
     public val isCertificateSelectionEnabled: Boolean
-        get() = !isLoading && operation == null
+        get() = !isLoading && operation == null && syncControlOperation == null
 
     public val isSaveEnabled: Boolean
-        get() = !isLoading && operation == null
+        get() = !isLoading && operation == null && syncControlOperation == null
 
     public val isRecheckVisible: Boolean
         get() = hasSavedProfile
 
     public val isRecheckEnabled: Boolean
-        get() = !isLoading && operation == null && hasSavedProfile && !hasUnsavedChanges
+        get() =
+            !isLoading &&
+                operation == null &&
+                syncControlOperation == null &&
+                hasSavedProfile &&
+                !hasUnsavedChanges
 
     public val isSaving: Boolean
         get() = operation != null
+
+    public val isSyncNowVisible: Boolean
+        get() = hasSavedProfile && syncEnabled
+
+    public val isSyncNowEnabled: Boolean
+        get() = isSyncNowVisible && syncPhase == SyncPhase.IDLE && controlsIdle
+
+    public val isCancelSyncVisible: Boolean
+        get() = syncEnabled && syncPhase.isCancellable
+
+    public val isCancelSyncEnabled: Boolean
+        get() = isCancelSyncVisible && controlsIdle
+
+    public val isDisableSyncVisible: Boolean
+        get() = hasSavedProfile && syncEnabled
+
+    public val isDisableSyncEnabled: Boolean
+        get() = isDisableSyncVisible && controlsIdle
+
+    public val isEnableSyncVisible: Boolean
+        get() = hasSavedProfile && !syncEnabled
+
+    public val isEnableSyncEnabled: Boolean
+        get() = isEnableSyncVisible && controlsIdle
+
+    public val isCalendarPermissionActionVisible: Boolean
+        get() = syncProblem == SyncProblem.CALENDAR_PERMISSION
+
+    public val isNotificationPermissionActionVisible: Boolean
+        get() = notificationPermissionDenied
+
+    private val controlsIdle: Boolean
+        get() = !isLoading && operation == null && syncControlOperation == null
 }
 
 public enum class ConnectionStatus {
@@ -46,6 +92,13 @@ public enum class ConnectionStatus {
 public enum class ConnectionOperation {
     SAVE,
     RECHECK,
+}
+
+public enum class SyncControlOperation {
+    RUN_NOW,
+    CANCEL,
+    DISABLE,
+    ENABLE,
 }
 
 public enum class SettingsConnectionError {

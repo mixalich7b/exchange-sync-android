@@ -1,6 +1,8 @@
 package net.mixalich7b.exchangesync.core.connection
 
 import kotlinx.coroutines.CancellationException
+import net.mixalich7b.exchangesync.core.sync.ProfileSynchronizationActivator
+import net.mixalich7b.exchangesync.core.sync.ProfileActivationPersistenceException
 
 public sealed interface SaveConnectionResult {
     public data class Invalid(
@@ -22,6 +24,7 @@ public fun interface SaveConnectionAction {
 public class SaveConnection(
     private val repository: ConnectionProfileRepository,
     private val verifyConnection: VerifyConnectionAction,
+    private val synchronizationActivator: ProfileSynchronizationActivator,
 ) : SaveConnectionAction {
     override suspend fun execute(draft: ConnectionDraft): SaveConnectionResult {
         return when (val result = verifyConnection.execute(draft)) {
@@ -34,13 +37,26 @@ public class SaveConnection(
     private suspend fun persist(
         profile: ConnectionProfile,
         diagnostics: TlsConnectionDiagnostics,
-    ): SaveConnectionResult =
+    ): SaveConnectionResult {
+        val previous =
+            try {
+                repository.load()
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (_: Exception) {
+                return SaveConnectionResult.Failed(ConnectionFailure.PERSISTENCE)
+            }
+        if (previous == profile) return SaveConnectionResult.Saved(profile, diagnostics)
+
         try {
-            repository.replace(profile)
-            SaveConnectionResult.Saved(profile, diagnostics)
+            synchronizationActivator.activateProfile(profile)
         } catch (cancellation: CancellationException) {
             throw cancellation
+        } catch (_: ProfileActivationPersistenceException) {
+            return SaveConnectionResult.Failed(ConnectionFailure.PERSISTENCE)
         } catch (_: Exception) {
-            SaveConnectionResult.Failed(ConnectionFailure.PERSISTENCE)
+            // The verified profile is already durably committed. Synchronization exposes its own problem state.
         }
+        return SaveConnectionResult.Saved(profile, diagnostics)
+    }
 }
