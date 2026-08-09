@@ -29,7 +29,7 @@ private class StubPublicKey : PublicKey {
     override fun getEncoded(): ByteArray = byteArrayOf(2)
 }
 
-internal class StubX509Certificate(
+internal open class StubX509Certificate(
     private val encoded: ByteArray = byteArrayOf(5),
     private val serialNumber: BigInteger = BigInteger.ONE,
     private val issuer: X500Principal = X500Principal("CN=test-issuer"),

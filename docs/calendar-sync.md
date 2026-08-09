@@ -38,11 +38,25 @@ Series-only `ResponseType` change обновляет только response prese
 унаследованных exception rows; их текст, время, attendees, reminders и deleted
 state не пересоздаются, а explicit exception override остаётся неизменным.
 
+Exchange Server product build `15.2.x` не является версией ActiveSync
+wire-протокола. Такой сервер обслуживается через объявленные `14.0`, `14.1`,
+`16.0` или `16.1`; protocol-only значение `15.2` не согласуется.
+
 Persisted checkpoints включают terminal endpoint, protocol version,
 FolderSync key, primary collection ID, collection SyncKey и текущий window.
 Calendar Provider page применяется до сохранения следующего SyncKey. Повтор той
 же страницы идемпотентно upsert-ит ServerId и полностью заменяет только явно
 присутствующие child collections.
+
+Capability discovery и все календарные команды точного сохранённого профиля
+используют один process-local HTTP-сеанс. Подходящие cookie, установленные
+`OPTIONS`, разрешённым HTTPS redirect или командой, доступны последующим
+`FolderSync`/`Sync`, retries и continuation slices; другие профили и
+неподходящие redirect destinations их не получают. Cookie не сохраняются на
+диск. Поэтому после recreation процесса синхронизация сначала выполняет
+`OPTIONS`, даже имея persisted checkpoints. Если сохранённая protocol version
+ещё предлагается, ключи продолжают использоваться; при смене версии сначала
+запрашивается существующий fenced full reset.
 
 ## Представление событий
 
@@ -127,6 +141,15 @@ notification со стабильным ID показывает локализо�
 и persisted problem перед post/clear, поэтому поздний worker не затрагивает
 уведомление новой generation. Endpoint, login, response/event content,
 certificate material и exception messages в notification не попадают.
+
+## Диагностика
+
+Сетевые и protocol failures, отклонённые события, операции Calendar Provider,
+sync phases/retries/resets/terminal outcomes и границы WorkManager связываются
+в Logcat по generation, run token и process-local operation ID. Записи не
+содержат event content, WBXML, provider values или profile identity. Полный
+перечень безопасных полей и команды сбора приведены в
+[руководстве по диагностике](diagnostics.md).
 
 ## Проверка
 

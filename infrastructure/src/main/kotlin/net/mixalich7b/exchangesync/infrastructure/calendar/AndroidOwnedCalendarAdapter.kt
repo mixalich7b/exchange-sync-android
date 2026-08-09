@@ -43,6 +43,13 @@ import net.mixalich7b.exchangesync.core.sync.SyncStateRepository
 import net.mixalich7b.exchangesync.core.sync.SyncStateTransitions
 import net.mixalich7b.exchangesync.core.sync.SynchronizationMutationLock
 import net.mixalich7b.exchangesync.infrastructure.activesync.calendar.ActiveSyncCalendarValueParsers
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.AndroidLogcatDiagnosticSink
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnosticEvent
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticComponent
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperationKind
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticSeverity
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
 
 internal class CalendarProviderTransactionTooLargeException : RuntimeException()
 
@@ -78,6 +85,7 @@ public class AndroidOwnedCalendarAdapter internal constructor(
     private val isFullSyncRequired: suspend (SyncFence) -> Boolean = { false },
     private val hasCalendarAccess: () -> Boolean = { true },
     private val mutationLock: SynchronizationMutationLock = SynchronizationMutationLock(),
+    private val diagnostics: DeviceDiagnostics = DeviceDiagnostics(),
 ) : OwnedCalendarPort {
     public constructor(
         context: Context,
@@ -103,19 +111,29 @@ public class AndroidOwnedCalendarAdapter internal constructor(
                 context.checkSelfPermission(Manifest.permission.WRITE_CALENDAR) == PackageManager.PERMISSION_GRANTED
         },
         mutationLock = mutationLock,
+        diagnostics = DeviceDiagnostics(AndroidLogcatDiagnosticSink()),
     )
 
     override suspend fun deleteOwnedCalendar(fence: SyncFence?): Boolean =
         withContext(Dispatchers.IO) {
             mutationLock.withLock {
                 if (fence != null && !isCleanupFenceCurrent(fence)) return@withLock false
+                val operation =
+                    diagnostics.operation(
+                        DiagnosticOperationKind.SYNCHRONIZATION,
+                        fence?.generation,
+                        fence?.runToken,
+                    )
                 try {
                     gateway.deleteAllOwned()
-                } catch (_: OwnedCalendarProviderException) {
+                } catch (failure: OwnedCalendarProviderException) {
+                    emitProviderFailure(operation, DiagnosticStage.CLEANUP, SyncProblem.CALENDAR_PROVIDER, failure)
                     false
-                } catch (_: CalendarProviderAccessException) {
+                } catch (failure: CalendarProviderAccessException) {
+                    emitProviderFailure(operation, DiagnosticStage.CLEANUP, SyncProblem.CALENDAR_PROVIDER, failure)
                     false
-                } catch (_: SecurityException) {
+                } catch (failure: SecurityException) {
+                    emitProviderFailure(operation, DiagnosticStage.CLEANUP, SyncProblem.CALENDAR_PERMISSION, failure)
                     false
                 }
             }
@@ -135,35 +153,72 @@ public class AndroidOwnedCalendarAdapter internal constructor(
     ): LocalPageOutcome {
         if (!isFenceCurrent(fence)) return LocalPageOutcome.Obsolete
         val profile = profileRepository.load() ?: return LocalPageOutcome.Failed(SyncProblem.PROTOCOL_DATA)
+        val operation =
+            diagnostics.operation(
+                DiagnosticOperationKind.SYNCHRONIZATION,
+                fence.generation,
+                fence.runToken,
+            )
+        var stage = DiagnosticStage.OWNERSHIP
         return try {
             val owned = gateway.resolveOwned(profile.email)
             if (owned.wasRecreated && !isFullSyncRequired(fence)) {
                 throw CalendarMirrorResetRequiredException()
             }
+            stage = DiagnosticStage.PROVIDER_QUERY
             val syncIds = page.changes.mapTo(linkedSetOf(), CalendarChangeIdentity::requireSyncId)
             val existing = gateway.queryExisting(owned.calendarId, syncIds)
+            stage = DiagnosticStage.EVENT_MAP
             val pagePlan = CalendarPagePlanner.plan(page, owned, existing)
             val batchPlan = CalendarProviderBatchPlanner.plan(pagePlan, timeZoneResolver)
             if (!isFenceCurrent(fence)) return LocalPageOutcome.Obsolete
+            stage = DiagnosticStage.PROVIDER_BATCH
             gateway.applyBatch(batchPlan)
             LocalPageOutcome.Applied
-        } catch (_: CalendarProviderTransactionTooLargeException) {
+        } catch (failure: CalendarProviderTransactionTooLargeException) {
+            emitProviderFailure(operation, stage, SyncProblem.CALENDAR_PROVIDER, failure)
             LocalPageOutcome.TransactionTooLarge
-        } catch (_: CalendarMirrorResetRequiredException) {
+        } catch (failure: CalendarMirrorResetRequiredException) {
+            emitProviderFailure(operation, stage, SyncProblem.PROTOCOL_DATA, failure, failure.serverId)
             LocalPageOutcome.FullResetRequired
-        } catch (_: CalendarMappingException) {
+        } catch (failure: CalendarMappingException) {
+            emitProviderFailure(operation, DiagnosticStage.EVENT_MAP, SyncProblem.PROTOCOL_DATA, failure)
             LocalPageOutcome.Failed(SyncProblem.PROTOCOL_DATA)
-        } catch (_: CalendarPlanningException) {
+        } catch (failure: CalendarPlanningException) {
+            emitProviderFailure(operation, DiagnosticStage.EVENT_MAP, SyncProblem.PROTOCOL_DATA, failure, failure.serverId)
             LocalPageOutcome.Failed(SyncProblem.PROTOCOL_DATA)
-        } catch (_: OwnedCalendarProviderException) {
+        } catch (failure: OwnedCalendarProviderException) {
+            emitProviderFailure(operation, stage, SyncProblem.CALENDAR_PROVIDER, failure)
             LocalPageOutcome.Failed(SyncProblem.CALENDAR_PROVIDER)
-        } catch (_: CalendarProviderAccessException) {
+        } catch (failure: CalendarProviderAccessException) {
+            emitProviderFailure(operation, stage, SyncProblem.CALENDAR_PROVIDER, failure)
             LocalPageOutcome.Failed(SyncProblem.CALENDAR_PROVIDER)
-        } catch (_: SecurityException) {
-            LocalPageOutcome.Failed(
-                if (hasCalendarAccess()) SyncProblem.CALENDAR_PROVIDER else SyncProblem.CALENDAR_PERMISSION,
-            )
+        } catch (failure: SecurityException) {
+            val problem = if (hasCalendarAccess()) SyncProblem.CALENDAR_PROVIDER else SyncProblem.CALENDAR_PERMISSION
+            emitProviderFailure(operation, stage, problem, failure)
+            LocalPageOutcome.Failed(problem)
         }
+    }
+
+    private fun emitProviderFailure(
+        operation: net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperation,
+        stage: DiagnosticStage,
+        problem: SyncProblem,
+        throwable: Throwable,
+        serverId: String? = null,
+    ) {
+        diagnostics.emit(
+            DeviceDiagnosticEvent(
+                DiagnosticSeverity.ERROR,
+                DiagnosticComponent.CALENDAR,
+                stage,
+                operation,
+                reasonCode = throwable.javaClass.simpleName,
+                failureCategory = problem.name,
+                serverId = serverId,
+                throwable = throwable,
+            ),
+        )
     }
 }
 

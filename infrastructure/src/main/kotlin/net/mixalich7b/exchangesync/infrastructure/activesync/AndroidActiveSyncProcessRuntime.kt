@@ -1,0 +1,48 @@
+package net.mixalich7b.exchangesync.infrastructure.activesync
+
+import android.content.Context
+import net.mixalich7b.exchangesync.core.connection.ConnectionVerifier
+import net.mixalich7b.exchangesync.core.sync.RemoteCalendarPort
+import net.mixalich7b.exchangesync.infrastructure.tls.AndroidCertificateAssetSource
+import net.mixalich7b.exchangesync.infrastructure.tls.CertificateAssetLoader
+import net.mixalich7b.exchangesync.infrastructure.tls.KeyChainClientCredentialResolver
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.AndroidLogcatDiagnosticSink
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
+
+public class AndroidActiveSyncProcessRuntime(context: Context) {
+    public val connectionVerifier: ConnectionVerifier
+    public val remoteCalendar: RemoteCalendarPort
+
+    init {
+        val applicationContext = context.applicationContext
+        val diagnostics = DeviceDiagnostics(AndroidLogcatDiagnosticSink())
+        val sessions = ActiveSyncProfileSessionRegistry()
+        val credentials = KeyChainClientCredentialResolver(applicationContext, diagnostics)
+        val transportFactory =
+            ProfileSessionSecureHttpTransportFactory(
+                sessions = sessions,
+                delegate =
+                    OkHttpSecureHttpTransportFactory(
+                        CertificateAssetLoader(
+                            AndroidCertificateAssetSource(applicationContext.assets),
+                            diagnostics = diagnostics,
+                        ),
+                        diagnostics,
+                    ),
+            )
+        connectionVerifier =
+            ActiveSyncConnectionVerifier(
+                credentialResolver = credentials,
+                transportFactory = transportFactory,
+                sessions = sessions,
+                diagnostics = diagnostics,
+            )
+        remoteCalendar =
+            ActiveSyncRemoteCalendar(
+                capabilities = ActiveSyncCapabilityClient(credentials, transportFactory, diagnostics = diagnostics),
+                commands = ActiveSyncCommandClient(credentials, transportFactory, diagnostics = diagnostics),
+                sessions = sessions,
+                diagnostics = diagnostics,
+            )
+    }
+}

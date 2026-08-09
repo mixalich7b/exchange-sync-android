@@ -72,6 +72,52 @@ class ActiveSyncConnectionVerifierTest {
             assertEquals(listOf("OPTIONS"), factory.transport.requests.map { request -> request.method })
         }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `successful connection verification records a reusable live capability`() =
+        runTest {
+            val credential = credential()
+            val sessions = ActiveSyncProfileSessionRegistry()
+            val factory =
+                RecordingTransportFactory(
+                    listOf(
+                        ProbeResponse(
+                            statusCode = 200,
+                            headers =
+                                mapOf(
+                                    "MS-ASProtocolVersions" to "14.1,16.1",
+                                    "MS-ASProtocolCommands" to "FolderSync,Sync",
+                                ),
+                            localCertificates = listOf(credential.leafCertificate),
+                            peerCertificates = listOf(peerCertificate()),
+                        ),
+                    ),
+                )
+            val verifier =
+                ActiveSyncConnectionVerifier(
+                    credentialResolver = ClientCredentialResolver { ClientCredentialResolution.Available(credential) },
+                    transportFactory = factory,
+                    sessions = sessions,
+                    transportDispatcher = UnconfinedTestDispatcher(testScheduler),
+                )
+
+            val result = verifier.verify(profile())
+
+            assertEquals(ConnectionCheckResult.Success(expectedDiagnostics("exchange.example.test")), result)
+            assertEquals(
+                ActiveSyncLiveCapability(
+                    terminalEndpoint = ActiveSyncProbePolicy.initialUrl("exchange.example.test"),
+                    version = net.mixalich7b.exchangesync.core.sync.ActiveSyncVersion.V16_1,
+                    supportedVersions =
+                        setOf(
+                            net.mixalich7b.exchangesync.core.sync.ActiveSyncVersion.V14_1,
+                            net.mixalich7b.exchangesync.core.sync.ActiveSyncVersion.V16_1,
+                        ),
+                ),
+                sessions.acquire(profile()).liveCapability(),
+            )
+        }
+
     @Test
     fun `HTTPS redirect repeats OPTIONS and evaluates terminal response`() =
         runTest {
@@ -179,7 +225,7 @@ class ActiveSyncConnectionVerifierTest {
                                         ClientCredentialResolution.Available(credential)
                                     },
                                 transportFactory =
-                                    ProbeTransportFactory {
+                                    ProbeTransportFactory { _, _, _ ->
                                         factoryThread = Thread.currentThread()
                                         ProbeTransport {
                                             ProbeResponse(
@@ -222,7 +268,7 @@ class ActiveSyncConnectionVerifierTest {
                             ClientCredentialResolution.Available(credential)
                         },
                     transportFactory =
-                        ProbeTransportFactory { _ ->
+                        ProbeTransportFactory { _, _, _ ->
                             ProbeTransport {
                                 requestCount += 1
                                 if (requestCount == 1) {
@@ -264,7 +310,11 @@ class ActiveSyncConnectionVerifierTest {
         val transport = RecordingTransport(responses)
         var createCalls: Int = 0
 
-        override fun create(credential: ClientCredential): ProbeTransport {
+        override fun create(
+            profile: ConnectionProfile,
+            credential: ClientCredential,
+            operation: net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperation,
+        ): ProbeTransport {
             createCalls += 1
             return transport
         }

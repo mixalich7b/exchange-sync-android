@@ -8,6 +8,13 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnosticEvent
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticComponent
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperation
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperationKind
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticSeverity
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
 
 internal data class KeyChainMaterial(
     val privateKey: PrivateKey?,
@@ -20,31 +27,92 @@ internal fun interface KeyChainMaterialAccess {
 
 internal fun interface ClientCredentialResolver {
     suspend fun resolve(alias: String): ClientCredentialResolution
+
+    suspend fun resolve(
+        alias: String,
+        operation: DiagnosticOperation,
+    ): ClientCredentialResolution = resolve(alias)
 }
 
 internal class KeyChainClientCredentialResolver(
     private val access: KeyChainMaterialAccess,
     private val dispatcher: CoroutineDispatcher,
+    private val diagnostics: DeviceDiagnostics = DeviceDiagnostics(),
 ) : ClientCredentialResolver {
-    constructor(context: Context) : this(
+    constructor(
+        context: Context,
+        diagnostics: DeviceDiagnostics = DeviceDiagnostics(),
+    ) : this(
         access = AndroidKeyChainMaterialAccess(context.applicationContext),
         dispatcher = Dispatchers.IO,
+        diagnostics = diagnostics,
     )
 
     override suspend fun resolve(alias: String): ClientCredentialResolution =
+        resolve(alias, diagnostics.operation(DiagnosticOperationKind.LOCAL_OPERATION))
+
+    override suspend fun resolve(
+        alias: String,
+        operation: DiagnosticOperation,
+    ): ClientCredentialResolution =
         withContext(dispatcher) {
             try {
                 val material = access.load(alias)
-                ClientCredentialFactory.resolve(alias, material.privateKey, material.certificateChain)
+                val resolution = ClientCredentialFactory.resolve(alias, material.privateKey, material.certificateChain)
+                diagnostics.emit(
+                    DeviceDiagnosticEvent(
+                        severity =
+                            if (resolution is ClientCredentialResolution.Available) {
+                                DiagnosticSeverity.INFO
+                            } else {
+                                DiagnosticSeverity.ERROR
+                            },
+                        component = DiagnosticComponent.KEYCHAIN,
+                        stage = DiagnosticStage.KEYCHAIN_RESOLUTION,
+                        operation = operation,
+                        chainLength = material.certificateChain?.size ?: 0,
+                        keyAlgorithm = material.privateKey?.algorithm,
+                        fingerprint =
+                            (resolution as? ClientCredentialResolution.Available)
+                                ?.credential
+                                ?.leafCertificate
+                                ?.let(::sha256Fingerprint),
+                        outcome =
+                            if (resolution is ClientCredentialResolution.Available) {
+                                "available"
+                            } else {
+                                "unavailable"
+                            },
+                    ),
+                )
+                resolution
             } catch (cancellation: CancellationException) {
                 throw cancellation
-            } catch (_: InterruptedException) {
+            } catch (failure: InterruptedException) {
                 Thread.currentThread().interrupt()
+                emitFailure(operation, failure)
                 ClientCredentialResolution.Unavailable
-            } catch (_: Exception) {
+            } catch (failure: Exception) {
+                emitFailure(operation, failure)
                 ClientCredentialResolution.Unavailable
             }
         }
+
+    private fun emitFailure(
+        operation: DiagnosticOperation,
+        failure: Throwable,
+    ) {
+        diagnostics.emit(
+            DeviceDiagnosticEvent(
+                DiagnosticSeverity.ERROR,
+                DiagnosticComponent.KEYCHAIN,
+                DiagnosticStage.KEYCHAIN_RESOLUTION,
+                operation,
+                outcome = "failure",
+                throwable = failure,
+            ),
+        )
+    }
 }
 
 private class AndroidKeyChainMaterialAccess(

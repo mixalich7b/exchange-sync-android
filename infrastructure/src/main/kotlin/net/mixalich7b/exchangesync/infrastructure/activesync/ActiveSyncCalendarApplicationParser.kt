@@ -36,9 +36,23 @@ internal object ActiveSyncCalendarApplicationParser {
                 -> parseUpsert(command, profileEmail, version)
             }
         } catch (error: ActiveSyncProtocolDataException) {
-            throw error
+            throw error.withContext(command.kind.name, command.serverId)
+        } catch (error: ActiveSyncCalendarValueException) {
+            throw ActiveSyncProtocolDataException(
+                message = "Calendar application data is malformed",
+                reason = ActiveSyncValidationReason.INVALID_VALUE,
+                commandKind = command.kind.name,
+                serverId = command.serverId,
+                cause = error,
+            )
         } catch (error: IllegalArgumentException) {
-            throw ActiveSyncProtocolDataException("Calendar application data is malformed")
+            throw ActiveSyncProtocolDataException(
+                message = "Calendar application data is malformed",
+                reason = ActiveSyncValidationReason.INVALID_APPLICATION_DATA,
+                commandKind = command.kind.name,
+                serverId = command.serverId,
+                cause = error,
+            )
         }
 
     private fun parseUpsert(

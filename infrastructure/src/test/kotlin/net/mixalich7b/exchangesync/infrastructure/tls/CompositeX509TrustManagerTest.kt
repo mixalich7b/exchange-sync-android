@@ -1,6 +1,7 @@
 package net.mixalich7b.exchangesync.infrastructure.tls
 
 import java.security.cert.CertificateException
+import java.security.cert.CertificateEncodingException
 import java.security.cert.X509Certificate
 import javax.net.ssl.X509TrustManager
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -19,6 +20,24 @@ class CompositeX509TrustManagerTest {
 
         assertEquals(1, system.serverChecks)
         assertEquals(0, local.serverChecks)
+    }
+
+    @Test
+    fun `fingerprint diagnostics cannot turn an accepted server chain into a trust failure`() {
+        val unencodableCertificate =
+            object : StubX509Certificate() {
+                override fun getEncoded(): ByteArray = throw CertificateEncodingException("unavailable")
+            }
+        val manager =
+            CompositeX509TrustManager(
+                RecordingTrustManager(acceptServer = true),
+                local = null,
+                localTrustStatus = LocalTrustStatus.MISSING,
+            )
+
+        manager.checkServerTrusted(arrayOf(unencodableCertificate), "RSA")
+
+        assertEquals(1, manager.acceptedIssuers.size)
     }
 
     @Test

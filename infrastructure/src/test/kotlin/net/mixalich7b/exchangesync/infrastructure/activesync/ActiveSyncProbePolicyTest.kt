@@ -1,6 +1,7 @@
 package net.mixalich7b.exchangesync.infrastructure.activesync
 
 import net.mixalich7b.exchangesync.core.connection.ConnectionFailure
+import net.mixalich7b.exchangesync.core.sync.ActiveSyncVersion
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
@@ -85,6 +86,57 @@ class ActiveSyncProbePolicyTest {
     }
 
     @Test
+    fun `Exchange 15_2 product builds use their advertised ActiveSync protocol`() {
+        val compatibleEndpoints =
+            listOf(
+                ExchangeEndpointFixture(
+                    productBuildFamily = "15.2",
+                    advertisedProtocols = "16.1",
+                    expectedVersion = ActiveSyncVersion.V16_1,
+                ),
+                ExchangeEndpointFixture(
+                    productBuildFamily = "15.2",
+                    advertisedProtocols = "14.1",
+                    expectedVersion = ActiveSyncVersion.V14_1,
+                ),
+                ExchangeEndpointFixture(
+                    productBuildFamily = null,
+                    advertisedProtocols = "14.0,16.0",
+                    expectedVersion = ActiveSyncVersion.V16_0,
+                ),
+            )
+
+        compatibleEndpoints.forEach { fixture ->
+            assertEquals(
+                fixture.expectedVersion,
+                ActiveSyncVersionNegotiator.select(fixture.advertisedProtocols),
+                fixture.description,
+            )
+            assertNull(
+                ActiveSyncResponseEvaluator.evaluate(
+                    statusCode = 200,
+                    protocolVersions = fixture.advertisedProtocols,
+                    protocolCommands = "FolderSync,Sync",
+                ),
+                fixture.description,
+            )
+        }
+    }
+
+    @Test
+    fun `Exchange product build 15_2 is not an ActiveSync protocol version`() {
+        assertNull(ActiveSyncVersionNegotiator.select("15.2"))
+        assertEquals(
+            ConnectionFailure.PROTOCOL_INCOMPATIBLE,
+            ActiveSyncResponseEvaluator.evaluate(
+                statusCode = 200,
+                protocolVersions = "15.2",
+                protocolCommands = "FolderSync,Sync",
+            ),
+        )
+    }
+
+    @Test
     fun `missing or incompatible capability tokens report protocol failure`() {
         listOf(
             null to "FolderSync,Sync",
@@ -122,6 +174,16 @@ class ActiveSyncProbePolicyTest {
                 status.toString(),
             )
         }
+    }
+
+    private data class ExchangeEndpointFixture(
+        val productBuildFamily: String?,
+        val advertisedProtocols: String,
+        val expectedVersion: ActiveSyncVersion,
+    ) {
+        val description: String =
+            productBuildFamily?.let { family -> "Exchange product build family $family" }
+                ?: "endpoint without product-build metadata"
     }
 
 }

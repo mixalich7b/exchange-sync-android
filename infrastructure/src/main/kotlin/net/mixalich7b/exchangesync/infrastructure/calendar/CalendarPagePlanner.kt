@@ -7,9 +7,22 @@ import net.mixalich7b.exchangesync.core.calendar.ProviderCalendarMutation
 import net.mixalich7b.exchangesync.core.calendar.ProviderEvent
 import net.mixalich7b.exchangesync.core.sync.RemoteCalendarPage
 
-internal class CalendarPlanningException(message: String) : IllegalArgumentException(message)
+internal class CalendarPlanningException(
+    message: String,
+    val serverId: String? = null,
+    cause: Throwable? = null,
+) : IllegalArgumentException(message, cause) {
+    fun withServerId(value: String): CalendarPlanningException =
+        if (serverId != null) this else CalendarPlanningException(message.orEmpty(), value, this)
+}
 
-internal class CalendarMirrorResetRequiredException : IllegalStateException()
+internal class CalendarMirrorResetRequiredException(
+    val serverId: String? = null,
+    cause: Throwable? = null,
+) : IllegalStateException(null, cause) {
+    fun withServerId(value: String): CalendarMirrorResetRequiredException =
+        if (serverId != null) this else CalendarMirrorResetRequiredException(value, this)
+}
 
 internal data class ExistingProviderEvent(
     val eventId: Long,
@@ -75,34 +88,43 @@ internal object CalendarPagePlanner {
             page.changes.map { change ->
                 val mutation = change as? ActiveSyncCalendarMutation
                     ?: throw CalendarPlanningException("Calendar page contains an unsupported change")
-                val existing = existingBySyncId[CalendarPlanIdentity.syncId(mutation)]
-                when (val mapped = CalendarEventMapper.map(mutation, owned.color, existing?.snapshot)) {
-                    is ProviderCalendarMutation.Delete ->
-                        CalendarEventPlan.Delete(owned.calendarId, mapped.syncId)
-                    is ProviderCalendarMutation.Upsert -> {
-                        val source = mutation as ActiveSyncCalendarMutation.Upsert
-                        if (!mapped.isAddition && existing == null) {
-                            throw CalendarMirrorResetRequiredException()
+                val serverId = CalendarPlanIdentity.syncId(mutation)
+                try {
+                    val existing = existingBySyncId[serverId]
+                    when (val mapped = CalendarEventMapper.map(mutation, owned.color, existing?.snapshot)) {
+                        is ProviderCalendarMutation.Delete ->
+                            CalendarEventPlan.Delete(owned.calendarId, mapped.syncId)
+                        is ProviderCalendarMutation.Upsert -> {
+                            val source = mutation as ActiveSyncCalendarMutation.Upsert
+                            if (!mapped.isAddition && existing == null) {
+                                throw CalendarMirrorResetRequiredException(serverId)
+                            }
+                            CalendarEventPlan.Upsert(
+                                calendarId = owned.calendarId,
+                                eventId = existing?.eventId,
+                                event = mapped.event,
+                                isAddition = mapped.isAddition,
+                                replaceOrganizer =
+                                    source.item.organizerEmail != ActiveSyncField.Absent ||
+                                        source.item.organizerName != ActiveSyncField.Absent,
+                                replaceAttendees = source.item.attendees != ActiveSyncField.Absent,
+                                replaceReminders = source.item.reminderMinutes != ActiveSyncField.Absent,
+                                replaceExceptions =
+                                    source.item.exceptions != ActiveSyncField.Absent,
+                                refreshExceptionResponses =
+                                    source.item.exceptions == ActiveSyncField.Absent &&
+                                        source.item.responseType != ActiveSyncField.Absent &&
+                                        existing?.snapshot?.exceptions is ActiveSyncField.Value,
+                                providerTimeZone = existing?.providerTimeZone,
+                            )
                         }
-                        CalendarEventPlan.Upsert(
-                            calendarId = owned.calendarId,
-                            eventId = existing?.eventId,
-                            event = mapped.event,
-                            isAddition = mapped.isAddition,
-                            replaceOrganizer =
-                                source.item.organizerEmail != ActiveSyncField.Absent ||
-                                    source.item.organizerName != ActiveSyncField.Absent,
-                            replaceAttendees = source.item.attendees != ActiveSyncField.Absent,
-                            replaceReminders = source.item.reminderMinutes != ActiveSyncField.Absent,
-                            replaceExceptions =
-                                source.item.exceptions != ActiveSyncField.Absent,
-                            refreshExceptionResponses =
-                                source.item.exceptions == ActiveSyncField.Absent &&
-                                    source.item.responseType != ActiveSyncField.Absent &&
-                                    existing?.snapshot?.exceptions is ActiveSyncField.Value,
-                            providerTimeZone = existing?.providerTimeZone,
-                        )
                     }
+                } catch (failure: CalendarMirrorResetRequiredException) {
+                    throw failure.withServerId(serverId)
+                } catch (failure: CalendarPlanningException) {
+                    throw failure.withServerId(serverId)
+                } catch (failure: IllegalArgumentException) {
+                    throw CalendarPlanningException("Calendar event cannot be mapped", serverId, failure)
                 }
             }
         return CalendarPagePlan.create(owned.calendarId, operations)

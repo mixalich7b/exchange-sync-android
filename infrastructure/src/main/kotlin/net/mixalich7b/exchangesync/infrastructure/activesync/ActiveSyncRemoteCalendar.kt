@@ -11,13 +11,24 @@ import net.mixalich7b.exchangesync.core.sync.SyncPageRequest
 import net.mixalich7b.exchangesync.core.sync.SyncPhase
 import net.mixalich7b.exchangesync.core.sync.SyncProblem
 import okhttp3.HttpUrl
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnosticEvent
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticComponent
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperation
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperationKind
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticSeverity
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
 
 internal sealed interface ActiveSyncCapabilityOutcome {
     data class Success(
         val terminalEndpoint: HttpUrl,
         val version: ActiveSyncVersion,
-    ) : ActiveSyncCapabilityOutcome
+        val supportedVersions: Set<ActiveSyncVersion> = setOf(version),
+    ) : ActiveSyncCapabilityOutcome {
+        init {
+            require(version in supportedVersions)
+        }
+    }
 
     data class Failure(
         val kind: SyncFailureKind,
@@ -27,11 +38,18 @@ internal sealed interface ActiveSyncCapabilityOutcome {
 
 internal fun interface ActiveSyncCapabilityGateway {
     suspend fun discover(profile: ConnectionProfile): ActiveSyncCapabilityOutcome
+
+    suspend fun discover(
+        profile: ConnectionProfile,
+        operation: DiagnosticOperation,
+    ): ActiveSyncCapabilityOutcome = discover(profile)
 }
 
 internal class ActiveSyncRemoteCalendar(
     private val capabilities: ActiveSyncCapabilityGateway,
     private val commands: ActiveSyncCommandGateway,
+    private val sessions: ActiveSyncProfileSessionRegistry = ActiveSyncProfileSessionRegistry(),
+    private val diagnostics: DeviceDiagnostics = DeviceDiagnostics(),
 ) : RemoteCalendarPort {
     override suspend fun fetchPage(request: SyncPageRequest): RemotePageOutcome =
         fetchPage(request) {}
@@ -39,37 +57,74 @@ internal class ActiveSyncRemoteCalendar(
     override suspend fun fetchPage(
         request: SyncPageRequest,
         reportPhase: suspend (SyncPhase) -> Unit,
-    ): RemotePageOutcome =
-        try {
-            fetchProtocolPage(request, reportPhase)
+    ): RemotePageOutcome {
+        val operation =
+            diagnostics.operation(
+                DiagnosticOperationKind.SYNCHRONIZATION,
+                request.fence.generation,
+                request.fence.runToken,
+            )
+        return try {
+            fetchProtocolPage(request, reportPhase, operation)
         } catch (status: ActiveSyncStatusException) {
+            emitProtocolFailure(
+                operation = operation,
+                stage = status.commandKind.diagnosticStage(),
+                reason = "COMMAND_STATUS_${status.kind.name}",
+                failureCategory = status.problem?.name ?: status.kind.name,
+                command = status.commandKind,
+                throwable = status,
+            )
             RemotePageOutcome.Failure(status.kind, status.problem)
-        } catch (_: PrimaryCalendarSelectionException) {
+        } catch (failure: PrimaryCalendarSelectionException) {
+            emitProtocolFailure(
+                operation,
+                DiagnosticStage.FOLDER_SYNC,
+                "PRIMARY_CALENDAR",
+                SyncProblem.PRIMARY_CALENDAR.name,
+                ActiveSyncCommand.FOLDER_SYNC.wireValue,
+                throwable = failure,
+            )
             RemotePageOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.PRIMARY_CALENDAR)
-        } catch (_: ActiveSyncProtocolDataException) {
+        } catch (failure: ActiveSyncProtocolDataException) {
+            emitProtocolFailure(
+                operation = operation,
+                stage = DiagnosticStage.EVENT_PARSE,
+                reason = failure.reason.name,
+                failureCategory = SyncProblem.PROTOCOL_DATA.name,
+                command = failure.commandKind,
+                serverId = failure.serverId,
+                throwable = failure,
+            )
             RemotePageOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.PROTOCOL_DATA)
-        } catch (_: IllegalArgumentException) {
+        } catch (failure: IllegalArgumentException) {
+            emitProtocolFailure(
+                operation,
+                DiagnosticStage.EVENT_PARSE,
+                "ILLEGAL_ARGUMENT",
+                SyncProblem.PROTOCOL_DATA.name,
+                throwable = failure,
+            )
             RemotePageOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.PROTOCOL_DATA)
         }
+    }
 
     private suspend fun fetchProtocolPage(
         request: SyncPageRequest,
         reportPhase: suspend (SyncPhase) -> Unit,
+        operation: DiagnosticOperation,
     ): RemotePageOutcome {
-        if (
-            request.checkpoints.terminalCommandUrl?.toHttpUrlOrNull() == null ||
-            request.checkpoints.protocolVersion == null
-        ) {
+        if (sessions.acquire(request.profile).liveCapability() == null) {
             reportPhase(SyncPhase.DISCOVERING_PROTOCOL)
         }
         val prepared =
-            when (val result = prepareCapability(request)) {
+            when (val result = prepareCapability(request, operation)) {
                 is Preparation.Failure -> return result.outcome
                 is Preparation.Success -> result.value
             }
         reportPhase(SyncPhase.DISCOVERING_FOLDERS)
         val folder =
-            when (val result = prepareFolder(request, prepared)) {
+            when (val result = prepareFolder(request, prepared, operation)) {
                 is Preparation.Failure -> return result.outcome
                 is Preparation.Success -> result.value
             }
@@ -92,13 +147,17 @@ internal class ActiveSyncRemoteCalendar(
                             getChanges = false,
                             version = prepared.version,
                         ),
+                    operation = operation,
                 )
             when (priming) {
                 is ActiveSyncCommandOutcome.Failure -> return priming.toRemoteFailure()
                 is ActiveSyncCommandOutcome.Success -> {
-                    val primed = CalendarSyncCodec.decodeResponse(priming.body, folder.primaryCalendarId)
+                    val primed = decodeCalendarResponse(priming.body, folder.primaryCalendarId)
                     if (primed.commands.isNotEmpty() || primed.moreAvailable || primed.syncKey == "0") {
-                        throw ActiveSyncProtocolDataException("Invalid Calendar Sync priming response")
+                        throw ActiveSyncProtocolDataException(
+                            "Invalid Calendar Sync priming response",
+                            commandKind = ActiveSyncCommand.SYNC.wireValue,
+                        )
                     }
                     collectionKey = primed.syncKey
                     calendarEndpoint = priming.terminalEndpoint
@@ -120,6 +179,7 @@ internal class ActiveSyncRemoteCalendar(
                         getChanges = true,
                         version = prepared.version,
                     ),
+                operation = operation,
             )
         return when (calendarOutcome) {
             is ActiveSyncCommandOutcome.Failure -> calendarOutcome.toRemoteFailure()
@@ -132,10 +192,13 @@ internal class ActiveSyncRemoteCalendar(
                             moreAvailable = false,
                         )
                     } else {
-                        CalendarSyncCodec.decodeResponse(calendarOutcome.body, folder.primaryCalendarId)
+                        decodeCalendarResponse(calendarOutcome.body, folder.primaryCalendarId)
                     }
                 if (page.moreAvailable && page.syncKey == collectionKey) {
-                    throw ActiveSyncProtocolDataException("Calendar SyncKey did not advance while more changes are available")
+                    throw ActiveSyncProtocolDataException(
+                        "Calendar SyncKey did not advance while more changes are available",
+                        commandKind = ActiveSyncCommand.SYNC.wireValue,
+                    )
                 }
                 RemotePageOutcome.Page(
                     RemoteCalendarPage(
@@ -159,23 +222,40 @@ internal class ActiveSyncRemoteCalendar(
         }
     }
 
-    private suspend fun prepareCapability(request: SyncPageRequest): Preparation<PreparedCapability> {
-        val savedUrl = request.checkpoints.terminalCommandUrl?.toHttpUrlOrNull()
+    private suspend fun prepareCapability(
+        request: SyncPageRequest,
+        operation: DiagnosticOperation,
+    ): Preparation<PreparedCapability> {
+        val session = sessions.acquire(request.profile)
         val savedVersion = request.checkpoints.protocolVersion
-        if (savedUrl != null && savedVersion != null) {
-            return Preparation.Success(PreparedCapability(savedUrl, savedVersion))
+        val capability =
+            session.liveCapability()
+                ?: when (val outcome = capabilities.discover(request.profile, operation)) {
+                    is ActiveSyncCapabilityOutcome.Success ->
+                        ActiveSyncLiveCapability(
+                            terminalEndpoint = outcome.terminalEndpoint,
+                            version = outcome.version,
+                            supportedVersions = outcome.supportedVersions,
+                        )
+                    is ActiveSyncCapabilityOutcome.Failure ->
+                        return Preparation.Failure(RemotePageOutcome.Failure(outcome.kind, outcome.problem))
+                }
+        session.recordCapability(capability)
+        if (savedVersion != null && savedVersion !in capability.supportedVersions) {
+            return Preparation.Failure(
+                RemotePageOutcome.Failure(SyncFailureKind.FULL_RESET_REQUIRED, null),
+            )
         }
-        return when (val outcome = capabilities.discover(request.profile)) {
-            is ActiveSyncCapabilityOutcome.Success ->
-                Preparation.Success(PreparedCapability(outcome.terminalEndpoint, outcome.version))
-            is ActiveSyncCapabilityOutcome.Failure ->
-                Preparation.Failure(RemotePageOutcome.Failure(outcome.kind, outcome.problem))
-        }
+        val selectedVersion = savedVersion ?: capability.version
+        val selected = capability.copy(version = selectedVersion)
+        session.recordCapability(selected)
+        return Preparation.Success(PreparedCapability(selected.terminalEndpoint, selected.version))
     }
 
     private suspend fun prepareFolder(
         request: SyncPageRequest,
         capability: PreparedCapability,
+        operation: DiagnosticOperation,
     ): Preparation<PreparedFolder> {
         val savedPrimary = request.checkpoints.primaryCalendarId
         val savedFolderKey = request.checkpoints.folderSyncKey
@@ -188,13 +268,14 @@ internal class ActiveSyncRemoteCalendar(
                 deviceId = request.deviceId,
                 version = capability.version,
                 body = FolderSyncCodec.encodeRequest(folderKey),
+                operation = operation,
             )
         return when (outcome) {
             is ActiveSyncCommandOutcome.Failure -> {
                 Preparation.Failure(outcome.toRemoteFailure())
             }
             is ActiveSyncCommandOutcome.Success -> {
-                val page = FolderSyncCodec.decodeResponse(outcome.body)
+                val page = decodeFolderResponse(outcome.body)
                 val state =
                     if (savedPrimary != null) {
                         reconcileRetainedPrimary(savedPrimary, folderKey, page)
@@ -260,6 +341,58 @@ internal class ActiveSyncRemoteCalendar(
 
     private fun ActiveSyncCommandOutcome.Failure.toRemoteFailure(): RemotePageOutcome.Failure =
         RemotePageOutcome.Failure(kind, problem)
+
+    private fun decodeFolderResponse(body: ByteArray): FolderSyncPage =
+        try {
+            FolderSyncCodec.decodeResponse(body)
+        } catch (status: ActiveSyncStatusException) {
+            throw status.withCommand(ActiveSyncCommand.FOLDER_SYNC.wireValue)
+        } catch (failure: ActiveSyncProtocolDataException) {
+            throw failure.withContext(ActiveSyncCommand.FOLDER_SYNC.wireValue)
+        }
+
+    private fun decodeCalendarResponse(
+        body: ByteArray,
+        primaryCalendarId: String,
+    ): RawCalendarSyncPage =
+        try {
+            CalendarSyncCodec.decodeResponse(body, primaryCalendarId)
+        } catch (status: ActiveSyncStatusException) {
+            throw status.withCommand(ActiveSyncCommand.SYNC.wireValue)
+        } catch (failure: ActiveSyncProtocolDataException) {
+            throw failure.withContext(ActiveSyncCommand.SYNC.wireValue)
+        }
+
+    private fun emitProtocolFailure(
+        operation: DiagnosticOperation,
+        stage: DiagnosticStage,
+        reason: String,
+        failureCategory: String,
+        command: String? = null,
+        serverId: String? = null,
+        throwable: Throwable? = null,
+    ) {
+        diagnostics.emit(
+            DeviceDiagnosticEvent(
+                DiagnosticSeverity.WARN,
+                DiagnosticComponent.ACTIVE_SYNC,
+                stage,
+                operation,
+                command = command,
+                reasonCode = reason,
+                failureCategory = failureCategory,
+                serverId = serverId,
+                throwable = throwable,
+            ),
+        )
+    }
+
+    private fun String?.diagnosticStage(): DiagnosticStage =
+        when (this) {
+            ActiveSyncCommand.FOLDER_SYNC.wireValue -> DiagnosticStage.FOLDER_SYNC
+            ActiveSyncCommand.SYNC.wireValue -> DiagnosticStage.CALENDAR_SYNC
+            else -> DiagnosticStage.COMMAND
+        }
 
     private companion object {
         const val DEFAULT_CALENDAR_TYPE = 8

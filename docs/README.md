@@ -27,6 +27,8 @@
   Android KeyChain, TLS/mTLS, ActiveSync probe, хранение и ошибки.
 - [Синхронизация календаря](calendar-sync.md) — ActiveSync flow, owned Calendar
   Provider mirror, приглашения, WorkManager, retries, permissions и problems.
+- [Диагностика](diagnostics.md) — безопасные структурированные записи Logcat,
+  корреляция, redaction и точные команды сбора через ADB.
 
 Команды сборки и проверки, требования к окружению и процесс разработки
 поддерживаются в [`AGENTS.md`](../AGENTS.md).

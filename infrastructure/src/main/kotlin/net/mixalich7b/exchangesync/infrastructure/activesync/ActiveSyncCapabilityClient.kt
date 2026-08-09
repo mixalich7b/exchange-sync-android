@@ -14,29 +14,69 @@ import net.mixalich7b.exchangesync.core.sync.SyncProblem
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredential
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredentialResolution
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredentialResolver
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnosticEvent
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticComponent
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperation
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperationKind
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticSeverity
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.diagnosticHost
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.diagnosticPath
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.safeHeaderTokens
 
 internal class ActiveSyncCapabilityClient(
     private val credentialResolver: ClientCredentialResolver,
     private val transportFactory: SecureHttpTransportFactory,
     private val totalTimeoutMillis: Long = 30_000,
     private val transportDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val diagnostics: DeviceDiagnostics = DeviceDiagnostics(),
 ) : ActiveSyncCapabilityGateway {
-    override suspend fun discover(profile: ConnectionProfile): ActiveSyncCapabilityOutcome {
-        val resolution = credentialResolver.resolve(profile.clientCertificateAlias)
+    override suspend fun discover(profile: ConnectionProfile): ActiveSyncCapabilityOutcome =
+        discover(profile, diagnostics.operation(DiagnosticOperationKind.CAPABILITY_DISCOVERY))
+
+    override suspend fun discover(
+        profile: ConnectionProfile,
+        operation: DiagnosticOperation,
+    ): ActiveSyncCapabilityOutcome {
+        val resolution = credentialResolver.resolve(profile.clientCertificateAlias, operation)
         if (resolution !is ClientCredentialResolution.Available) {
+            diagnostics.emit(failureEvent(operation, DiagnosticStage.KEYCHAIN_RESOLUTION, SyncProblem.CLIENT_CERTIFICATE))
             return ActiveSyncCapabilityOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.CLIENT_CERTIFICATE)
         }
         return try {
             withTimeout(totalTimeoutMillis) {
-                val transport = withContext(transportDispatcher) { transportFactory.create(resolution.credential) }
-                discover(profile, resolution.credential, transport)
+                val transport =
+                    withContext(transportDispatcher) {
+                        transportFactory.create(profile, resolution.credential, operation)
+                    }
+                discover(profile, resolution.credential, transport, operation)
             }
-        } catch (_: TimeoutCancellationException) {
+        } catch (failure: TimeoutCancellationException) {
+            diagnostics.emit(
+                failureEvent(operation, DiagnosticStage.FAILURE, null).copy(
+                    timeoutMillis = totalTimeoutMillis,
+                    throwable = failure,
+                ),
+            )
             ActiveSyncCapabilityOutcome.Failure(SyncFailureKind.TRANSIENT, null)
         } catch (cancellation: CancellationException) {
+            diagnostics.emit(
+                DeviceDiagnosticEvent(
+                    DiagnosticSeverity.INFO,
+                    DiagnosticComponent.ACTIVE_SYNC,
+                    DiagnosticStage.CANCELLATION,
+                    operation,
+                ),
+            )
             throw cancellation
         } catch (failure: Exception) {
-            ConnectionExceptionClassifier.classify(failure).toCapabilityFailure()
+            val category = ConnectionExceptionClassifier.classify(failure)
+            val outcome = category.toCapabilityFailure()
+            diagnostics.emit(
+                failureEvent(operation, category.diagnosticStage(), outcome.problem).copy(throwable = failure),
+            )
+            outcome
         }
     }
 
@@ -44,20 +84,64 @@ internal class ActiveSyncCapabilityClient(
         profile: ConnectionProfile,
         credential: ClientCredential,
         transport: SecureHttpTransport,
+        operation: DiagnosticOperation,
     ): ActiveSyncCapabilityOutcome {
         var endpoint = ActiveSyncProbePolicy.initialUrl(profile.serverHost)
         val redirects = RedirectTracker(endpoint)
         while (true) {
-            val response = transport.execute(ActiveSyncProbePolicy.request(endpoint))
+            val response = transport.execute(ActiveSyncProbePolicy.request(endpoint, operation))
             if (ActiveSyncProbePolicy.isRedirect(response.statusCode)) {
                 when (val decision = redirects.follow(endpoint, response.header("Location"))) {
-                    is RedirectDecision.Follow -> endpoint = decision.url
-                    RedirectDecision.Rejected ->
+                    is RedirectDecision.Follow -> {
+                        diagnostics.emit(
+                            DeviceDiagnosticEvent(
+                                DiagnosticSeverity.INFO,
+                                DiagnosticComponent.ACTIVE_SYNC,
+                                DiagnosticStage.REDIRECT,
+                                operation,
+                                method = "OPTIONS",
+                                host = decision.url.diagnosticHost(),
+                                path = decision.url.diagnosticPath(),
+                                status = response.statusCode,
+                                outcome = "follow",
+                            ),
+                        )
+                        endpoint = decision.url
+                    }
+                    RedirectDecision.Rejected -> {
+                        diagnostics.emit(
+                            DeviceDiagnosticEvent(
+                                DiagnosticSeverity.WARN,
+                                DiagnosticComponent.ACTIVE_SYNC,
+                                DiagnosticStage.REDIRECT,
+                                operation,
+                                method = "OPTIONS",
+                                host = endpoint.diagnosticHost(),
+                                path = endpoint.diagnosticPath(),
+                                status = response.statusCode,
+                                failureCategory = SyncProblem.REDIRECT.name,
+                                outcome = "rejected",
+                            ),
+                        )
                         return ActiveSyncCapabilityOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.REDIRECT)
+                    }
                 }
                 continue
             }
             if (!response.used(credential.leafCertificate)) {
+                diagnostics.emit(
+                    failureEvent(
+                        operation,
+                        DiagnosticStage.CLIENT_CERTIFICATE_VERIFICATION,
+                        SyncProblem.CLIENT_CERTIFICATE,
+                    ).copy(
+                        method = "OPTIONS",
+                        host = endpoint.diagnosticHost(),
+                        path = endpoint.diagnosticPath(),
+                        chainLength = response.localCertificates.size,
+                        reasonCode = "SELECTED_LEAF_ABSENT",
+                    ),
+                )
                 return ActiveSyncCapabilityOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.CLIENT_CERTIFICATE)
             }
             val capabilityFailure =
@@ -66,12 +150,92 @@ internal class ActiveSyncCapabilityClient(
                     protocolVersions = response.header("MS-ASProtocolVersions"),
                     protocolCommands = response.header("MS-ASProtocolCommands"),
                 )
-            if (capabilityFailure != null) return capabilityFailure.toCapabilityFailure()
+            if (capabilityFailure != null) {
+                diagnostics.emit(
+                    DeviceDiagnosticEvent(
+                        DiagnosticSeverity.WARN,
+                        DiagnosticComponent.ACTIVE_SYNC,
+                        DiagnosticStage.CAPABILITY_VALIDATION,
+                        operation,
+                        method = "OPTIONS",
+                        host = endpoint.diagnosticHost(),
+                        path = endpoint.diagnosticPath(),
+                        status = response.statusCode,
+                        protocolVersions = safeHeaderTokens(response.header("MS-ASProtocolVersions")),
+                        protocolCommands = safeHeaderTokens(response.header("MS-ASProtocolCommands")),
+                        reasonCode =
+                            capabilityReason(
+                                response.statusCode,
+                                response.header("MS-ASProtocolVersions"),
+                                response.header("MS-ASProtocolCommands"),
+                            ),
+                        failureCategory = capabilityFailure.name,
+                    ),
+                )
+                return capabilityFailure.toCapabilityFailure()
+            }
             val version = ActiveSyncVersionNegotiator.select(response.header("MS-ASProtocolVersions"))
-                ?: return ActiveSyncCapabilityOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.COMPATIBILITY)
-            return ActiveSyncCapabilityOutcome.Success(endpoint, version)
+            if (version == null) {
+                diagnostics.emit(
+                    failureEvent(
+                        operation,
+                        DiagnosticStage.VERSION_SELECTION,
+                        SyncProblem.COMPATIBILITY,
+                    ).copy(
+                        method = "OPTIONS",
+                        host = endpoint.diagnosticHost(),
+                        path = endpoint.diagnosticPath(),
+                        status = response.statusCode,
+                        reasonCode = "NO_MUTUAL_VERSION",
+                    ),
+                )
+                return ActiveSyncCapabilityOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.COMPATIBILITY)
+            }
+            diagnostics.emit(
+                DeviceDiagnosticEvent(
+                    DiagnosticSeverity.INFO,
+                    DiagnosticComponent.ACTIVE_SYNC,
+                    DiagnosticStage.VERSION_SELECTION,
+                    operation,
+                    host = endpoint.diagnosticHost(),
+                    path = endpoint.diagnosticPath(),
+                    outcome = version.wireValue,
+                ),
+            )
+            return ActiveSyncCapabilityOutcome.Success(
+                terminalEndpoint = endpoint,
+                version = version,
+                supportedVersions = ActiveSyncVersionNegotiator.supported(response.header("MS-ASProtocolVersions")),
+            )
         }
     }
+
+    private fun failureEvent(
+        operation: DiagnosticOperation,
+        stage: DiagnosticStage,
+        problem: SyncProblem?,
+    ): DeviceDiagnosticEvent =
+        DeviceDiagnosticEvent(
+            severity = DiagnosticSeverity.ERROR,
+            component = DiagnosticComponent.ACTIVE_SYNC,
+            stage = stage,
+            operation = operation,
+            failureCategory = problem?.name,
+            outcome = "failure",
+        )
+
+    private fun capabilityReason(
+        status: Int,
+        versions: String?,
+        commands: String?,
+    ): String =
+        when {
+            status != 200 -> "HTTP_STATUS"
+            ActiveSyncVersionNegotiator.select(versions) == null -> "NO_MUTUAL_VERSION"
+            !safeHeaderTokens(commands).map(String::lowercase).containsAll(setOf("foldersync", "sync")) ->
+                "MISSING_REQUIRED_COMMAND"
+            else -> "INVALID_CAPABILITY"
+        }
 
     private fun SecureHttpResponse.used(expected: X509Certificate): Boolean =
         localCertificates.any { certificate ->

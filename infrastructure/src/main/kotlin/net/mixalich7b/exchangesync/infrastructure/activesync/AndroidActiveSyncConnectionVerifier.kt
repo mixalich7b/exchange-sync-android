@@ -13,16 +13,22 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import net.mixalich7b.exchangesync.core.connection.ConnectionCheckResult
 import net.mixalich7b.exchangesync.core.connection.ConnectionProfile
 import net.mixalich7b.exchangesync.core.connection.ConnectionVerifier
-import net.mixalich7b.exchangesync.infrastructure.tls.AndroidCertificateAssetSource
 import net.mixalich7b.exchangesync.infrastructure.tls.CertificateAssetLoader
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredential
 import net.mixalich7b.exchangesync.infrastructure.tls.CompositeX509TrustManager
 import net.mixalich7b.exchangesync.infrastructure.tls.FixedAliasKeyManager
-import net.mixalich7b.exchangesync.infrastructure.tls.KeyChainClientCredentialResolver
 import net.mixalich7b.exchangesync.infrastructure.tls.LocalCertificates
 import net.mixalich7b.exchangesync.infrastructure.tls.LocalTrustStatus
+import net.mixalich7b.exchangesync.infrastructure.tls.sha256Fingerprint
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnosticEvent
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticComponent
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperation
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticSeverity
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.CookieJar
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -56,23 +62,34 @@ internal fun readActiveSyncResponseBody(
 private const val RESPONSE_READ_CHUNK_BYTES: Long = 8 * 1024
 
 public class AndroidActiveSyncConnectionVerifier(context: Context) : ConnectionVerifier {
-    private val delegate: ConnectionVerifier =
-        ActiveSyncConnectionVerifier(
-            credentialResolver = KeyChainClientCredentialResolver(context.applicationContext),
-            transportFactory =
-                OkHttpSecureHttpTransportFactory(
-                    CertificateAssetLoader(AndroidCertificateAssetSource(context.assets)),
-                ),
-        )
+    private val delegate: ConnectionVerifier = AndroidActiveSyncProcessRuntime(context).connectionVerifier
 
     override suspend fun verify(profile: ConnectionProfile): ConnectionCheckResult = delegate.verify(profile)
 }
 
 internal class OkHttpSecureHttpTransportFactory(
     private val certificateLoader: CertificateAssetLoader,
-) : ProbeTransportFactory {
-    override fun create(credential: ClientCredential): ProbeTransport {
-        val trustManager = CombinedTrustManagerFactory.create(certificateLoader.load())
+    private val diagnostics: DeviceDiagnostics = DeviceDiagnostics(),
+) : CookieJarSecureHttpTransportFactory {
+    override fun create(
+        credential: ClientCredential,
+        cookieJar: CookieJar,
+        operation: DiagnosticOperation,
+    ): ProbeTransport {
+        val localCertificates = certificateLoader.load(operation)
+        val trustManager = CombinedTrustManagerFactory.create(localCertificates, diagnostics, operation)
+        diagnostics.emit(
+            DeviceDiagnosticEvent(
+                DiagnosticSeverity.INFO,
+                DiagnosticComponent.TLS,
+                DiagnosticStage.CLIENT_KEY,
+                operation,
+                chainLength = credential.certificateChain.size,
+                keyAlgorithm = credential.privateKey.algorithm,
+                fingerprint = sha256Fingerprint(credential.leafCertificate),
+                outcome = "available",
+            ),
+        )
         val sslContext =
             SSLContext.getInstance("TLS").apply {
                 init(arrayOf(FixedAliasKeyManager(credential)), arrayOf(trustManager), null)
@@ -80,18 +97,22 @@ internal class OkHttpSecureHttpTransportFactory(
         val client =
             OkHttpClient.Builder()
                 .sslSocketFactory(sslContext.socketFactory, trustManager)
+                .cookieJar(cookieJar)
+                .eventListenerFactory { ActiveSyncNetworkEventListener(diagnostics, operation) }
                 .followRedirects(false)
                 .followSslRedirects(false)
                 .connectTimeout(10, TimeUnit.SECONDS)
                 .readTimeout(15, TimeUnit.SECONDS)
                 .callTimeout(30, TimeUnit.SECONDS)
                 .build()
-        return OkHttpSecureHttpTransport(client)
+        return OkHttpSecureHttpTransport(client, diagnostics, operation)
     }
 }
 
 private class OkHttpSecureHttpTransport(
     private val client: OkHttpClient,
+    private val diagnostics: DeviceDiagnostics,
+    private val operation: DiagnosticOperation,
 ) : ProbeTransport {
     override suspend fun execute(request: Request): ProbeResponse =
         suspendCancellableCoroutine { continuation ->
@@ -100,12 +121,41 @@ private class OkHttpSecureHttpTransport(
             call.enqueue(
                 object : Callback {
                     override fun onFailure(call: Call, e: IOException) {
+                        if (!call.isCanceled()) {
+                            diagnostics.emit(
+                                DeviceDiagnosticEvent(
+                                    DiagnosticSeverity.ERROR,
+                                    DiagnosticComponent.HTTP,
+                                    DiagnosticStage.FAILURE,
+                                    operation,
+                                    method = request.method,
+                                    command = request.url.queryParameter("Cmd"),
+                                    host = request.url.host,
+                                    path = request.url.encodedPath,
+                                    throwable = e,
+                                ),
+                            )
+                        }
                         continuation.resumeWith(Result.failure(e))
                     }
 
                     override fun onResponse(call: Call, response: Response) {
                         response.use {
                             try {
+                                diagnostics.emit(
+                                    DeviceDiagnosticEvent(
+                                        DiagnosticSeverity.INFO,
+                                        DiagnosticComponent.HTTP,
+                                        DiagnosticStage.RESPONSE_BODY,
+                                        operation,
+                                        method = request.method,
+                                        command = request.url.queryParameter("Cmd"),
+                                        host = request.url.host,
+                                        path = request.url.encodedPath,
+                                        status = response.code,
+                                        outcome = "bounded_read",
+                                    ),
+                                )
                                 continuation.resumeSafely(
                                     SecureHttpResponse(
                                         statusCode = response.code,
@@ -133,9 +183,14 @@ private class OkHttpSecureHttpTransport(
 }
 
 private object CombinedTrustManagerFactory {
-    fun create(localCertificates: LocalCertificates): CompositeX509TrustManager {
+    fun create(
+        localCertificates: LocalCertificates,
+        diagnostics: DeviceDiagnostics,
+        operation: DiagnosticOperation,
+    ): CompositeX509TrustManager {
         val system = trustManager(keyStore = null)
-        val local = createLocal(localCertificates.certificates)
+        val localResult = createLocal(localCertificates.certificates)
+        val local = localResult.manager
         val status =
             when {
                 local == null && (localCertificates.hadAssets || localCertificates.issues.isNotEmpty()) ->
@@ -144,11 +199,23 @@ private object CombinedTrustManagerFactory {
                 localCertificates.issues.isNotEmpty() -> LocalTrustStatus.INVALID
                 else -> LocalTrustStatus.AVAILABLE
             }
-        return CompositeX509TrustManager(system, local, status)
+        diagnostics.emit(
+            DeviceDiagnosticEvent(
+                severity = if (status == LocalTrustStatus.INVALID) DiagnosticSeverity.WARN else DiagnosticSeverity.INFO,
+                component = DiagnosticComponent.TLS,
+                stage = DiagnosticStage.TRUST_MANAGER,
+                operation = operation,
+                chainLength = localCertificates.certificates.size,
+                reasonCode = status.name,
+                outcome = "constructed",
+                throwable = localResult.failure,
+            ),
+        )
+        return CompositeX509TrustManager(system, local, status, diagnostics, operation)
     }
 
-    private fun createLocal(certificates: List<X509Certificate>): X509TrustManager? {
-        if (certificates.isEmpty()) return null
+    private fun createLocal(certificates: List<X509Certificate>): LocalTrustManagerResult {
+        if (certificates.isEmpty()) return LocalTrustManagerResult(null, null)
         return try {
             val keyStore =
                 KeyStore.getInstance(KeyStore.getDefaultType()).apply {
@@ -157,11 +224,16 @@ private object CombinedTrustManagerFactory {
                         setCertificateEntry("local-ca-$index", certificate)
                     }
                 }
-            trustManager(keyStore)
-        } catch (_: Exception) {
-            null
+            LocalTrustManagerResult(trustManager(keyStore), null)
+        } catch (failure: Exception) {
+            LocalTrustManagerResult(null, failure)
         }
     }
+
+    private data class LocalTrustManagerResult(
+        val manager: X509TrustManager?,
+        val failure: Throwable?,
+    )
 
     private fun trustManager(keyStore: KeyStore?): X509TrustManager {
         val factory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())

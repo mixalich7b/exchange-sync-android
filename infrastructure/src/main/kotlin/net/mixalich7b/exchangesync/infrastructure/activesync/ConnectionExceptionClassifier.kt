@@ -16,6 +16,7 @@ import javax.net.ssl.SSLPeerUnverifiedException
 import net.mixalich7b.exchangesync.core.connection.ConnectionFailure
 import net.mixalich7b.exchangesync.infrastructure.tls.CombinedTrustException
 import net.mixalich7b.exchangesync.infrastructure.tls.LocalTrustStatus
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
 
 internal object ConnectionExceptionClassifier {
     fun classify(failure: Throwable): ConnectionFailure {
@@ -59,3 +60,20 @@ internal object ConnectionExceptionClassifier {
         return causes
     }
 }
+
+internal fun ConnectionFailure.diagnosticStage(): DiagnosticStage =
+    when (this) {
+        ConnectionFailure.CLIENT_CERTIFICATE_UNAVAILABLE -> DiagnosticStage.KEYCHAIN_RESOLUTION
+        ConnectionFailure.CLIENT_CERTIFICATE_REJECTED -> DiagnosticStage.HANDSHAKE
+        ConnectionFailure.SERVER_TRUST,
+        ConnectionFailure.LOCAL_CA_MISSING,
+        ConnectionFailure.LOCAL_CA_INVALID,
+        ConnectionFailure.SERVER_CERTIFICATE_DIAGNOSTICS,
+        -> DiagnosticStage.SERVER_CHAIN
+        ConnectionFailure.HOSTNAME_MISMATCH -> DiagnosticStage.HOSTNAME
+        ConnectionFailure.REDIRECT_POLICY -> DiagnosticStage.REDIRECT
+        ConnectionFailure.PROTOCOL_INCOMPATIBLE,
+        ConnectionFailure.ENDPOINT_MISMATCH,
+        -> DiagnosticStage.CAPABILITY_VALIDATION
+        else -> DiagnosticStage.FAILURE
+    }

@@ -142,7 +142,7 @@ class ActiveSyncRemoteCalendarTest {
                         }
                     }
                 }
-            val remote = ActiveSyncRemoteCalendar(capabilities, commands)
+            val remote = ActiveSyncRemoteCalendar(capabilities, commands, liveSessions(ActiveSyncVersion.V14_1))
             val request =
                 request(
                     fullSync = false,
@@ -166,6 +166,120 @@ class ActiveSyncRemoteCalendarTest {
         }
 
     @Test
+    fun `live profile capability is reused without another OPTIONS request`() =
+        runBlocking {
+            val sessions = ActiveSyncProfileSessionRegistry()
+            sessions.acquire(profile()).recordCapability(
+                ActiveSyncLiveCapability(
+                    terminalEndpoint = endpoint(),
+                    version = ActiveSyncVersion.V16_1,
+                    supportedVersions = setOf(ActiveSyncVersion.V16_1),
+                ),
+            )
+            var optionsCalls = 0
+            val commands = successfulIncrementalCommands(ActiveSyncVersion.V16_1)
+            val remote =
+                ActiveSyncRemoteCalendar(
+                    capabilities =
+                        ActiveSyncCapabilityGateway {
+                            optionsCalls += 1
+                            error("Live capability must be reused")
+                        },
+                    commands = commands,
+                    sessions = sessions,
+                )
+
+            val outcome = remote.fetchPage(request(fullSync = false, checkpoints = persistedCheckpoints()))
+
+            assertTrue(outcome is RemotePageOutcome.Page)
+            assertEquals(0, optionsCalls)
+        }
+
+    @Test
+    fun `cold profile discovers capabilities and retains a persisted version that is still offered`() =
+        runBlocking {
+            val calls = mutableListOf<String>()
+            val sessions = ActiveSyncProfileSessionRegistry()
+            val remote =
+                ActiveSyncRemoteCalendar(
+                    capabilities =
+                        ActiveSyncCapabilityGateway {
+                            calls += "OPTIONS"
+                            ActiveSyncCapabilityOutcome.Success(
+                                terminalEndpoint = endpoint(),
+                                version = ActiveSyncVersion.V16_1,
+                                supportedVersions =
+                                    setOf(
+                                        ActiveSyncVersion.V14_1,
+                                        ActiveSyncVersion.V16_1,
+                                    ),
+                            )
+                        },
+                    commands = successfulIncrementalCommands(ActiveSyncVersion.V14_1, calls),
+                    sessions = sessions,
+                )
+
+            val outcome =
+                remote.fetchPage(
+                    request(
+                        fullSync = false,
+                        checkpoints = persistedCheckpoints(version = ActiveSyncVersion.V14_1),
+                    ),
+                )
+            val continuation =
+                remote.fetchPage(
+                    request(
+                        fullSync = false,
+                        checkpoints = persistedCheckpoints(version = ActiveSyncVersion.V14_1),
+                    ),
+                )
+
+            assertTrue(outcome is RemotePageOutcome.Page)
+            assertTrue(continuation is RemotePageOutcome.Page)
+            assertEquals(listOf("OPTIONS", "FolderSync", "Sync", "FolderSync", "Sync"), calls)
+            assertEquals(ActiveSyncVersion.V14_1, sessions.acquire(profile()).liveCapability()?.version)
+        }
+
+    @Test
+    fun `protocol version change requests full reset before old keys are used`() =
+        runBlocking {
+            var commandCalls = 0
+            val sessions = ActiveSyncProfileSessionRegistry()
+            val remote =
+                ActiveSyncRemoteCalendar(
+                    capabilities =
+                        ActiveSyncCapabilityGateway {
+                            ActiveSyncCapabilityOutcome.Success(
+                                terminalEndpoint = endpoint(),
+                                version = ActiveSyncVersion.V16_1,
+                                supportedVersions = setOf(ActiveSyncVersion.V16_1),
+                            )
+                        },
+                    commands =
+                        ActiveSyncCommandGateway { _, _, _, _, _, _ ->
+                            commandCalls += 1
+                            error("Old protocol keys must not be used")
+                        },
+                    sessions = sessions,
+                )
+
+            val outcome =
+                remote.fetchPage(
+                    request(
+                        fullSync = false,
+                        checkpoints = persistedCheckpoints(version = ActiveSyncVersion.V14_1),
+                    ),
+                )
+
+            assertEquals(
+                RemotePageOutcome.Failure(SyncFailureKind.FULL_RESET_REQUIRED, null),
+                outcome,
+            )
+            assertEquals(0, commandCalls)
+            assertEquals(ActiveSyncVersion.V16_1, sessions.acquire(profile()).liveCapability()?.version)
+        }
+
+    @Test
     fun `empty successful incremental Sync keeps the collection key and completes with no changes`() =
         runBlocking {
             val commands =
@@ -183,6 +297,7 @@ class ActiveSyncRemoteCalendarTest {
                 ActiveSyncRemoteCalendar(
                     capabilities = ActiveSyncCapabilityGateway { error("Saved capability must be reused") },
                     commands = commands,
+                    sessions = liveSessions(ActiveSyncVersion.V16_1),
                 )
 
             val outcome =
@@ -239,7 +354,7 @@ class ActiveSyncRemoteCalendarTest {
                         }
                     }
                 }
-            val remote = ActiveSyncRemoteCalendar(capabilities, commands)
+            val remote = ActiveSyncRemoteCalendar(capabilities, commands, liveSessions(ActiveSyncVersion.V16_1))
 
             val outcome =
                 remote.fetchPage(
@@ -280,6 +395,7 @@ class ActiveSyncRemoteCalendarTest {
                                     },
                                 )
                             },
+                        sessions = liveSessions(ActiveSyncVersion.V16_1),
                     )
                 return remote.fetchPage(
                     request(
@@ -371,6 +487,7 @@ class ActiveSyncRemoteCalendarTest {
                                 },
                             )
                         },
+                    sessions = liveSessions(ActiveSyncVersion.V16_1),
                 )
 
             val outcome =
@@ -405,6 +522,45 @@ class ActiveSyncRemoteCalendarTest {
             checkpoints = checkpoints,
             fullSyncRequired = fullSync,
         )
+
+    private fun persistedCheckpoints(
+        version: ActiveSyncVersion = ActiveSyncVersion.V16_1,
+    ): SyncCheckpoints =
+        SyncCheckpoints(
+            terminalCommandUrl = endpoint().toString(),
+            protocolVersion = version,
+            folderSyncKey = "known-folder-key",
+            primaryCalendarId = "known-primary",
+            collectionSyncKey = "known-calendar-key",
+        )
+
+    private fun liveSessions(version: ActiveSyncVersion): ActiveSyncProfileSessionRegistry =
+        ActiveSyncProfileSessionRegistry().also { sessions ->
+            sessions.acquire(profile()).recordCapability(
+                ActiveSyncLiveCapability(
+                    terminalEndpoint = endpoint(),
+                    version = version,
+                    supportedVersions = setOf(version),
+                ),
+            )
+        }
+
+    private fun successfulIncrementalCommands(
+        expectedVersion: ActiveSyncVersion,
+        calls: MutableList<String> = mutableListOf(),
+    ): ActiveSyncCommandGateway =
+        ActiveSyncCommandGateway { _, endpoint, command, _, version, _ ->
+            calls += command.wireValue
+            assertEquals(expectedVersion, version)
+            ActiveSyncCommandOutcome.Success(
+                endpoint,
+                if (command == ActiveSyncCommand.FOLDER_SYNC) {
+                    emptyFolderResponse("next-folder-key")
+                } else {
+                    byteArrayOf()
+                },
+            )
+        }
 
     private fun folderResponse(syncKey: String, primaryId: String): ByteArray =
         wbxml(

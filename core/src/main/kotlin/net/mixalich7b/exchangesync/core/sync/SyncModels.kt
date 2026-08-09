@@ -177,6 +177,7 @@ public data class RemoteCalendarPage(
 public enum class SyncFailureKind {
     TRANSIENT,
     INVALID_KEY,
+    FULL_RESET_REQUIRED,
     WINDOW_TOO_LARGE,
     CRITICAL,
 }

@@ -149,7 +149,7 @@ class ActiveSyncCommandClientTest {
             val client =
                 ActiveSyncCommandClient(
                     credentialResolver = ClientCredentialResolver { ClientCredentialResolution.Available(credential) },
-                    transportFactory = SecureHttpTransportFactory {
+                    transportFactory = SecureHttpTransportFactory { _, _, _ ->
                         SecureHttpTransport { throw ActiveSyncResponseTooLargeException() }
                     },
                     transportDispatcher = UnconfinedTestDispatcher(testScheduler),
@@ -192,7 +192,7 @@ class ActiveSyncCommandClientTest {
             val client =
                 ActiveSyncCapabilityClient(
                     credentialResolver = ClientCredentialResolver { ClientCredentialResolution.Available(credential) },
-                    transportFactory = SecureHttpTransportFactory { transport },
+                    transportFactory = SecureHttpTransportFactory { _, _, _ -> transport },
                     transportDispatcher = UnconfinedTestDispatcher(testScheduler),
                 )
 
@@ -200,6 +200,7 @@ class ActiveSyncCommandClientTest {
                 ActiveSyncCapabilityOutcome.Success(
                     "https://mail.example.test/EAS".toHttpUrl(),
                     ActiveSyncVersion.V16_1,
+                    setOf(ActiveSyncVersion.V14_0, ActiveSyncVersion.V16_1),
                 ),
                 client.discover(profile()),
             )
@@ -213,7 +214,7 @@ class ActiveSyncCommandClientTest {
     ): ActiveSyncCommandClient =
         ActiveSyncCommandClient(
             credentialResolver = ClientCredentialResolver { ClientCredentialResolution.Available(credential) },
-            transportFactory = SecureHttpTransportFactory { transport },
+            transportFactory = SecureHttpTransportFactory { _, _, _ -> transport },
             transportDispatcher = UnconfinedTestDispatcher(testScheduler),
         )
 

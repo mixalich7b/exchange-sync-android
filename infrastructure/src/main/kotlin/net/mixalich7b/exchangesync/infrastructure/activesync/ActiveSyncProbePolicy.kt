@@ -2,6 +2,7 @@ package net.mixalich7b.exchangesync.infrastructure.activesync
 
 import net.mixalich7b.exchangesync.core.connection.ConnectionFailure
 import net.mixalich7b.exchangesync.core.sync.ActiveSyncVersion
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperation
 import okhttp3.HttpUrl
 import okhttp3.Request
 
@@ -16,10 +17,14 @@ internal object ActiveSyncProbePolicy {
             .addPathSegment("Microsoft-Server-ActiveSync")
             .build()
 
-    fun request(url: HttpUrl): Request =
+    fun request(
+        url: HttpUrl,
+        operation: DiagnosticOperation? = null,
+    ): Request =
         Request.Builder()
             .url(url)
             .method("OPTIONS", null)
+            .apply { operation?.let { tag(DiagnosticOperation::class.java, it) } }
             .build()
 
     fun isRedirect(statusCode: Int): Boolean = statusCode in redirectCodes
@@ -90,6 +95,11 @@ internal object ActiveSyncResponseEvaluator {
 
 internal object ActiveSyncVersionNegotiator {
     fun select(header: String?): ActiveSyncVersion? {
+        val supported = supported(header)
+        return ActiveSyncVersion.entries.lastOrNull { version -> version in supported }
+    }
+
+    fun supported(header: String?): Set<ActiveSyncVersion> {
         val offered =
             header
                 ?.split(',')
@@ -97,6 +107,6 @@ internal object ActiveSyncVersionNegotiator {
                 ?.filter(String::isNotEmpty)
                 ?.toSet()
                 .orEmpty()
-        return ActiveSyncVersion.entries.lastOrNull { version -> version.wireValue in offered }
+        return ActiveSyncVersion.entries.filterTo(linkedSetOf()) { version -> version.wireValue in offered }
     }
 }

@@ -15,7 +15,7 @@ class AppCompositionTest {
             setOf(
                 "DataStoreConnectionProfileRepository",
                 "DataStoreSynchronizationStateRepository",
-                "AndroidActiveSyncRemoteCalendar",
+                "AndroidActiveSyncProcessRuntime",
                 "AndroidOwnedCalendarAdapter",
                 "AndroidSyncPermissionPort",
                 "WorkManagerSyncScheduler",
@@ -27,6 +27,19 @@ class AppCompositionTest {
                 "SyncWorkerFactory",
             ).all(source::contains),
         )
+    }
+
+    @Test
+    fun `one ActiveSync process runtime serves connection verification and calendar synchronization`() {
+        val source = File("src/main/kotlin/net/mixalich7b/exchangesync/AppContainer.kt").readText()
+
+        assertEquals(
+            1,
+            source.windowed("AndroidActiveSyncProcessRuntime(".length)
+                .count { candidate -> candidate == "AndroidActiveSyncProcessRuntime(" },
+        )
+        assertTrue("activeSyncRuntime.connectionVerifier" in source)
+        assertTrue("activeSyncRuntime.remoteCalendar" in source)
     }
 
     @Test

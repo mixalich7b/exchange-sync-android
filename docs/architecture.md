@@ -48,10 +48,12 @@ Kotlin/JVM-модулем без Android и HTTP API. Такое разделе�
 вручную связывает:
 
 - общий Preferences DataStore для профиля и sync metadata;
-- Android-адаптеры проверки и календарных команд ActiveSync;
+- один process-wide ActiveSync runtime для проверки и календарных команд с
+  profile-scoped cookie/capability sessions;
 - owned-only Calendar Provider adapter;
 - WorkManager scheduler и ручной `WorkerFactory`;
 - permission port и generation-aware notification reporter;
+- Logcat-backed diagnostics adapter и Android-free `SyncDiagnosticsPort`;
 - один core-сценарий `VerifyConnection`, используемый и `SaveConnection`, и
   ручной повторной проверкой;
 - core-сценарии `SaveConnection`, lifecycle, manual/periodic trigger и bounded
@@ -116,6 +118,14 @@ dispatcher. Создание trust managers, `SSLContext` и OkHttp-клиент
 Save может оставаться активным дольше номинального timeout; это принятый
 trade-off текущей реализации.
 
+Созданный один раз на процесс ActiveSync runtime разделяет только внутри точной
+profile identity потокобезопасный cookie jar и live capability result. Реестр
+ограничен четырьмя LRU entries. Новые verifier/remote-calendar transports для
+того же профиля получают этот сеанс, но продолжают создавать TLS client с
+выбранной mTLS identity и объединённым server trust. После process death сеанс
+пуст: перед календарной командой выполняется новый `OPTIONS`; persisted protocol
+version сохраняется только если остаётся в свежем advertised set.
+
 ## Хранение данных
 
 Preferences DataStore содержит ровно один профиль:
@@ -133,6 +143,13 @@ TLS-диагностика и stack trace не сохраняются. Успе�
 terminal peer chain: hostname, subject/issuer, serial, validity и SHA-256
 fingerprint. Android продолжает владеть закрытым ключом, а backup приложения
 отключён.
+
+Process-local cookie/capability sessions и структурированные diagnostic records
+также не сохраняются в DataStore. Diagnostics идут только в системный Logcat с
+тегом `ExchangeSync`; приложение не создаёт архив, экран просмотра или канал
+upload. Корреляция сетевых, protocol, provider и worker boundaries выполняется
+process-local operation ID и, для sync, generation/run token. Безопасные поля и
+ADB-команды описаны в [диагностике](diagnostics.md).
 
 ## Проверка реализации
 

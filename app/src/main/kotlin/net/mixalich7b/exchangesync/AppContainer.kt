@@ -7,8 +7,8 @@ import net.mixalich7b.exchangesync.core.connection.SaveConnection
 import net.mixalich7b.exchangesync.core.connection.SaveConnectionAction
 import net.mixalich7b.exchangesync.core.connection.VerifyConnection
 import net.mixalich7b.exchangesync.core.connection.VerifyConnectionAction
-import net.mixalich7b.exchangesync.infrastructure.activesync.AndroidActiveSyncConnectionVerifier
-import net.mixalich7b.exchangesync.infrastructure.activesync.AndroidActiveSyncRemoteCalendar
+import net.mixalich7b.exchangesync.infrastructure.activesync.AndroidActiveSyncProcessRuntime
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.AndroidSyncDiagnostics
 import net.mixalich7b.exchangesync.infrastructure.calendar.AndroidOwnedCalendarAdapter
 import net.mixalich7b.exchangesync.infrastructure.notification.SyncProblemNotificationReporter
 import net.mixalich7b.exchangesync.infrastructure.permission.AndroidSyncPermissionPort
@@ -30,6 +30,8 @@ internal class AppContainer(context: Context) {
     private val applicationContext = context.applicationContext
     private val dataStore = applicationContext.applicationDataStore
     private val synchronizationMutationLock = SynchronizationMutationLock()
+    private val activeSyncRuntime = AndroidActiveSyncProcessRuntime(applicationContext)
+    private val syncDiagnostics = AndroidSyncDiagnostics()
 
     val syncNotificationResources: SyncNotificationResources =
         SyncNotificationResources.from(applicationContext)
@@ -94,7 +96,7 @@ internal class AppContainer(context: Context) {
             },
         )
 
-    private val remoteCalendar = AndroidActiveSyncRemoteCalendar(applicationContext)
+    private val remoteCalendar = activeSyncRuntime.remoteCalendar
 
     val executeSynchronization =
         ExecuteSynchronizationSlice(
@@ -106,6 +108,7 @@ internal class AppContainer(context: Context) {
             permissions = syncPermissions,
             problems = syncProblems,
             clock = AndroidSyncClock,
+            diagnostics = syncDiagnostics,
         )
 
     val workerFactory =
@@ -114,7 +117,7 @@ internal class AppContainer(context: Context) {
             executeSynchronization = executeSynchronization,
         )
 
-    private val verifier = AndroidActiveSyncConnectionVerifier(applicationContext)
+    private val verifier = activeSyncRuntime.connectionVerifier
 
     val verifyConnection: VerifyConnectionAction = VerifyConnection(verifier)
 

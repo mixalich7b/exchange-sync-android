@@ -109,6 +109,12 @@ Probe завершается ошибкой redirect policy, если `Location`
   `16.0` или `16.1`; сервер только с 12.1 отклоняется как несовместимый;
 - `MS-ASProtocolCommands` с командами `FolderSync` и `Sync`.
 
+Номер семейства сборок Exchange Server 2019 `15.2.x` и версия wire-протокола
+ActiveSync — разные величины. Приложение не ищет product-version metadata и не
+добавляет `15.2` в заголовок `MS-ASProtocolVersions`: endpoint семейства 15.2
+совместим, когда объявляет хотя бы одну из `14.0`, `14.1`, `16.0` или `16.1`.
+Значение `15.2`, предложенное только как protocol version, отклоняется.
+
 Тело ответа `OPTIONS` не читается и не участвует в результате probe: для
 capability check значимы только terminal status, обязательные заголовки и TLS
 diagnostics.
@@ -150,6 +156,30 @@ validator: сначала разработчик должен исправить
 ошибки сертификата остаются server-trust, а hostname mismatch имеет отдельную
 категорию.
 
+## Process-local HTTP-сеанс
+
+Один создаваемый `AppContainer` ActiveSync runtime обслуживает и проверку
+подключения, и календарные команды. Для точной identity профиля — hostname,
+email, `domain\login` и KeyChain alias — runtime держит отдельный потокобезопасный
+сеанс. В нём находятся cookie jar и последний успешно установленный в текущем
+процессе capability result: terminal HTTPS endpoint, выбранная версия и набор
+поддерживаемых версий.
+
+Cookie принимаются и заменяются по обычной identity name/domain/path,
+просроченные и удалённые сервером значения отбрасываются. При последующих
+`OPTIONS`, redirect, `FolderSync` и `Sync` отправляются только подходящие по
+Secure, host/domain, path и expiry cookie. Поэтому cookie redirect destination
+не уходит на посторонний host. Реестр ограничен четырьмя недавно использованными
+профилями; вытеснение безопасно и приводит лишь к новому capability discovery.
+
+Сеанс существует только до завершения процесса. Cookie, их имена, значения и
+атрибуты не записываются в DataStore и не попадают в UI или diagnostics. После
+холодного старта календарная синхронизация всегда выполняет свежий `OPTIONS` до
+первой команды, даже если на диске есть checkpoints. Сохранённая protocol
+version продолжает использоваться, если сервер по-прежнему её объявляет; иначе
+выбирается максимальная общая версия и выполняется fenced full reset до
+повторного использования protocol-dependent checkpoints.
+
 ## Ошибки
 
 UI получает устойчивые категории, а не exception messages или response bodies:
@@ -165,10 +195,15 @@ UI получает устойчивые категории, а не exception m
 Stack traces, закрытый ключ и другой key material в presentation data не
 попадают.
 
+Технические причины до их преобразования в эти категории пишутся в системный
+Logcat с тегом `ExchangeSync`. Правила полей, редактирования чувствительных
+данных и точные команды ADB описаны в [диагностике](diagnostics.md).
+
 ## Хранение и границы безопасности
 
 DataStore сохраняет четыре поля профиля и отдельную non-secret sync metadata:
 generation/run token, phase, safe problem, device ID и ActiveSync checkpoints.
+Process-local cookie и live capability state в DataStore не сохраняются.
 TLS-диагностика существует только в памяти текущего ViewModel и после
 пересоздания приложения не восстанавливается. Пароль в модели отсутствует.
 `OPTIONS` probe не создаёт HTTP Authorization header; календарные ActiveSync

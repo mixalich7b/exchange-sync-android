@@ -210,10 +210,19 @@ internal object CalendarProviderBatchPlanner {
     ): CalendarProviderBatchPlan {
         val operations = mutableListOf<CalendarProviderBatchOperation>()
         page.operations.forEach { eventPlan ->
-            when (eventPlan) {
-                is CalendarEventPlan.Delete ->
-                    operations += CalendarProviderBatchOperation.EventDelete(page.calendarId, eventPlan.syncId)
-                is CalendarEventPlan.Upsert -> addUpsert(eventPlan, operations, timeZoneResolver)
+            val serverId =
+                when (eventPlan) {
+                    is CalendarEventPlan.Delete -> eventPlan.syncId
+                    is CalendarEventPlan.Upsert -> eventPlan.event.syncId
+                }
+            try {
+                when (eventPlan) {
+                    is CalendarEventPlan.Delete ->
+                        operations += CalendarProviderBatchOperation.EventDelete(page.calendarId, eventPlan.syncId)
+                    is CalendarEventPlan.Upsert -> addUpsert(eventPlan, operations, timeZoneResolver)
+                }
+            } catch (failure: CalendarPlanningException) {
+                throw failure.withServerId(serverId)
             }
         }
         return CalendarProviderBatchPlan.create(page.calendarId, operations)

@@ -12,14 +12,93 @@ import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlReader
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlTag
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlWriter
 
-internal class ActiveSyncProtocolDataException(message: String) : IllegalArgumentException(message)
+internal enum class ActiveSyncValidationReason {
+    MALFORMED_WBXML,
+    UNEXPECTED_ROOT,
+    MISSING_REQUIRED_VALUE,
+    EMPTY_VALUE,
+    INVALID_STATUS,
+    INVALID_NUMBER,
+    COUNT_MISMATCH,
+    UNSUPPORTED_COMMAND,
+    UNKNOWN_FOLDER,
+    COLLECTION_MISMATCH,
+    MISSING_APPLICATION_DATA,
+    INVALID_APPLICATION_DATA,
+    MISSING_START,
+    MISSING_END,
+    INVALID_TIME_RANGE,
+    INVALID_ALL_DAY,
+    INVALID_RECURRENCE,
+    INVALID_ATTENDEE,
+    INVALID_MEETING_RESPONSE,
+    INVALID_TIME_ZONE,
+    INVALID_VALUE,
+    NON_ADVANCING_SYNC_KEY,
+    INVALID_PRIMING_RESPONSE,
+    PROTOCOL_STRUCTURE,
+}
+
+internal class ActiveSyncProtocolDataException(
+    message: String,
+    val reason: ActiveSyncValidationReason = reasonFor(message),
+    val commandKind: String? = null,
+    val serverId: String? = null,
+    cause: Throwable? = null,
+) : IllegalArgumentException(message, cause) {
+    fun withContext(
+        commandKind: String,
+        serverId: String? = this.serverId,
+    ): ActiveSyncProtocolDataException =
+        ActiveSyncProtocolDataException(
+            message = message.orEmpty(),
+            reason = reason,
+            commandKind = commandKind,
+            serverId = serverId,
+            cause = this,
+        )
+
+    private companion object {
+        fun reasonFor(message: String): ActiveSyncValidationReason =
+            when {
+                "Malformed ActiveSync WBXML" in message -> ActiveSyncValidationReason.MALFORMED_WBXML
+                "Unexpected ActiveSync response root" in message -> ActiveSyncValidationReason.UNEXPECTED_ROOT
+                "Required ActiveSync value is missing" in message -> ActiveSyncValidationReason.MISSING_REQUIRED_VALUE
+                "ActiveSync value is empty" in message -> ActiveSyncValidationReason.EMPTY_VALUE
+                "command status" in message -> ActiveSyncValidationReason.INVALID_STATUS
+                "change count" in message -> ActiveSyncValidationReason.COUNT_MISMATCH
+                "Unsupported" in message -> ActiveSyncValidationReason.UNSUPPORTED_COMMAND
+                "unknown folder" in message -> ActiveSyncValidationReason.UNKNOWN_FOLDER
+                "collection is missing or ambiguous" in message -> ActiveSyncValidationReason.COLLECTION_MISMATCH
+                "no application data" in message -> ActiveSyncValidationReason.MISSING_APPLICATION_DATA
+                "application data" in message -> ActiveSyncValidationReason.INVALID_APPLICATION_DATA
+                "start is missing" in message -> ActiveSyncValidationReason.MISSING_START
+                "end is missing" in message -> ActiveSyncValidationReason.MISSING_END
+                "time range" in message -> ActiveSyncValidationReason.INVALID_TIME_RANGE
+                "All-day" in message -> ActiveSyncValidationReason.INVALID_ALL_DAY
+                "recurrence" in message.lowercase() -> ActiveSyncValidationReason.INVALID_RECURRENCE
+                "attendee" in message.lowercase() -> ActiveSyncValidationReason.INVALID_ATTENDEE
+                "meeting response" in message.lowercase() -> ActiveSyncValidationReason.INVALID_MEETING_RESPONSE
+                "time zone" in message.lowercase() -> ActiveSyncValidationReason.INVALID_TIME_ZONE
+                "SyncKey did not advance" in message -> ActiveSyncValidationReason.NON_ADVANCING_SYNC_KEY
+                "priming response" in message -> ActiveSyncValidationReason.INVALID_PRIMING_RESPONSE
+                message.startsWith("Invalid ") -> ActiveSyncValidationReason.INVALID_VALUE
+                else -> ActiveSyncValidationReason.PROTOCOL_STRUCTURE
+            }
+    }
+}
 
 internal class PrimaryCalendarSelectionException : IllegalArgumentException("Primary Calendar folder is ambiguous")
 
 internal class ActiveSyncStatusException(
     val kind: SyncFailureKind,
     val problem: SyncProblem?,
-) : IllegalArgumentException("ActiveSync command returned a failure status")
+    val commandKind: String? = null,
+    cause: Throwable? = null,
+) : IllegalArgumentException("ActiveSync command returned a failure status", cause) {
+    fun withCommand(command: String): ActiveSyncStatusException =
+        if (commandKind == command) this else ActiveSyncStatusException(kind, problem, command, this)
+}
 
 internal data class ActiveSyncFolder(
     val serverId: String,
@@ -280,7 +359,11 @@ private fun readRoot(body: ByteArray, expectedTag: WbxmlTag): WbxmlElement =
     } catch (error: ActiveSyncProtocolDataException) {
         throw error
     } catch (error: IllegalArgumentException) {
-        throw ActiveSyncProtocolDataException("Malformed ActiveSync WBXML response: ${error.message.orEmpty()}")
+        throw ActiveSyncProtocolDataException(
+            message = "Malformed ActiveSync WBXML response",
+            reason = ActiveSyncValidationReason.MALFORMED_WBXML,
+            cause = error,
+        )
     }
 
 private fun WbxmlElement.requiredStatus(tag: WbxmlTag): Int = requiredText(tag).parseStatus()

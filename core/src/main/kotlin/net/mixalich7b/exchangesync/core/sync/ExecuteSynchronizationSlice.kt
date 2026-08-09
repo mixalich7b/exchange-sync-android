@@ -17,18 +17,73 @@ public class ExecuteSynchronizationSlice(
     private val problems: SyncProblemReporterPort,
     private val clock: SyncClock,
     private val limits: SyncSliceLimits = SyncSliceLimits(),
+    private val diagnostics: SyncDiagnosticsPort = NoOpSyncDiagnostics,
 ) : ExecuteSynchronizationAction {
-    override suspend fun execute(fence: SyncFence): SyncSliceOutcome =
-        try {
-            executeSlice(fence)
+    override suspend fun execute(fence: SyncFence): SyncSliceOutcome {
+        return try {
+            executeSlice(fence).also { outcome ->
+                recordTerminalOutcome(fence, outcome)
+            }
         } catch (cancellation: CancellationException) {
+            diagnostics.record(
+                SyncDiagnosticEvent(SyncDiagnosticKind.CANCELLATION, fence, outcome = "cancelled"),
+                cancellation,
+            )
             throw cancellation
-        } catch (_: Exception) {
-            recoverUnexpectedFailure(fence)
+        } catch (failure: Exception) {
+            diagnostics.record(
+                SyncDiagnosticEvent(SyncDiagnosticKind.UNEXPECTED_EXCEPTION, fence, outcome = "recover"),
+                failure,
+            )
+            recoverUnexpectedFailure(fence).also { outcome ->
+                recordTerminalOutcome(fence, outcome)
+            }
         }
+    }
+
+    private fun recordTerminalOutcome(
+        fence: SyncFence,
+        outcome: SyncSliceOutcome,
+    ) {
+        val kind =
+            when (outcome) {
+                is SyncSliceOutcome.Blocked,
+                SyncSliceOutcome.PermissionRequired,
+                -> SyncDiagnosticKind.BLOCK
+                SyncSliceOutcome.Obsolete -> SyncDiagnosticKind.OBSOLETE
+                SyncSliceOutcome.Cancelled -> SyncDiagnosticKind.CANCELLATION
+                else -> SyncDiagnosticKind.COMPLETE
+            }
+        val problem =
+            when (outcome) {
+                is SyncSliceOutcome.Blocked -> outcome.problem
+                SyncSliceOutcome.PermissionRequired -> SyncProblem.CALENDAR_PERMISSION
+                else -> null
+            }
+        diagnostics.record(
+            SyncDiagnosticEvent(
+                kind = kind,
+                fence = fence,
+                problem = problem,
+                outcome = outcome.javaClass.simpleName,
+            ),
+            null,
+        )
+    }
 
     private suspend fun executeSlice(fence: SyncFence): SyncSliceOutcome {
-        if (!isCurrent(fence)) return SyncSliceOutcome.Obsolete
+        val initial = stateRepository.load()
+        diagnostics.record(
+            SyncDiagnosticEvent(
+                SyncDiagnosticKind.START,
+                fence,
+                trigger = initial.currentTrigger,
+                phase = initial.phase,
+                attempt = initial.consecutiveTransientAttempts,
+            ),
+            null,
+        )
+        if (!SyncStateTransitions.mayPerformSideEffect(initial, fence)) return SyncSliceOutcome.Obsolete
         if (!permissions.hasCalendarAccess()) {
             block(fence, SyncProblem.CALENDAR_PERMISSION)
             return SyncSliceOutcome.PermissionRequired
@@ -53,6 +108,10 @@ public class ExecuteSynchronizationSlice(
                         fullSyncRequired = current.fullSyncRequired,
                     ),
                 ) { phase ->
+                    diagnostics.record(
+                        SyncDiagnosticEvent(SyncDiagnosticKind.PHASE, fence, phase = phase),
+                        null,
+                    )
                     transitionPhase(fence, phase)
                 }
             if (!isCurrent(fence)) return SyncSliceOutcome.Obsolete
@@ -90,21 +149,41 @@ public class ExecuteSynchronizationSlice(
     ): SyncSliceOutcome? {
         transitionPhase(fence, SyncPhase.APPLYING) ?: return SyncSliceOutcome.Obsolete
         if (!isCurrent(fence)) return SyncSliceOutcome.Obsolete
-        return when (val localOutcome = ownedCalendar.applyPage(fence, page)) {
+        val localOutcome = ownedCalendar.applyPage(fence, page)
+        if (localOutcome != LocalPageOutcome.Applied) {
+            diagnostics.record(
+                SyncDiagnosticEvent(
+                    SyncDiagnosticKind.LOCAL_FAILURE,
+                    fence,
+                    problem = (localOutcome as? LocalPageOutcome.Failed)?.problem,
+                    outcome = localOutcome.javaClass.simpleName,
+                ),
+                null,
+            )
+        }
+        return when (localOutcome) {
             LocalPageOutcome.Applied -> {
                 if (!isCurrent(fence)) {
                     SyncSliceOutcome.Obsolete
                 } else {
                     val committed =
-                        stateRepository.update { current ->
-                            if (SyncStateTransitions.mayPerformSideEffect(current, fence)) {
-                                current.copy(
-                                    checkpoints = page.nextCheckpoints,
-                                    consecutiveTransientAttempts = 0,
-                                )
-                            } else {
-                                current
+                        try {
+                            stateRepository.update { current ->
+                                if (SyncStateTransitions.mayPerformSideEffect(current, fence)) {
+                                    current.copy(
+                                        checkpoints = page.nextCheckpoints,
+                                        consecutiveTransientAttempts = 0,
+                                    )
+                                } else {
+                                    current
+                                }
                             }
+                        } catch (failure: Exception) {
+                            diagnostics.record(
+                                SyncDiagnosticEvent(SyncDiagnosticKind.CHECKPOINT_FAILURE, fence),
+                                failure,
+                            )
+                            throw failure
                         }
                     if (SyncStateTransitions.mayPerformSideEffect(committed, fence)) null else SyncSliceOutcome.Obsolete
                 }
@@ -117,6 +196,7 @@ public class ExecuteSynchronizationSlice(
     }
 
     private suspend fun requestFullReset(fence: SyncFence): SyncSliceOutcome {
+        diagnostics.record(SyncDiagnosticEvent(SyncDiagnosticKind.RESET, fence), null)
         val reset =
             stateRepository.update { latest ->
                 if (SyncStateTransitions.mayPerformSideEffect(latest, fence)) {
@@ -136,18 +216,38 @@ public class ExecuteSynchronizationSlice(
     private suspend fun handleRemoteFailure(
         fence: SyncFence,
         failure: RemotePageOutcome.Failure,
-    ): SyncSliceOutcome =
-        when (failure.kind) {
+    ): SyncSliceOutcome {
+        diagnostics.record(
+            SyncDiagnosticEvent(
+                SyncDiagnosticKind.REMOTE_FAILURE,
+                fence,
+                failureKind = failure.kind,
+                problem = failure.problem,
+            ),
+            null,
+        )
+        return when (failure.kind) {
             SyncFailureKind.TRANSIENT -> recordTransientFailure(fence)
             SyncFailureKind.INVALID_KEY -> resetInvalidKeyOrBlock(fence)
+            SyncFailureKind.FULL_RESET_REQUIRED -> requestFullReset(fence)
             SyncFailureKind.WINDOW_TOO_LARGE -> reduceWindowAndContinue(fence, SyncProblem.PROTOCOL_DATA)
             SyncFailureKind.CRITICAL -> block(fence, failure.problem ?: SyncProblem.PROTOCOL_DATA)
         }
+    }
 
     private suspend fun recordTransientFailure(fence: SyncFence): SyncSliceOutcome {
         val current = stateRepository.load()
         if (!SyncStateTransitions.mayPerformSideEffect(current, fence)) return SyncSliceOutcome.Obsolete
         val attempts = current.consecutiveTransientAttempts + 1
+        diagnostics.record(
+            SyncDiagnosticEvent(
+                SyncDiagnosticKind.RETRY,
+                fence,
+                attempt = attempts,
+                outcome = if (attempts < MAX_TRANSIENT_ATTEMPTS) "retry" else "exhausted",
+            ),
+            null,
+        )
         return if (attempts < MAX_TRANSIENT_ATTEMPTS) {
             stateRepository.update { latest ->
                 if (SyncStateTransitions.mayPerformSideEffect(latest, fence)) {
@@ -230,6 +330,15 @@ public class ExecuteSynchronizationSlice(
         val current = stateRepository.load()
         if (!SyncStateTransitions.mayPerformSideEffect(current, fence)) return SyncSliceOutcome.Obsolete
         if (current.checkpoints.windowSize == 1) return block(fence, minimumWindowProblem)
+        diagnostics.record(
+            SyncDiagnosticEvent(
+                SyncDiagnosticKind.WINDOW_REDUCTION,
+                fence,
+                problem = minimumWindowProblem,
+                outcome = (current.checkpoints.windowSize / 2).coerceAtLeast(1).toString(),
+            ),
+            null,
+        )
         stateRepository.update { latest ->
             if (SyncStateTransitions.mayPerformSideEffect(latest, fence)) {
                 latest.copy(

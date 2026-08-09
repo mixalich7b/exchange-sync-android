@@ -1,11 +1,17 @@
 package net.mixalich7b.exchangesync.infrastructure.tls
 
 import android.content.res.AssetManager
-import java.io.IOException
 import java.io.InputStream
 import java.security.cert.CertificateException
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnosticEvent
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticComponent
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperation
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperationKind
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticSeverity
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
 
 internal fun interface X509CertificateParser {
     fun parse(path: String, input: InputStream): X509Certificate
@@ -28,9 +34,37 @@ internal data class LocalCertificates(
 internal class CertificateAssetLoader(
     private val source: CertificateAssetSource,
     private val parser: X509CertificateParser = JcaX509CertificateParser,
+    private val diagnostics: DeviceDiagnostics = DeviceDiagnostics(),
 ) {
-    fun load(): LocalCertificates {
-        val names = source.list(DIRECTORY).sorted()
+    fun load(
+        operation: DiagnosticOperation = diagnostics.operation(DiagnosticOperationKind.LOCAL_OPERATION),
+    ): LocalCertificates {
+        val names =
+            try {
+                source.list(DIRECTORY).sorted()
+            } catch (failure: Exception) {
+                diagnostics.emit(
+                    DeviceDiagnosticEvent(
+                        DiagnosticSeverity.WARN,
+                        DiagnosticComponent.LOCAL_CA,
+                        DiagnosticStage.LOCAL_CA_LIST,
+                        operation,
+                        outcome = "failed",
+                        throwable = failure,
+                    ),
+                )
+                return LocalCertificates(emptyList(), emptyList(), hadAssets = false)
+            }
+        diagnostics.emit(
+            DeviceDiagnosticEvent(
+                DiagnosticSeverity.INFO,
+                DiagnosticComponent.LOCAL_CA,
+                DiagnosticStage.LOCAL_CA_LIST,
+                operation,
+                chainLength = names.size,
+                outcome = if (names.isEmpty()) "empty" else "available",
+            ),
+        )
         val certificates = mutableListOf<X509Certificate>()
         val issues = mutableListOf<LocalCertificateIssue>()
 
@@ -39,8 +73,29 @@ internal class CertificateAssetLoader(
                 source.open("$DIRECTORY/$fileName").use { input ->
                     certificates += parser.parse("$DIRECTORY/$fileName", input)
                 }
-            } catch (_: Exception) {
+                diagnostics.emit(
+                    DeviceDiagnosticEvent(
+                        DiagnosticSeverity.INFO,
+                        DiagnosticComponent.LOCAL_CA,
+                        DiagnosticStage.LOCAL_CA_PARSE,
+                        operation,
+                        assetFile = fileName,
+                        outcome = "parsed",
+                    ),
+                )
+            } catch (failure: Exception) {
                 issues += LocalCertificateIssue(fileName)
+                diagnostics.emit(
+                    DeviceDiagnosticEvent(
+                        DiagnosticSeverity.WARN,
+                        DiagnosticComponent.LOCAL_CA,
+                        DiagnosticStage.LOCAL_CA_PARSE,
+                        operation,
+                        assetFile = fileName,
+                        outcome = "invalid",
+                        throwable = failure,
+                    ),
+                )
             }
         }
 
@@ -60,11 +115,7 @@ internal class AndroidCertificateAssetSource(
     private val assetManager: AssetManager,
 ) : CertificateAssetSource {
     override fun list(directory: String): List<String> =
-        try {
-            assetManager.list(directory)?.toList().orEmpty()
-        } catch (_: IOException) {
-            emptyList()
-        }
+        assetManager.list(directory)?.toList().orEmpty()
 
     override fun open(path: String): InputStream = assetManager.open(path)
 }

@@ -814,6 +814,36 @@ class SyncUseCasesTest {
         }
 
     @Test
+    fun `remote protocol change requests full reset without consuming invalid-key recovery`() =
+        runTest {
+            val trace = mutableListOf<String>()
+            val stateRepository = FakeStateRepository(runningState(), trace)
+            val calendar = FakeCalendar(trace)
+            val scheduler = FakeScheduler(trace)
+
+            val outcome =
+                executor(
+                    stateRepository,
+                    FakeRemote(
+                        mutableListOf(
+                            RemotePageOutcome.Failure(SyncFailureKind.FULL_RESET_REQUIRED, null),
+                        ),
+                        trace,
+                    ),
+                    calendar,
+                    scheduler,
+                    trace,
+                ).execute(stateRepository.current.fence)
+
+            assertEquals(SyncSliceOutcome.Continued, outcome)
+            assertTrue(stateRepository.current.fullSyncRequired)
+            assertFalse(stateRepository.current.invalidKeyRecoveryUsed)
+            assertEquals(SyncCheckpoints.EMPTY, stateRepository.current.checkpoints)
+            assertEquals(1, calendar.deleteAttempts)
+            assertEquals(listOf(SyncFence(2, 3)), scheduler.continuations)
+        }
+
+    @Test
     fun `restart while disabled cannot enqueue a manual synchronization`() =
         runTest {
             val trace = mutableListOf<String>()
@@ -1383,6 +1413,7 @@ class SyncUseCasesTest {
         runTest {
             val trace = mutableListOf<String>()
             val stateRepository = FakeStateRepository(runningState(), trace)
+            val diagnostics = RecordingSyncDiagnostics()
             val executor =
                 executor(
                     stateRepository,
@@ -1394,6 +1425,7 @@ class SyncUseCasesTest {
                     FakeCalendar(trace),
                     FakeScheduler(trace),
                     trace,
+                    diagnostics = diagnostics,
                 )
 
             val outcome = executor.execute(stateRepository.current.fence)
@@ -1402,6 +1434,16 @@ class SyncUseCasesTest {
             assertEquals(SyncPhase.QUEUED, stateRepository.current.phase)
             assertEquals(1, stateRepository.current.consecutiveTransientAttempts)
             assertNull(stateRepository.current.problem)
+            assertEquals(
+                listOf(
+                    SyncDiagnosticKind.START,
+                    SyncDiagnosticKind.PHASE,
+                    SyncDiagnosticKind.UNEXPECTED_EXCEPTION,
+                    SyncDiagnosticKind.RETRY,
+                    SyncDiagnosticKind.COMPLETE,
+                ),
+                diagnostics.events.map(SyncDiagnosticEvent::kind),
+            )
         }
 
     @Test
@@ -1483,6 +1525,7 @@ class SyncUseCasesTest {
         trace: MutableList<String>,
         limits: SyncSliceLimits = SyncSliceLimits(),
         clock: SyncClock = FakeClock(),
+        diagnostics: SyncDiagnosticsPort = NoOpSyncDiagnostics,
     ): ExecuteSynchronizationSlice =
         ExecuteSynchronizationSlice(
             stateRepository = stateRepository,
@@ -1494,6 +1537,7 @@ class SyncUseCasesTest {
             problems = FakeProblems(trace),
             clock = clock,
             limits = limits,
+            diagnostics = diagnostics,
         )
 
     private fun problemsShown(trace: List<String>): List<String> = trace.filter { it.startsWith("problem:show") }
@@ -1576,6 +1620,17 @@ class SyncUseCasesTest {
 
         fun replace(state: SyncState) {
             mutableStates.value = state
+        }
+    }
+
+    private class RecordingSyncDiagnostics : SyncDiagnosticsPort {
+        val events = mutableListOf<SyncDiagnosticEvent>()
+
+        override fun record(
+            event: SyncDiagnosticEvent,
+            throwable: Throwable?,
+        ) {
+            events += event
         }
     }
 

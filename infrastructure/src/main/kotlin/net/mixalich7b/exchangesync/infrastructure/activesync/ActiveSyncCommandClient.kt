@@ -15,6 +15,15 @@ import net.mixalich7b.exchangesync.core.sync.SyncProblem
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredential
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredentialResolution
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredentialResolver
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperation
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnosticEvent
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticComponent
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperationKind
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticSeverity
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.diagnosticHost
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.diagnosticPath
 import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
@@ -37,6 +46,7 @@ internal object ActiveSyncCommandRequestFactory {
         deviceType: String = ACTIVE_SYNC_DEVICE_TYPE,
         version: ActiveSyncVersion,
         body: ByteArray,
+        operation: DiagnosticOperation? = null,
     ): Request {
         require(deviceId.isNotBlank() && deviceId.all(Char::isLetterOrDigit))
         require(deviceType.isNotBlank() && deviceType.all(Char::isLetterOrDigit))
@@ -54,6 +64,7 @@ internal object ActiveSyncCommandRequestFactory {
             .header("MS-ASProtocolVersion", version.wireValue)
             .header("Content-Type", ACTIVE_SYNC_CONTENT_TYPE)
             .post(body.toRequestBody(ACTIVE_SYNC_CONTENT_TYPE.toMediaType()))
+            .apply { operation?.let { tag(DiagnosticOperation::class.java, it) } }
             .build()
     }
 }
@@ -79,6 +90,16 @@ internal fun interface ActiveSyncCommandGateway {
         version: ActiveSyncVersion,
         body: ByteArray,
     ): ActiveSyncCommandOutcome
+
+    suspend fun execute(
+        profile: ConnectionProfile,
+        endpoint: HttpUrl,
+        command: ActiveSyncCommand,
+        deviceId: String,
+        version: ActiveSyncVersion,
+        body: ByteArray,
+        operation: DiagnosticOperation,
+    ): ActiveSyncCommandOutcome = execute(profile, endpoint, command, deviceId, version, body)
 }
 
 internal class ActiveSyncCommandClient(
@@ -86,6 +107,7 @@ internal class ActiveSyncCommandClient(
     private val transportFactory: SecureHttpTransportFactory,
     private val totalTimeoutMillis: Long = 30_000,
     private val transportDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val diagnostics: DeviceDiagnostics = DeviceDiagnostics(),
 ) : ActiveSyncCommandGateway {
     override suspend fun execute(
         profile: ConnectionProfile,
@@ -94,24 +116,89 @@ internal class ActiveSyncCommandClient(
         deviceId: String,
         version: ActiveSyncVersion,
         body: ByteArray,
+    ): ActiveSyncCommandOutcome =
+        execute(
+            profile,
+            endpoint,
+            command,
+            deviceId,
+            version,
+            body,
+            diagnostics.operation(DiagnosticOperationKind.ACTIVE_SYNC_COMMAND),
+        )
+
+    override suspend fun execute(
+        profile: ConnectionProfile,
+        endpoint: HttpUrl,
+        command: ActiveSyncCommand,
+        deviceId: String,
+        version: ActiveSyncVersion,
+        body: ByteArray,
+        operation: DiagnosticOperation,
     ): ActiveSyncCommandOutcome {
-        val resolution = credentialResolver.resolve(profile.clientCertificateAlias)
+        val resolution = credentialResolver.resolve(profile.clientCertificateAlias, operation)
         if (resolution !is ClientCredentialResolution.Available) {
+            emitFailure(operation, command, endpoint, SyncProblem.CLIENT_CERTIFICATE, DiagnosticStage.KEYCHAIN_RESOLUTION)
             return ActiveSyncCommandOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.CLIENT_CERTIFICATE)
         }
         return try {
             withTimeout(totalTimeoutMillis) {
-                val transport = withContext(transportDispatcher) { transportFactory.create(resolution.credential) }
-                executeRedirectChain(profile, endpoint, command, deviceId, version, body, resolution.credential, transport)
+                val transport =
+                    withContext(transportDispatcher) {
+                        transportFactory.create(profile, resolution.credential, operation)
+                    }
+                executeRedirectChain(
+                    profile,
+                    endpoint,
+                    command,
+                    deviceId,
+                    version,
+                    body,
+                    resolution.credential,
+                    transport,
+                    operation,
+                )
             }
-        } catch (_: TimeoutCancellationException) {
+        } catch (failure: TimeoutCancellationException) {
+            emitFailure(
+                operation,
+                command,
+                endpoint,
+                null,
+                DiagnosticStage.FAILURE,
+                timeoutMillis = totalTimeoutMillis,
+                throwable = failure,
+            )
             ActiveSyncCommandOutcome.Failure(SyncFailureKind.TRANSIENT, null)
         } catch (cancellation: CancellationException) {
+            diagnostics.emit(
+                DeviceDiagnosticEvent(
+                    DiagnosticSeverity.INFO,
+                    DiagnosticComponent.ACTIVE_SYNC,
+                    DiagnosticStage.CANCELLATION,
+                    operation,
+                    command = command.wireValue,
+                    host = endpoint.diagnosticHost(),
+                    path = endpoint.diagnosticPath(),
+                ),
+            )
             throw cancellation
-        } catch (_: ActiveSyncResponseTooLargeException) {
+        } catch (failure: ActiveSyncResponseTooLargeException) {
+            emitFailure(
+                operation,
+                command,
+                endpoint,
+                null,
+                DiagnosticStage.RESPONSE_BODY,
+                reasonCode = "RESPONSE_TOO_LARGE",
+                throwable = failure,
+            )
             ActiveSyncCommandOutcome.Failure(SyncFailureKind.WINDOW_TOO_LARGE, null)
         } catch (failure: Exception) {
-            ConnectionExceptionClassifier.classify(failure).toCommandFailure()
+            val category = ConnectionExceptionClassifier.classify(failure)
+            val outcome = category.toCommandFailure()
+            emitFailure(operation, command, endpoint, outcome.problem, category.diagnosticStage(), throwable = failure)
+            outcome
         }
     }
 
@@ -124,25 +211,119 @@ internal class ActiveSyncCommandClient(
         body: ByteArray,
         credential: ClientCredential,
         transport: SecureHttpTransport,
+        operation: DiagnosticOperation,
     ): ActiveSyncCommandOutcome {
         var currentEndpoint = endpoint
         val redirects = RedirectTracker(endpoint)
         while (true) {
-            val request = ActiveSyncCommandRequestFactory.create(currentEndpoint, profile, command, deviceId, version = version, body = body)
+            val request =
+                ActiveSyncCommandRequestFactory.create(
+                    currentEndpoint,
+                    profile,
+                    command,
+                    deviceId,
+                    version = version,
+                    body = body,
+                    operation = operation,
+                )
             val response = transport.execute(request)
             if (ActiveSyncProbePolicy.isRedirect(response.statusCode)) {
                 when (val decision = redirects.follow(currentEndpoint, response.header("Location"))) {
-                    is RedirectDecision.Follow -> currentEndpoint = decision.url
-                    RedirectDecision.Rejected ->
+                    is RedirectDecision.Follow -> {
+                        diagnostics.emit(
+                            DeviceDiagnosticEvent(
+                                DiagnosticSeverity.INFO,
+                                DiagnosticComponent.ACTIVE_SYNC,
+                                DiagnosticStage.REDIRECT,
+                                operation,
+                                method = "POST",
+                                command = command.wireValue,
+                                host = decision.url.diagnosticHost(),
+                                path = decision.url.diagnosticPath(),
+                                status = response.statusCode,
+                                outcome = "follow",
+                            ),
+                        )
+                        currentEndpoint = decision.url
+                    }
+                    RedirectDecision.Rejected -> {
+                        diagnostics.emit(
+                            DeviceDiagnosticEvent(
+                                DiagnosticSeverity.WARN,
+                                DiagnosticComponent.ACTIVE_SYNC,
+                                DiagnosticStage.REDIRECT,
+                                operation,
+                                method = "POST",
+                                command = command.wireValue,
+                                host = currentEndpoint.diagnosticHost(),
+                                path = currentEndpoint.diagnosticPath(),
+                                status = response.statusCode,
+                                failureCategory = SyncProblem.REDIRECT.name,
+                                outcome = "rejected",
+                            ),
+                        )
                         return ActiveSyncCommandOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.REDIRECT)
+                    }
                 }
                 continue
             }
             if (!response.used(credential.leafCertificate)) {
+                emitFailure(
+                    operation,
+                    command,
+                    currentEndpoint,
+                    SyncProblem.CLIENT_CERTIFICATE,
+                    DiagnosticStage.CLIENT_CERTIFICATE_VERIFICATION,
+                )
                 return ActiveSyncCommandOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.CLIENT_CERTIFICATE)
             }
-            return response.toCommandOutcome(currentEndpoint)
+            val outcome = response.toCommandOutcome(currentEndpoint)
+            diagnostics.emit(
+                DeviceDiagnosticEvent(
+                    severity = if (outcome is ActiveSyncCommandOutcome.Success) DiagnosticSeverity.INFO else DiagnosticSeverity.WARN,
+                    component = DiagnosticComponent.ACTIVE_SYNC,
+                    stage = DiagnosticStage.COMMAND,
+                    operation = operation,
+                    method = "POST",
+                    command = command.wireValue,
+                    host = currentEndpoint.diagnosticHost(),
+                    path = currentEndpoint.diagnosticPath(),
+                    status = response.statusCode,
+                    failureCategory = (outcome as? ActiveSyncCommandOutcome.Failure)?.problem?.name,
+                    outcome = if (outcome is ActiveSyncCommandOutcome.Success) "success" else "failure",
+                ),
+            )
+            return outcome
         }
+    }
+
+    private fun emitFailure(
+        operation: DiagnosticOperation,
+        command: ActiveSyncCommand,
+        endpoint: HttpUrl,
+        problem: SyncProblem?,
+        stage: DiagnosticStage,
+        timeoutMillis: Long? = null,
+        reasonCode: String? = null,
+        throwable: Throwable? = null,
+    ) {
+        diagnostics.emit(
+            DeviceDiagnosticEvent(
+                DiagnosticSeverity.ERROR,
+                DiagnosticComponent.ACTIVE_SYNC,
+                stage,
+                operation,
+                method = "POST",
+                command = command.wireValue,
+                host = endpoint.diagnosticHost(),
+                path = endpoint.diagnosticPath(),
+                timeoutMillis = timeoutMillis,
+                reasonCode = reasonCode,
+                failureCategory = problem?.name,
+                outcome = "failure",
+                throwable = throwable,
+            ),
+        )
     }
 
     private fun SecureHttpResponse.toCommandOutcome(endpoint: HttpUrl): ActiveSyncCommandOutcome =
