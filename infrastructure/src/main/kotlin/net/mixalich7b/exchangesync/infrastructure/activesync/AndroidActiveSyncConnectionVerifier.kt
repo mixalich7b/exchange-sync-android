@@ -30,6 +30,7 @@ import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.CookieJar
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody
@@ -96,13 +97,14 @@ internal class OkHttpSecureHttpTransportFactory(
             }
         val client =
             OkHttpClient.Builder()
+                .protocols(listOf(Protocol.HTTP_1_1))
                 .sslSocketFactory(sslContext.socketFactory, trustManager)
                 .cookieJar(cookieJar)
                 .eventListenerFactory { ActiveSyncNetworkEventListener(diagnostics, operation) }
                 .followRedirects(false)
                 .followSslRedirects(false)
                 .connectTimeout(10, TimeUnit.SECONDS)
-                .readTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(25, TimeUnit.SECONDS)
                 .callTimeout(30, TimeUnit.SECONDS)
                 .build()
         return OkHttpSecureHttpTransport(client, diagnostics, operation)

@@ -28,6 +28,7 @@ import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import kotlin.time.Duration.Companion.milliseconds
 
 internal const val ACTIVE_SYNC_CONTENT_TYPE = "application/vnd.ms-sync.wbxml"
 internal const val ACTIVE_SYNC_DEVICE_TYPE = "ExchangeSync"
@@ -142,7 +143,7 @@ internal class ActiveSyncCommandClient(
             return ActiveSyncCommandOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.CLIENT_CERTIFICATE)
         }
         return try {
-            withTimeout(totalTimeoutMillis) {
+            withTimeout(totalTimeoutMillis.milliseconds) {
                 val transport =
                     withContext(transportDispatcher) {
                         transportFactory.create(profile, resolution.credential, operation)

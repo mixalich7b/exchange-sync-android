@@ -24,6 +24,7 @@ import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.diagnosticHost
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.diagnosticPath
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.safeHeaderTokens
+import kotlin.time.Duration.Companion.milliseconds
 
 internal typealias ProbeResponse = SecureHttpResponse
 internal typealias ProbeTransport = SecureHttpTransport
@@ -57,7 +58,7 @@ internal class ActiveSyncConnectionVerifier(
         }
 
         return try {
-            val result = withTimeout(totalTimeoutMillis) {
+            val result = withTimeout(totalTimeoutMillis.milliseconds) {
                 val transport =
                     withContext(transportDispatcher) {
                         transportFactory.create(profile, resolution.credential, operation)

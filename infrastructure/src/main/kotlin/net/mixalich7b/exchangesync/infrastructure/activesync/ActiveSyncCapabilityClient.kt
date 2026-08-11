@@ -24,6 +24,7 @@ import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.diagnosticHost
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.diagnosticPath
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.safeHeaderTokens
+import kotlin.time.Duration.Companion.milliseconds
 
 internal class ActiveSyncCapabilityClient(
     private val credentialResolver: ClientCredentialResolver,
@@ -45,7 +46,7 @@ internal class ActiveSyncCapabilityClient(
             return ActiveSyncCapabilityOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.CLIENT_CERTIFICATE)
         }
         return try {
-            withTimeout(totalTimeoutMillis) {
+            withTimeout(totalTimeoutMillis.milliseconds) {
                 val transport =
                     withContext(transportDispatcher) {
                         transportFactory.create(profile, resolution.credential, operation)

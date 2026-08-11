@@ -18,7 +18,6 @@ context: |
 
   Git:
   - Conventional Commits
-  - One OpenSpec change normally maps to one branch or worktree
 
 rules:
   proposal:
