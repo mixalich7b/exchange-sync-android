@@ -233,7 +233,8 @@ provider sub-batches, включая неоднозначный outcome акти
 
 State machine, codecs, mapping, page/batch planning, persistence, WorkManager
 policy, notifications и presentation покрываются локальными unit-тестами.
-Компиляция, Lint и debug assembly проверяют тонкие Android adapters. Живой
-Exchange/mTLS server, настоящий Calendar Provider и фактическое 15-минутное
-исполнение WorkManager требуют отдельного ручного прогона на Android 16. До
-такого прогона документация не считает server-backed checklist подтверждённым.
+Компиляция, Lint и debug assembly проверяют тонкие Android adapters.
+Server-backed checklist успешно пройден вручную на Xiaomi 17 с Android 16 и
+реальным Exchange Server: проверены HTTPS/mTLS и ActiveSync, настоящий Calendar
+Provider и фактическое 15-минутное исполнение periodic work через WorkManager.
+Автоматическая проверка при этом по-прежнему ограничена локальными unit-тестами.

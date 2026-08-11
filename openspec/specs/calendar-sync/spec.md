@@ -3,6 +3,7 @@
 ## Purpose
 
 Defines the one-way Exchange ActiveSync mirror that discovers the configured mailbox's primary calendar and represents its complete server-returned contents in one isolated, read-only Android calendar.
+The implemented server-backed flow has been manually verified on a Xiaomi 17 running Android 16 against a real Exchange Server, including HTTPS/mTLS and ActiveSync, the real Calendar Provider, and actual execution of the 15-minute WorkManager periodic work; automated verification remains unit-only.
 
 ## Requirements
 

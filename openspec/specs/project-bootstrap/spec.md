@@ -3,6 +3,7 @@
 ## Purpose
 
 Defines the runnable, locally verifiable Android project foundation on which later OpenSpec-managed Exchange calendar capabilities can be implemented without introducing product behavior prematurely.
+The current application has also completed manual server-backed verification on a Xiaomi 17 running Android 16 against a real Exchange Server; this status does not add connected-device or integration tests to the automated verification suite.
 
 ## Requirements
 

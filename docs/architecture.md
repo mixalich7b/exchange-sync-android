@@ -172,9 +172,10 @@ event identity, provider row IDs, SyncKey и payload туда не попада�
 и instrumentation. Pure policy, persistence codec, WBXML/ActiveSync fixtures,
 mapping, provider batch planning, worker policy, TLS, notifications и ViewModel
 проверяются с fakes. Android KeyChain, настоящий Calendar Provider, WorkManager
-runtime и живой Exchange/mTLS server остаются тонкими интеграционными границами:
-код для них проверяется компиляцией, Android Lint и debug-сборкой. Полный
-server-backed checklist должен отдельно выполняться вручную на Android 16; эта
-документация не утверждает, что такой прогон уже состоялся.
+runtime и живой Exchange/mTLS server остаются тонкими интеграционными границами,
+код для которых проверяется компиляцией, Android Lint и debug-сборкой. Полный
+server-backed checklist для этих границ успешно пройден вручную на Xiaomi 17 с
+Android 16 и реальным Exchange Server, включая фактическое 15-минутное
+исполнение periodic work через WorkManager.
 
 Актуальные команды находятся в [`AGENTS.md`](../AGENTS.md).

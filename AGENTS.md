@@ -112,7 +112,11 @@ Do not add `src/androidTest`, instrumentation runners, emulator/connected test
 tasks, Robolectric, integration tests, or end-to-end tests. Every observable
 behavior and bug fix must follow test-first RED-GREEN-REFACTOR and include a
 unit regression test where the unit-only boundary can exercise the behavior.
-Android launch/install behavior is verified manually on an Android 16 device.
+The server-backed manual verification checklist has been completed on a Xiaomi
+17 running Android 16 against a real Exchange Server. It covered HTTPS/mTLS and
+ActiveSync, the real Calendar Provider, and actual execution of the 15-minute
+WorkManager periodic work. This does not expand the unit-only automated test
+boundary described above.
 
 Generated build outputs, Gradle/Kotlin/IDE state, APKs, SDK paths, debug
 keystores, production signing material, credentials, private keys, client

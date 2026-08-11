@@ -230,7 +230,8 @@ TLS-диагностика существует только в памяти т�
 - `OPTIONS` подтверждает endpoint capabilities, но не доказывает доступ к
   mailbox или основному календарю.
 - Автоматические тесты не подключаются к живому серверу и не исполняют Android
-  KeyChain; интеграционный риск остаётся для ручной проверки на устройстве.
+  KeyChain; связка Android KeyChain, mTLS и живого Exchange Server проверена
+  вручную на Xiaomi 17 с Android 16.
 - Синхронное создание trust managers, `SSLContext` и OkHttp-клиента выполняется
   вне Main dispatcher, но не имеет жёсткого deadline и может превысить
   номинальный probe timeout при блокировке security provider.
