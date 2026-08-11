@@ -2,13 +2,13 @@
 
 ## Product summary and current boundary
 
-The product is an Android 16 application that will synchronize the primary
-calendar from a private Microsoft Exchange server into the device calendar.
-The planned protocol is Exchange ActiveSync over HTTPS on port 443 with mTLS;
+The product is an Android 16 application that synchronizes the primary calendar
+from a private Microsoft Exchange server into the device calendar. It uses
+Exchange ActiveSync over HTTPS on port 443 with mTLS;
 the application must implement the integration itself and must not register or
 use Android's built-in Exchange account integration.
 
-The explored first product stage has these constraints:
+The current product stage has these constraints:
 
 - One locally configured profile with email address, `domain\\login`, server
   hostname, and a client-certificate alias selected from Android's installed
@@ -25,13 +25,14 @@ The explored first product stage has these constraints:
 - Android 16 is the only supported platform. Distribution is direct local
   installation, not Google Play.
 
-The current implemented boundary is connection configuration and verification:
-the app validates one profile, uses Android KeyChain for client-certificate
-selection, checks HTTPS/mTLS and ActiveSync `OPTIONS`, and persists settings only
-after success. Calendar Provider writes, WorkManager scheduling, reminders, and
-notifications still require later OpenSpec changes.
+The current implemented boundary includes connection configuration and
+verification, full and incremental one-way calendar synchronization, manual and
+15-minute WorkManager execution, durable synchronization state, Calendar
+Provider writes, reminders, diagnostics, and persistent problem notifications.
+The app still supports only one profile and one primary calendar and never sends
+local calendar changes back to Exchange.
 
-## Module structure and ownership
+## Project structure and key components
 
 The permitted dependency direction is:
 
@@ -40,16 +41,48 @@ The permitted dependency direction is:
      -> :infrastructure  -> :core
 ```
 
-- `:app` owns the application manifest, launcher activity, app resources, and
-  manual dependency composition. Keep reusable logic out of this module.
-- `:core` is pure Kotlin/JVM and owns platform-independent connection models,
-  validation, failure types, use cases, and adapter contracts. It must not
-  depend on Android and uses explicit public API mode.
-- `:feature:settings` owns settings presentation state, ViewModel, and Compose
-  UI. It may depend on `:core` but must never depend on `:infrastructure`.
-- `:infrastructure` owns Android KeyChain access, DataStore persistence,
-  system-plus-local TLS trust, and the ActiveSync HTTP probe. It depends only on
-  `:core`.
+Top-level layout:
+
+```text
+app/                 Android entry points, manifest, resources, composition root
+core/                Pure Kotlin domain models, policies, ports, and use cases
+feature/settings/    Compose settings and synchronization-control feature
+infrastructure/      Android, network, storage, provider, and worker adapters
+openspec/specs/       Accepted normative behavior and scenarios
+docs/                 Developer-facing current-state architecture and operations
+gradle/               Version catalog and checked-in Gradle Wrapper files
+```
+
+Key components by module:
+
+- `:app` owns Android process and UI entry points. `ExchangeSyncApplication`
+  configures WorkManager, `AppContainer` manually wires all core use cases and
+  infrastructure adapters, and `MainActivity` hosts Compose plus KeyChain,
+  calendar-permission, notification-permission, and notification-settings
+  launchers. Keep reusable logic out of this module.
+- `:core` is a pure Kotlin/JVM module with explicit public API mode. Its
+  `connection/` package contains profile models, validation, typed failures,
+  adapter contracts, `VerifyConnection`, and `SaveConnection`; `calendar/`
+  contains Android-independent ActiveSync event models and `CalendarEventMapper`;
+  `sync/` contains durable state models, ports, lifecycle and trigger use cases,
+  state transitions, fencing/mutation locking, and bounded slice execution. It
+  must not depend on Android, OkHttp, DataStore, or WorkManager.
+- `:feature:settings` owns `SettingsUiState`, `SettingsViewModel`, and the
+  `SettingsRoute`/`SettingsScreen` Compose UI for profile editing, connection
+  checks, permission guidance, synchronization status, and user controls. It may
+  depend on `:core` but must never depend on `:infrastructure`.
+- `:infrastructure` implements core ports. `activesync/` owns HTTPS/mTLS,
+  capability discovery, redirects, WBXML codecs, FolderSync/Sync commands, and
+  remote calendar pages; `calendar/` owns the app-managed Android calendar,
+  event mapping plans, and bounded Calendar Provider batches; `persistence/`
+  owns profile and sync-state DataStore repositories; `tls/`, `work/`,
+  `permission/`, `notification/`, and `diagnostics/` isolate the corresponding
+  Android integrations. It depends only on `:core` among project modules.
+
+Production code lives under each module's `src/main`; local JVM tests mirror the
+same packages under `src/test`. Root `build.gradle.kts` defines the aggregate
+`verifyBootstrap` task, while dependency and plugin versions live only in
+`gradle/libs.versions.toml`.
 
 Do not split speculative Exchange, certificate, calendar, persistence, or sync
 modules before an active OpenSpec change identifies stable responsibilities.
