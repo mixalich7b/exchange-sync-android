@@ -27,10 +27,12 @@ WBXML декодируется с ограничениями размера до
 отклоняются как malformed data. Ограничения размера WBXML-документа и числа
 элементов типизированы отдельно от syntax/encoding/token errors и считаются
 page-scaled только для обычной Calendar `Sync` page. Вместе с bounded HTTP body
-и слишком большим provider batch они сохраняют committed calendar и collection
-SyncKey, уменьшают window вдвое с минимумом один и повторяют ту же страницу.
-Успешная меньшая страница применяется атомарно и продолжает `MoreAvailable`
-pagination уже с уменьшенным window. Если remote page остаётся больше лимита
+и слишком большой provider transaction они сохраняют committed checkpoint,
+уменьшают window вдвое с минимумом один и повторяют ту же страницу. Каждая
+remote page преобразуется в один упорядоченный provider plan и применяется
+последовательными вызовами не более чем по 50 операций. Успешная меньшая
+страница продолжает `MoreAvailable` pagination уже с уменьшенным window. Если
+remote page остаётся больше лимита
 при window 1, run блокируется как `PROTOCOL_DATA`; provider batch при window 1
 блокируется как `CALENDAR_PROVIDER`. Данные не пропускаются и checkpoint не
 продвигается. Excessive depth, oversized отдельная inline string, malformed
@@ -58,9 +60,14 @@ wire-протокола. Такой сервер обслуживается че
 
 Persisted checkpoints включают terminal endpoint, protocol version,
 FolderSync key, primary collection ID, collection SyncKey и текущий window.
-Calendar Provider page применяется до сохранения следующего SyncKey. Повтор той
-же страницы идемпотентно upsert-ит ServerId и полностью заменяет только явно
-присутствующие child collections.
+Calendar Provider page применяется до сохранения следующего SyncKey. Provider
+plan сохраняет канонический порядок операций; ссылки на insert внутри текущей
+группы становятся локальными back-reference, а ссылки на event из уже
+подтверждённой группы используют возвращённый provider row ID. Если более
+поздний вызов завершился ошибкой или его результат неоднозначен, уже
+подтверждённый префикс может быть видим локально, но SyncKey не меняется. Повтор
+той же страницы идемпотентно upsert-ит ServerId и полностью заменяет только явно
+присутствующие child collections, поэтому сходится без дубликатов.
 
 Capability discovery и все календарные команды точного сохранённого профиля
 используют один process-local HTTP-сеанс. Подходящие cookie, установленные
@@ -103,6 +110,17 @@ exceptions. Windows time-zone blob преобразуется в representable A
 zone; неоднозначные или непредставимые данные блокируют страницу безопасной
 категорией protocol/provider problem, не сдвигая identity или время.
 
+Для события с не более чем 100 участниками, не считая organizer, создаётся
+полный набор attendee rows. Если таких участников больше 100, они все
+опускаются, organizer сохраняется отдельной organizer row, а
+`HAS_ATTENDEE_DATA` отражает только её наличие. При отсутствии organizer в
+oversized-событии attendee rows не создаются. Правило применяется независимо к
+series и каждой recurrence exception после наследования её effective attendee
+list; переходы через порог полностью заменяют child collection. ActiveSync
+decoder и domain mapper при этом сохраняют весь входной список: ограничение
+действует только при материализации Calendar Provider и не влияет на
+классификацию приглашения или self-attendee status.
+
 Для приглашений authoritative `ResponseType` имеет приоритет; при его
 отсутствии допустим однозначный status attendee, соответствующего email
 профиля. Непринятое или tentative приглашение записывается с tentative
@@ -125,7 +143,7 @@ read-only/visible и изменяется только через sync-adapter-q
 run, adapter запрашивает fenced full reset и сброс checkpoint вместо применения
 следующей страницы. Все event, attendee, reminder и exception operations содержат owned
 calendar/event predicates; чужие календари не сканируются для ownership и не
-включаются в batch или cleanup.
+включаются в provider plan, sub-batch или cleanup.
 
 Ровно одна owned calendar row определяется полным внутренним ownership tuple.
 Удаление использует collection URI Calendar Provider с sync-adapter query
@@ -135,8 +153,11 @@ internal name; результат проверяется по числу уда�
 ремонтируются и не удаляются.
 
 Provider mutation и generation/run-token invalidation сериализуются общим
-mutex. Старый worker не может выполнить `resolveOwned`, batch или fenced cleanup
-после замены профиля, cancel или disable. Если другая локальная компонента
+mutex на всю Calendar page. Непосредственно перед каждым provider-вызовом
+проверяются coroutine cancellation и generation/run-token fence. Текущий
+sub-batch атомарен, но вся page не обязана быть атомарной: старый worker не
+начинает следующий sub-batch, `resolveOwned` или fenced cleanup после замены
+профиля, cancel или disable. Если другая локальная компонента
 удалит owned event, календарь целиком или изменит event так, что provider
 пометит его dirty, последующая обработка обнаруживает разрыв зеркала,
 ограждённо очищает owned calendar и запускает полную синхронизацию для
@@ -201,7 +222,9 @@ certificate material и exception messages в notification не попадают
 
 Сетевые и protocol failures, отклонённые события, операции Calendar Provider,
 sync phases/retries/resets/terminal outcomes и границы WorkManager связываются
-в Logcat по generation, run token и process-local operation ID. Записи не
+в Logcat по generation, run token и process-local operation ID. Безопасные
+агрегаты отдельно показывают suppression oversized attendee list и прогресс
+provider sub-batches, включая неоднозначный outcome активного вызова. Записи не
 содержат event content, WBXML, provider values или profile identity. Полный
 перечень безопасных полей и команды сбора приведены в
 [руководстве по диагностике](diagnostics.md).

@@ -52,6 +52,7 @@ internal enum class DiagnosticStage {
     EVENT_MAP,
     PROVIDER_QUERY,
     PROVIDER_BATCH,
+    ATTENDEE_SUPPRESSION,
     CHECKPOINT,
     CLEANUP,
     OWNERSHIP,
@@ -139,6 +140,31 @@ internal enum class FolderPreparationOutcome {
     INVALIDATED,
 }
 
+internal enum class DiagnosticAttendeeRepresentation {
+    ORGANIZER_ONLY,
+    EMPTY,
+}
+
+internal enum class DiagnosticProviderCallOutcome {
+    CONFIRMED,
+    UNKNOWN,
+}
+
+internal enum class DiagnosticProviderFailureCause {
+    ACCESS,
+    REMOTE,
+    OPERATION_APPLICATION,
+    OPERATION_CANCELLED,
+    INVALID_ARGUMENT,
+    INVALID_REQUEST,
+    INVALID_RESULT,
+    INVALID_REFERENCE,
+    UNSUPPORTED_VALUE,
+    UNEXPECTED,
+    TRANSACTION_TOO_LARGE,
+    SECURITY,
+}
+
 internal data class DiagnosticOperation(
     val id: String,
     val kind: DiagnosticOperationKind,
@@ -193,6 +219,17 @@ internal data class DeviceDiagnosticEvent(
     val plannedOperationCount: Int? = null,
     val attemptedOperationCount: Int? = null,
     val appliedOperationCount: Int? = null,
+    val attendeeLimit: Int? = null,
+    val attendeeInputCount: Int? = null,
+    val attendeeOmittedCount: Int? = null,
+    val attendeeRepresentation: DiagnosticAttendeeRepresentation? = null,
+    val providerOperationCount: Int? = null,
+    val subBatchCount: Int? = null,
+    val subBatchOrdinal: Int? = null,
+    val subBatchOperationCount: Int? = null,
+    val confirmedOperationCount: Int? = null,
+    val providerCallOutcome: DiagnosticProviderCallOutcome? = null,
+    val providerFailureCause: DiagnosticProviderFailureCause? = null,
     val cleanupTrigger: CleanupTrigger? = null,
     val checkpointOutcome: CheckpointOutcome? = null,
     val throwable: Throwable? = null,
@@ -273,6 +310,30 @@ private object DeviceDiagnosticFormatter {
             appendCount(values, "reduced_window_size", event.reducedWindowSize)
             return values.joinToString(" ").take(MAX_RECORD_LENGTH)
         }
+        if (event.hasLargeEntityOrProviderSubBatchFields()) {
+            append(values, "failure", event.failureCategory)
+            append(values, "outcome", event.outcome)
+            appendCount(values, "attempted_operation_count", event.attemptedOperationCount)
+            appendCount(values, "applied_operation_count", event.appliedOperationCount)
+            appendCount(values, "attendee_limit", event.attendeeLimit)
+            appendCount(values, "attendee_input_count", event.attendeeInputCount)
+            appendCount(values, "attendee_omitted_count", event.attendeeOmittedCount)
+            event.attendeeRepresentation?.let { representation ->
+                values += "attendee_representation=${representation.name.lowercase()}"
+            }
+            appendCount(values, "provider_operation_count", event.providerOperationCount)
+            appendCount(values, "sub_batch_count", event.subBatchCount)
+            appendCount(values, "sub_batch_ordinal", event.subBatchOrdinal)
+            appendCount(values, "sub_batch_operation_count", event.subBatchOperationCount)
+            appendCount(values, "confirmed_operation_count", event.confirmedOperationCount)
+            event.providerCallOutcome?.let { outcome ->
+                values += "provider_call_outcome=${outcome.name.lowercase()}"
+            }
+            event.providerFailureCause?.let { cause ->
+                values += "provider_failure_cause=${cause.name.lowercase()}"
+            }
+            return values.joinToString(" ").take(MAX_RECORD_LENGTH)
+        }
         append(values, "trigger", event.trigger)
         append(values, "phase", event.phase)
         append(values, "method", event.method)
@@ -348,6 +409,19 @@ private object DeviceDiagnosticFormatter {
     private fun DeviceDiagnosticEvent.mayIncludeRootMessage(): Boolean =
         component in messageSafeComponents ||
             (component == DiagnosticComponent.ACTIVE_SYNC && stage !in payloadSensitiveStages)
+
+    private fun DeviceDiagnosticEvent.hasLargeEntityOrProviderSubBatchFields(): Boolean =
+        attendeeLimit != null ||
+            attendeeInputCount != null ||
+            attendeeOmittedCount != null ||
+            attendeeRepresentation != null ||
+            providerOperationCount != null ||
+            subBatchCount != null ||
+            subBatchOrdinal != null ||
+            subBatchOperationCount != null ||
+            confirmedOperationCount != null ||
+            providerCallOutcome != null ||
+            providerFailureCause != null
 
     private val messageSafeComponents =
         setOf(

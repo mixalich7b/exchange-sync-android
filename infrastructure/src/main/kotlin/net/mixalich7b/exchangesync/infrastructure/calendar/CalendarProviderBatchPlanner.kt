@@ -14,6 +14,8 @@ import net.mixalich7b.exchangesync.core.calendar.ProviderEvent
 import net.mixalich7b.exchangesync.core.calendar.ProviderEventStatus
 import net.mixalich7b.exchangesync.core.calendar.ProviderSelfStatus
 
+internal const val MAX_MATERIALIZED_NON_ORGANIZER_ATTENDEES: Int = 100
+
 internal fun interface CalendarProviderTimeZoneResolver {
     fun resolve(timeZone: ActiveSyncTimeZone): String?
 }
@@ -186,19 +188,26 @@ internal sealed interface CalendarProviderBatchOperation {
     ) : CalendarProviderBatchOperation
 }
 
+internal data class CalendarAttendeeSuppression(
+    val inputCount: Int,
+    val organizerRetained: Boolean,
+)
+
 internal class CalendarProviderBatchPlan private constructor(
     val calendarId: Long,
     val operations: List<CalendarProviderBatchOperation>,
+    val attendeeSuppressions: List<CalendarAttendeeSuppression>,
 ) {
     companion object {
         fun create(
             calendarId: Long,
             operations: List<CalendarProviderBatchOperation>,
+            attendeeSuppressions: List<CalendarAttendeeSuppression> = emptyList(),
         ): CalendarProviderBatchPlan {
             if (calendarId < 0 || operations.any { it.calendarId != calendarId }) {
                 throw CalendarPlanningException("Calendar Provider batch escaped the owned calendar")
             }
-            return CalendarProviderBatchPlan(calendarId, operations)
+            return CalendarProviderBatchPlan(calendarId, operations, attendeeSuppressions)
         }
     }
 }
@@ -209,6 +218,7 @@ internal object CalendarProviderBatchPlanner {
         timeZoneResolver: CalendarProviderTimeZoneResolver,
     ): CalendarProviderBatchPlan {
         val operations = mutableListOf<CalendarProviderBatchOperation>()
+        val attendeeSuppressions = mutableListOf<CalendarAttendeeSuppression>()
         page.operations.forEach { eventPlan ->
             val serverId =
                 when (eventPlan) {
@@ -219,18 +229,20 @@ internal object CalendarProviderBatchPlanner {
                 when (eventPlan) {
                     is CalendarEventPlan.Delete ->
                         operations += CalendarProviderBatchOperation.EventDelete(page.calendarId, eventPlan.syncId)
-                    is CalendarEventPlan.Upsert -> addUpsert(eventPlan, operations, timeZoneResolver)
+                    is CalendarEventPlan.Upsert ->
+                        addUpsert(eventPlan, operations, attendeeSuppressions, timeZoneResolver)
                 }
             } catch (failure: CalendarPlanningException) {
                 throw failure.withServerId(serverId)
             }
         }
-        return CalendarProviderBatchPlan.create(page.calendarId, operations)
+        return CalendarProviderBatchPlan.create(page.calendarId, operations, attendeeSuppressions)
     }
 
     private fun addUpsert(
         plan: CalendarEventPlan.Upsert,
         operations: MutableList<CalendarProviderBatchOperation>,
+        attendeeSuppressions: MutableList<CalendarAttendeeSuppression>,
         timeZoneResolver: CalendarProviderTimeZoneResolver,
     ) {
         val values = plan.event.toProviderValues(plan.eventId == null, timeZoneResolver)
@@ -246,9 +258,9 @@ internal object CalendarProviderBatchPlanner {
                 EventReference.Existing(plan.eventId)
             }
         addOrganizerOperations(plan, eventReference, operations)
-        addAttendeeOperations(plan, eventReference, operations)
+        addAttendeeOperations(plan, eventReference, operations, attendeeSuppressions)
         addReminderOperations(plan, eventReference, operations)
-        addExceptionOperations(plan, eventReference, operations, timeZoneResolver)
+        addExceptionOperations(plan, eventReference, operations, attendeeSuppressions, timeZoneResolver)
     }
 
     private fun addOrganizerOperations(
@@ -278,6 +290,7 @@ internal object CalendarProviderBatchPlanner {
         plan: CalendarEventPlan.Upsert,
         eventReference: EventReference,
         operations: MutableList<CalendarProviderBatchOperation>,
+        attendeeSuppressions: MutableList<CalendarAttendeeSuppression>,
     ) {
         if (!plan.replaceAttendees) return
         val existingId = (eventReference as? EventReference.Existing)?.eventId
@@ -285,7 +298,9 @@ internal object CalendarProviderBatchPlanner {
             operations += CalendarProviderBatchOperation.AttendeesDelete(plan.calendarId, existingId)
         }
         val attendees = (plan.event.attendees as? ActiveSyncField.Value)?.value.orEmpty()
-        attendees.forEach { attendee ->
+        attendees.suppressionOrNull(plan.event.organizerEmail is ActiveSyncField.Value)
+            ?.let(attendeeSuppressions::add)
+        attendees.materializedNonOrganizerAttendees().forEach { attendee ->
             operations +=
                 CalendarProviderBatchOperation.AttendeeInsert(
                     plan.calendarId,
@@ -324,6 +339,7 @@ internal object CalendarProviderBatchPlanner {
         plan: CalendarEventPlan.Upsert,
         eventReference: EventReference,
         operations: MutableList<CalendarProviderBatchOperation>,
+        attendeeSuppressions: MutableList<CalendarAttendeeSuppression>,
         timeZoneResolver: CalendarProviderTimeZoneResolver,
     ) {
         if (plan.refreshExceptionResponses) {
@@ -357,7 +373,13 @@ internal object CalendarProviderBatchPlanner {
                     values = exception.toProviderValues(plan.event, timeZoneResolver, plan.providerTimeZone),
                 )
             val exceptionReference = EventReference.Inserted(exceptionIndex)
-            (exception.attendees as? ActiveSyncField.Value)?.value.orEmpty()
+            val attendees = (exception.attendees as? ActiveSyncField.Value)?.value.orEmpty()
+            if (!exception.deleted) {
+                attendees.suppressionOrNull(plan.event.organizerEmail is ActiveSyncField.Value)
+                    ?.let(attendeeSuppressions::add)
+            }
+            attendees
+                .materializedNonOrganizerAttendees()
                 .takeUnless { exception.deleted }
                 .orEmpty()
                 .forEach { attendee ->
@@ -442,7 +464,7 @@ internal object CalendarProviderBatchPlanner {
             values[CalendarProviderField.HAS_ALARM] = (reminderMinutes is ActiveSyncField.Value).asInt()
         }
         if (isInsert || attendees != ActiveSyncField.Absent) {
-            values[CalendarProviderField.HAS_ATTENDEE_DATA] = (attendees is ActiveSyncField.Value).asInt()
+            values[CalendarProviderField.HAS_ATTENDEE_DATA] = hasMaterializedAttendeeData().asInt()
         }
         if (isInsert) {
             if (start !is ActiveSyncField.Value || end !is ActiveSyncField.Value) {
@@ -531,6 +553,15 @@ internal object CalendarProviderBatchPlanner {
             series.accessLevel,
             ProviderAccessLevel::toProviderInteger,
         )
+        values[CalendarProviderField.HAS_ATTENDEE_DATA] =
+            (
+                series.organizerEmail is ActiveSyncField.Value ||
+                    (attendees as? ActiveSyncField.Value)
+                        ?.value
+                        .orEmpty()
+                        .materializedNonOrganizerAttendees()
+                        .isNotEmpty()
+            ).asInt()
         when (reminderMinutes) {
             ActiveSyncField.Absent -> Unit
             ActiveSyncField.Empty -> values[CalendarProviderField.HAS_ALARM] = 0
@@ -597,7 +628,22 @@ internal object CalendarProviderBatchPlanner {
         "$seriesSyncId#exception#${instance.toEpochMilli()}"
 
     private data class ResolvedField<T>(val present: Boolean, val value: T?)
+
+    private fun ProviderEvent.hasMaterializedAttendeeData(): Boolean =
+        organizerEmail is ActiveSyncField.Value ||
+            (attendees as? ActiveSyncField.Value)
+                ?.value
+                .orEmpty()
+                .materializedNonOrganizerAttendees()
+                .isNotEmpty()
 }
+
+private fun <T> List<T>.materializedNonOrganizerAttendees(): List<T> =
+    takeIf { attendees -> attendees.size <= MAX_MATERIALIZED_NON_ORGANIZER_ATTENDEES }.orEmpty()
+
+private fun <T> List<T>.suppressionOrNull(organizerRetained: Boolean): CalendarAttendeeSuppression? =
+    takeIf { attendees -> attendees.size > MAX_MATERIALIZED_NON_ORGANIZER_ATTENDEES }
+        ?.let { attendees -> CalendarAttendeeSuppression(attendees.size, organizerRetained) }
 
 private fun Boolean.asInt(): Int = if (this) 1 else 0
 

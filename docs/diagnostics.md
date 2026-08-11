@@ -45,6 +45,14 @@ telemetry или analytics нет. Доступны только records, кот
   `reused`, `repaired`, `deleted`, `unchanged`), `input_count`,
   `accepted_count`, `rejected_count`, `planned_operation_count`,
   `attempted_operation_count` и `applied_operation_count`;
+- для attendee suppression — `attendee_limit`, `attendee_input_count`,
+  `attendee_omitted_count` и безопасное `attendee_representation`
+  (`organizer_only`, `empty`);
+- для provider page/sub-batch — `provider_operation_count`, `sub_batch_count`,
+  `sub_batch_ordinal`, `sub_batch_operation_count`, cumulative
+  `confirmed_operation_count` и `provider_call_outcome` (`confirmed`,
+  `unknown`), а для ошибки — типизированный `provider_failure_cause` без текста
+  исключения;
 - для cleanup — `cleanup_trigger` (`profile_activation`, `full_reset`,
   `disable`, `startup`, `permission_recovery`, `user_retry`), bounded row и
   operation counts, delete outcome и durable failure category;
@@ -75,6 +83,20 @@ terminal, а настоящий syntax/encoding/token/structure defect сохр�
 reuse в page/retry/continuation и invalidation, не раскрывая содержимое cache.
 `calendar_provider_transaction` использует тот же typed window outcome, но
 сохраняет terminal problem `CALENDAR_PROVIDER` при window один.
+
+`attendee_suppression` означает, что effective список non-organizer attendees
+превысил лимит материализации; запись сообщает только лимит, входное и
+опущенное количество и итог `organizer_only`/`empty`. `provider_batch` сначала
+фиксирует общий размер plan, затем подтверждённые sub-batches с их порядковым
+номером, размером и cumulative числом применённых операций. Ошибка активного
+Binder-вызова получает `provider_call_outcome=unknown`: ранее подтверждённый
+префикс остаётся посчитанным, а checkpoint страницы не считается committed.
+Concrete cause остаётся ограниченным enum, например `remote`,
+`operation_application`, `invalid_result` или `transaction_too_large`. Для
+capacity failure следующий record с теми же `generation`/`run_token` сообщает
+точный `window_reduction` либо `minimum_window_block`; остальные permanent
+provider failures связываются с последующим terminal block record по тому же
+fence.
 
 Уровень `INFO` отмечает начало, capability/phase и terminal
 success/cancellation/obsolete. На нём же пишутся успешные `RESPONSE`, decoded
@@ -107,10 +129,11 @@ booleans и enums. `response_bytes` — только ограниченный р
 Provider и core synchronization stages; там остаются только классы и
 ограниченные frames.
 
-Capacity и folder-preparation records имеют более узкий formatter path: кроме
-`component`, `stage`, process-local operation ID, `generation`/`run_token` он
-принимает только перечисленные typed enums и bounded window values. Свободные
-`command`/`reason`/`outcome`, host/path, `server_id` и exception text для этих
+Capacity, folder-preparation, attendee-suppression и provider-sub-batch records
+имеют более узкий formatter path: кроме `component`, `stage`, process-local
+operation ID, `generation`/`run_token` он принимает только соответствующие
+typed enums, bounded counts/window values и allow-listed failure/outcome. Свободные
+`command`/`reason`, host/path, `server_id`, provider row ID и exception text для этих
 records не форматируются. Поэтому collection ID, folder name, FolderSync и
 collection SyncKey, email, `domain\login`, payload и текст исключения не могут
 попасть в эти записи даже при ошибочном заполнении общего event model.

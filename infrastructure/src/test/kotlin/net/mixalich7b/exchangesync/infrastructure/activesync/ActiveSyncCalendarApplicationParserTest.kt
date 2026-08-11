@@ -85,6 +85,43 @@ class ActiveSyncCalendarApplicationParserTest {
     }
 
     @Test
+    fun `received meeting response classification uses the complete oversized attendee list`() {
+        val attendeeElements =
+            List(100) { index ->
+                element(
+                    Calendar.ATTENDEE,
+                    text(Calendar.EMAIL, "guest-$index@example.test"),
+                    text(Calendar.NAME, "Guest $index"),
+                    text(Calendar.ATTENDEE_STATUS, "0"),
+                    text(Calendar.ATTENDEE_TYPE, "1"),
+                )
+            } +
+                element(
+                    Calendar.ATTENDEE,
+                    text(Calendar.EMAIL, PROFILE_EMAIL),
+                    text(Calendar.NAME, "Current User"),
+                    text(Calendar.ATTENDEE_STATUS, "3"),
+                    text(Calendar.ATTENDEE_TYPE, "1"),
+                )
+        val data =
+            element(
+                AirSync.APPLICATION_DATA,
+                *ordinaryChildren(subject = "Oversized meeting").toTypedArray(),
+                text(Calendar.MEETING_STATUS, "3"),
+                element(Calendar.ATTENDEES, *attendeeElements.toTypedArray()),
+            )
+
+        val mutation =
+            ActiveSyncCalendarApplicationParser.parse(
+                RawCalendarCommand(RawCalendarCommandKind.ADD, "oversized-response", data),
+                PROFILE_EMAIL,
+            ) as ActiveSyncCalendarMutation.Upsert
+
+        assertEquals(ActiveSyncField.Value(ActiveSyncResponseType.ACCEPTED), mutation.item.responseType)
+        assertEquals(101, (mutation.item.attendees as ActiveSyncField.Value).value.size)
+    }
+
+    @Test
     fun `received Change without ResponseType uses a supplied current-user attendee response`() {
         val mutation =
             ActiveSyncCalendarApplicationParser.parse(

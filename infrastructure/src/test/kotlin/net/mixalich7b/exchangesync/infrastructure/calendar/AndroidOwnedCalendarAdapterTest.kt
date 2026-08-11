@@ -5,6 +5,8 @@ import java.time.Instant
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Proxy
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncCalendarItem
@@ -35,6 +37,9 @@ import net.mixalich7b.exchangesync.core.sync.SyncProblem
 import net.mixalich7b.exchangesync.core.sync.SyncState
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnosticEvent
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticAttendeeRepresentation
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticProviderCallOutcome
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticProviderFailureCause
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.OwnedCalendarAction
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -169,6 +174,236 @@ class AndroidOwnedCalendarAdapterTest {
     }
 
     @Test
+    fun `a page of at most fifty operations uses exactly one provider call`() = runTest {
+        val gateway = RecordingCalendarGateway()
+
+        val outcome = adapter(gateway).applyPage(SyncFence(2, 4), deletePage(50))
+
+        assertEquals(LocalPageOutcome.Applied, outcome)
+        assertEquals(listOf(50), gateway.applied.map { subBatch -> subBatch.operations.size })
+    }
+
+    @Test
+    fun `larger pages use consecutive provider calls capped at fifty and apply only after the last`() = runTest {
+        val gateway = RecordingCalendarGateway()
+
+        val outcome = adapter(gateway).applyPage(SyncFence(2, 4), deletePage(121))
+
+        assertEquals(LocalPageOutcome.Applied, outcome)
+        assertEquals(listOf(50, 50, 21), gateway.applied.map { subBatch -> subBatch.operations.size })
+    }
+
+    @Test
+    fun `an obsolete fence between sub-batches stops before the next provider call`() = runTest {
+        val gateway = RecordingCalendarGateway()
+        var fenceChecks = 0
+        val adapter =
+            AndroidOwnedCalendarAdapter(
+                profileRepository = ProfileRepository(PROFILE),
+                gateway = gateway,
+                timeZoneResolver = CalendarProviderTimeZoneResolver { "UTC" },
+                isFenceCurrent = { ++fenceChecks <= 3 },
+            )
+
+        val outcome = adapter.applyPage(SyncFence(2, 4), deletePage(121))
+
+        assertEquals(LocalPageOutcome.Obsolete, outcome)
+        assertEquals(listOf(50, 50), gateway.applied.map { subBatch -> subBatch.operations.size })
+        assertEquals(4, fenceChecks)
+    }
+
+    @Test
+    fun `cancellation between sub-batches is observed before another provider call`() = runTest {
+        lateinit var synchronization: kotlinx.coroutines.Job
+        val gateway =
+            RecordingCalendarGateway(
+                onApply = { call -> if (call == 1) synchronization.cancel() },
+            )
+        synchronization =
+            launch(start = CoroutineStart.LAZY) {
+                adapter(gateway).applyPage(SyncFence(2, 4), deletePage(121))
+            }
+
+        synchronization.start()
+        synchronization.join()
+
+        assertTrue(synchronization.isCancelled)
+        assertEquals(1, gateway.applyCalls)
+    }
+
+    @Test
+    fun `failure of a later sub-batch stops immediately and does not report page success`() = runTest {
+        val gateway =
+            RecordingCalendarGateway(
+                applyFailure = CalendarProviderAccessException(),
+                applyFailureAtCall = 2,
+            )
+
+        val outcome = adapter(gateway).applyPage(SyncFence(2, 4), deletePage(121))
+
+        assertEquals(LocalPageOutcome.Failed(SyncProblem.CALENDAR_PROVIDER), outcome)
+        assertEquals(2, gateway.applyCalls)
+        assertEquals(listOf(50), gateway.applied.map { subBatch -> subBatch.operations.size })
+    }
+
+    @Test
+    fun `capacity failure of a later bounded sub-batch returns only the confirmed prefix and stops`() = runTest {
+        val events = mutableListOf<DeviceDiagnosticEvent>()
+        val gateway =
+            RecordingCalendarGateway(
+                applyFailure = CalendarProviderTransactionTooLargeException(),
+                applyFailureAtCall = 2,
+            )
+        val adapter =
+            AndroidOwnedCalendarAdapter(
+                profileRepository = ProfileRepository(PROFILE),
+                gateway = gateway,
+                timeZoneResolver = CalendarProviderTimeZoneResolver { "UTC" },
+                diagnostics = DeviceDiagnostics { event -> events += event },
+            )
+
+        val outcome = adapter.applyPage(SyncFence(2, 4), deletePage(121))
+
+        assertEquals(LocalPageOutcome.TransactionTooLarge, outcome)
+        assertEquals(2, gateway.applyCalls)
+        assertEquals(listOf(50), gateway.applied.map { subBatch -> subBatch.operations.size })
+        val failure = events.single { event -> event.outcome == "failure" }
+        assertEquals(50, failure.appliedOperationCount)
+    }
+
+    @Test
+    fun `oversized attendee suppression reports counts without identities or event content`() = runTest {
+        val events = mutableListOf<DeviceDiagnosticEvent>()
+        val attendees =
+            List(101) { index ->
+                ActiveSyncAttendee(
+                    "secret-attendee-$index@example.test",
+                    "Secret Attendee $index",
+                    ActiveSyncAttendeeStatus.ACCEPTED,
+                    ActiveSyncAttendeeType.REQUIRED,
+                )
+            }
+        val item =
+            addition("secret-event-id").copy(
+                subject = ActiveSyncField.Value("Private board meeting"),
+                organizerEmail = ActiveSyncField.Value("secret-owner@example.test"),
+                attendees = ActiveSyncField.Value(attendees),
+            )
+        val adapter =
+            AndroidOwnedCalendarAdapter(
+                profileRepository = ProfileRepository(PROFILE),
+                gateway = RecordingCalendarGateway(),
+                timeZoneResolver = CalendarProviderTimeZoneResolver { "UTC" },
+                diagnostics = DeviceDiagnostics { event -> events += event },
+            )
+
+        assertEquals(
+            LocalPageOutcome.Applied,
+            adapter.applyPage(
+                SyncFence(2, 4),
+                RemoteCalendarPage(
+                    listOf(ActiveSyncCalendarMutation.Upsert(item, true)),
+                    SyncCheckpoints(collectionSyncKey = "secret-next-key"),
+                    false,
+                ),
+            ),
+        )
+
+        val suppression = events.single { event -> event.attendeeOmittedCount != null }
+        assertEquals(100, suppression.attendeeLimit)
+        assertEquals(101, suppression.attendeeInputCount)
+        assertEquals(101, suppression.attendeeOmittedCount)
+        assertEquals(DiagnosticAttendeeRepresentation.ORGANIZER_ONLY, suppression.attendeeRepresentation)
+        assertEquals(null, suppression.serverId)
+        val records = events.toString()
+        listOf(
+            "secret-event-id",
+            "Private board meeting",
+            "secret-owner@example.test",
+            "secret-attendee-100@example.test",
+            "secret-next-key",
+        ).forEach { secret -> assertFalse(records.contains(secret), secret) }
+    }
+
+    @Test
+    fun `provider diagnostics report every confirmed sub-batch and a final page summary`() = runTest {
+        val events = mutableListOf<DeviceDiagnosticEvent>()
+        val adapter =
+            AndroidOwnedCalendarAdapter(
+                profileRepository = ProfileRepository(PROFILE),
+                gateway = RecordingCalendarGateway(),
+                timeZoneResolver = CalendarProviderTimeZoneResolver { "UTC" },
+                diagnostics = DeviceDiagnostics { event -> events += event },
+            )
+
+        assertEquals(LocalPageOutcome.Applied, adapter.applyPage(SyncFence(2, 4), deletePage(121)))
+
+        val providerEvents = events.filter { event -> event.stage == DiagnosticStage.PROVIDER_BATCH }
+        val subBatches = providerEvents.filter { event -> event.subBatchOrdinal != null }
+        assertEquals(listOf(1, 2, 3), subBatches.map(DeviceDiagnosticEvent::subBatchOrdinal))
+        assertEquals(listOf(50, 50, 21), subBatches.map(DeviceDiagnosticEvent::subBatchOperationCount))
+        assertEquals(listOf(50, 100, 121), subBatches.map(DeviceDiagnosticEvent::confirmedOperationCount))
+        assertTrue(subBatches.all { event -> event.providerOperationCount == 121 })
+        assertTrue(subBatches.all { event -> event.subBatchCount == 3 })
+        assertTrue(subBatches.all { event -> event.providerCallOutcome == DiagnosticProviderCallOutcome.CONFIRMED })
+        val summary = providerEvents.single { event -> event.subBatchOrdinal == null }
+        assertEquals(121, summary.attemptedOperationCount)
+        assertEquals(121, summary.confirmedOperationCount)
+    }
+
+    @Test
+    fun `one-batch completion reports matching attempted and confirmed counts`() = runTest {
+        val events = mutableListOf<DeviceDiagnosticEvent>()
+        val adapter =
+            AndroidOwnedCalendarAdapter(
+                profileRepository = ProfileRepository(PROFILE),
+                gateway = RecordingCalendarGateway(),
+                timeZoneResolver = CalendarProviderTimeZoneResolver { "UTC" },
+                diagnostics = DeviceDiagnostics { event -> events += event },
+            )
+
+        assertEquals(LocalPageOutcome.Applied, adapter.applyPage(SyncFence(2, 4), deletePage(1)))
+
+        val subBatch = events.single { event -> event.subBatchOrdinal == 1 }
+        assertEquals(1, subBatch.subBatchCount)
+        assertEquals(1, subBatch.subBatchOperationCount)
+        assertEquals(1, subBatch.confirmedOperationCount)
+    }
+
+    @Test
+    fun `later ambiguous failure reports confirmed prefix without claiming the failed call applied zero`() = runTest {
+        val events = mutableListOf<DeviceDiagnosticEvent>()
+        val adapter =
+            AndroidOwnedCalendarAdapter(
+                profileRepository = ProfileRepository(PROFILE),
+                gateway =
+                    RecordingCalendarGateway(
+                        applyFailure =
+                            CalendarProviderAccessException(
+                                failureCause = CalendarProviderFailureCause.REMOTE,
+                            ),
+                        applyFailureAtCall = 2,
+                    ),
+                timeZoneResolver = CalendarProviderTimeZoneResolver { "UTC" },
+                diagnostics = DeviceDiagnostics { event -> events += event },
+            )
+
+        assertEquals(
+            LocalPageOutcome.Failed(SyncProblem.CALENDAR_PROVIDER),
+            adapter.applyPage(SyncFence(2, 4), deletePage(121)),
+        )
+
+        val failure = events.single { event -> event.providerCallOutcome == DiagnosticProviderCallOutcome.UNKNOWN }
+        assertEquals(121, failure.providerOperationCount)
+        assertEquals(3, failure.subBatchCount)
+        assertEquals(2, failure.subBatchOrdinal)
+        assertEquals(50, failure.subBatchOperationCount)
+        assertEquals(50, failure.confirmedOperationCount)
+        assertEquals(50, failure.appliedOperationCount)
+        assertEquals(DiagnosticProviderFailureCause.REMOTE, failure.providerFailureCause)
+    }
+
+    @Test
     fun `empty page reports reused ownership and zero mapper planner and batch counts`() = runTest {
         val events = mutableListOf<DeviceDiagnosticEvent>()
         val gateway = RecordingCalendarGateway()
@@ -200,6 +435,8 @@ class AndroidOwnedCalendarAdapterTest {
         val batch = events.single { event -> event.stage == DiagnosticStage.PROVIDER_BATCH }
         assertEquals(0, batch.attemptedOperationCount)
         assertEquals(0, batch.appliedOperationCount)
+        assertEquals(null, batch.providerCallOutcome)
+        assertTrue(gateway.applied.isEmpty())
     }
 
     @Test
@@ -599,10 +836,52 @@ class AndroidOwnedCalendarAdapterTest {
 
         assertEquals(setOf("one"), gateway.eventSyncIds)
         assertEquals(2, gateway.attendeeRows)
-        assertEquals(1, gateway.reminderRows)
+        assertEquals(2, gateway.reminderRows)
         assertEquals(1, gateway.exceptionRows)
         assertTrue(gateway.plans[0].operations.first() is CalendarProviderBatchOperation.EventInsert)
         assertTrue(gateway.plans[1].operations.first() is CalendarProviderBatchOperation.EventUpdate)
+    }
+
+    @Test
+    fun `unchanged page replay repairs a confirmed prefix with partial attendees`() = runTest {
+        val gateway = ReplayCalendarGateway()
+        var fenceChecks = 0
+        val interrupted =
+            AndroidOwnedCalendarAdapter(
+                profileRepository = ProfileRepository(PROFILE),
+                gateway = gateway,
+                timeZoneResolver = CalendarProviderTimeZoneResolver { "UTC" },
+                isFenceCurrent = { ++fenceChecks <= 2 },
+            )
+        val page = replaySeriesPage()
+
+        assertEquals(LocalPageOutcome.Obsolete, interrupted.applyPage(SyncFence(1, 1), page))
+        assertEquals(1, gateway.topLevelEventCount)
+        assertTrue(gateway.attendeeRows in 1 until 200)
+
+        assertEquals(LocalPageOutcome.Applied, adapter(gateway).applyPage(SyncFence(1, 1), page))
+
+        assertReplayConverged(gateway)
+    }
+
+    @Test
+    fun `unchanged page replay repairs attendees reminders and exceptions after ambiguous failure`() = runTest {
+        val gateway = ReplayCalendarGateway(failOnCall = 3, failAfterApply = true)
+        val page = replaySeriesPage()
+
+        assertEquals(
+            LocalPageOutcome.Failed(SyncProblem.CALENDAR_PROVIDER),
+            adapter(gateway).applyPage(SyncFence(1, 1), page),
+        )
+        assertEquals(1, gateway.topLevelEventCount)
+        assertEquals(1, gateway.exceptionRows)
+        assertTrue(gateway.attendeeRows in 101 until 200)
+        assertEquals(1, gateway.reminderRows)
+
+        gateway.clearFailure()
+        assertEquals(LocalPageOutcome.Applied, adapter(gateway).applyPage(SyncFence(1, 1), page))
+
+        assertReplayConverged(gateway)
     }
 
     private fun adapter(gateway: RecordingCalendarGateway): AndroidOwnedCalendarAdapter =
@@ -626,6 +905,63 @@ class AndroidOwnedCalendarAdapterTest {
             end = ActiveSyncField.Value(Instant.parse("2026-08-09T10:00:00Z")),
             allDay = ActiveSyncField.Value(false),
         )
+
+    private fun deletePage(count: Int): RemoteCalendarPage =
+        RemoteCalendarPage(
+            changes = List(count) { index -> ActiveSyncCalendarMutation.Delete("event-$index", soft = false) },
+            nextCheckpoints = SyncCheckpoints.EMPTY,
+            moreAvailable = false,
+        )
+
+    private fun replaySeriesPage(): RemoteCalendarPage {
+        val attendees =
+            ActiveSyncField.Value(
+                List(100) { index ->
+                    ActiveSyncAttendee(
+                        "guest-$index@example.test",
+                        "Guest $index",
+                        ActiveSyncAttendeeStatus.ACCEPTED,
+                        ActiveSyncAttendeeType.REQUIRED,
+                    )
+                },
+            )
+        val item =
+            addition("large-series").copy(
+                organizerEmail = ActiveSyncField.Value("owner@example.test"),
+                organizerName = ActiveSyncField.Value("Owner"),
+                attendees = attendees,
+                reminderMinutes = ActiveSyncField.Value(10),
+                recurrence =
+                    ActiveSyncField.Value(
+                        ActiveSyncRecurrence(ActiveSyncRecurrenceType.DAILY, 1, end = ActiveSyncRecurrenceEnd.Infinite),
+                    ),
+                exceptions =
+                    ActiveSyncField.Value(
+                        listOf(
+                            ActiveSyncCalendarException(
+                                instanceStart = Instant.parse("2026-08-10T09:00:00Z"),
+                                deleted = false,
+                                attendees = attendees,
+                                reminderMinutes = ActiveSyncField.Value(5),
+                            ),
+                        ),
+                    ),
+            )
+        return RemoteCalendarPage(
+            listOf(ActiveSyncCalendarMutation.Upsert(item, isAddition = true)),
+            SyncCheckpoints(collectionSyncKey = "next-key"),
+            moreAvailable = false,
+        )
+    }
+
+    private fun assertReplayConverged(gateway: ReplayCalendarGateway) {
+        assertEquals(1, gateway.topLevelEventCount)
+        assertEquals(setOf("large-series"), gateway.eventSyncIds)
+        assertEquals(1, gateway.organizerRows)
+        assertEquals(200, gateway.attendeeRows)
+        assertEquals(2, gateway.reminderRows)
+        assertEquals(1, gateway.exceptionRows)
+    }
 
     private fun testTimeZone(): ActiveSyncTimeZone =
         ActiveSyncTimeZone(
@@ -727,6 +1063,8 @@ class AndroidOwnedCalendarAdapterTest {
 
     private class RecordingCalendarGateway(
         private val applyFailure: RuntimeException? = null,
+        private val applyFailureAtCall: Int = 1,
+        private val onApply: (Int) -> Unit = {},
         private val resolveFailure: RuntimeException? = null,
         private val queryFailure: RuntimeException? = null,
         private val deleteFailure: Throwable? = null,
@@ -734,7 +1072,8 @@ class AndroidOwnedCalendarAdapterTest {
     ) : OwnedCalendarProviderGateway {
         val resolvedEmails = mutableListOf<String>()
         val queries = mutableListOf<Pair<Long, Set<String>>>()
-        val applied = mutableListOf<CalendarProviderBatchPlan>()
+        val applied = mutableListOf<CalendarProviderSubBatch>()
+        var applyCalls: Int = 0
         var deleteCalls: Int = 0
 
         override fun resolveOwned(profileEmail: String): OwnedCalendarResolution {
@@ -755,18 +1094,35 @@ class AndroidOwnedCalendarAdapterTest {
             return emptyList()
         }
 
-        override fun applyBatch(plan: CalendarProviderBatchPlan) {
-            applyFailure?.let { throw it }
-            applied += plan
+        override fun applySubBatch(subBatch: CalendarProviderSubBatch): CalendarProviderSubBatchResult {
+            applyCalls += 1
+            onApply(applyCalls)
+            if (applyCalls == applyFailureAtCall) applyFailure?.let { throw it }
+            applied += subBatch
+            return successfulResult(subBatch)
         }
     }
 
-    private class ReplayCalendarGateway : OwnedCalendarProviderGateway {
-        val eventSyncIds = linkedSetOf<String>()
-        val plans = mutableListOf<CalendarProviderBatchPlan>()
-        var attendeeRows = 0
-        var reminderRows = 0
-        var exceptionRows = 0
+    private class ReplayCalendarGateway(
+        private var failOnCall: Int? = null,
+        private val failAfterApply: Boolean = false,
+    ) : OwnedCalendarProviderGateway {
+        private val rows = linkedMapOf<Long, StatefulEventRow>()
+        private var nextRowId = 71L
+        private var applyCalls = 0
+        val plans = mutableListOf<CalendarProviderSubBatch>()
+        val eventSyncIds: Set<String>
+            get() = rows.values.filter { row -> row.originalId == null }.mapTo(linkedSetOf(), StatefulEventRow::syncId)
+        val topLevelEventCount: Int
+            get() = rows.values.count { row -> row.originalId == null }
+        val attendeeRows: Int
+            get() = rows.values.sumOf { row -> row.attendees.size }
+        val organizerRows: Int
+            get() = rows.values.count { row -> row.organizerEmail != null }
+        val reminderRows: Int
+            get() = rows.values.count(StatefulEventRow::hasReminder)
+        val exceptionRows: Int
+            get() = rows.values.count { row -> row.originalId != null }
 
         override fun resolveOwned(profileEmail: String): OwnedCalendarResolution =
             OwnedCalendarResolution(OWNED_CALENDAR, -13_408_615)
@@ -775,28 +1131,127 @@ class AndroidOwnedCalendarAdapterTest {
             OwnedCalendarCleanupResult(ownedRowCount = 0, deletedRowCount = 0)
 
         override fun queryExisting(calendarId: Long, syncIds: Set<String>): List<ExistingProviderEvent> =
-            syncIds.filter(eventSyncIds::contains).map { ExistingProviderEvent(71, calendarId, it) }
+            rows.values
+                .filter { row -> row.originalId == null && row.syncId in syncIds }
+                .map { row -> ExistingProviderEvent(row.id, calendarId, row.syncId) }
 
-        override fun applyBatch(plan: CalendarProviderBatchPlan) {
-            plans += plan
-            plan.operations.forEach { operation ->
+        override fun applySubBatch(subBatch: CalendarProviderSubBatch): CalendarProviderSubBatchResult {
+            applyCalls += 1
+            if (applyCalls == failOnCall && !failAfterApply) throw CalendarProviderAccessException()
+            plans += subBatch
+            val localInsertIds = mutableMapOf<Int, Long>()
+            val insertResults = mutableListOf<CalendarProviderInsertResult>()
+            subBatch.operations.forEachIndexed { localIndex, operation ->
                 when (operation) {
-                    is CalendarProviderBatchOperation.EventInsert ->
-                        eventSyncIds += checkNotNull(operation.values[CalendarProviderField.SYNC_ID] as? String)
-                    is CalendarProviderBatchOperation.AttendeesDelete -> attendeeRows = 0
-                    is CalendarProviderBatchOperation.AttendeeInsert -> attendeeRows += 1
-                    is CalendarProviderBatchOperation.RemindersDelete -> reminderRows = 0
-                    is CalendarProviderBatchOperation.ReminderInsert -> reminderRows += 1
-                    is CalendarProviderBatchOperation.ExceptionsDelete -> exceptionRows = 0
-                    is CalendarProviderBatchOperation.ExceptionInsert -> exceptionRows += 1
-                    else -> Unit
+                    is CalendarProviderBatchOperation.EventInsert -> {
+                        val id = nextRowId++
+                        rows[id] =
+                            StatefulEventRow(
+                                id = id,
+                                syncId = checkNotNull(operation.values[CalendarProviderField.SYNC_ID] as? String),
+                            )
+                        localInsertIds[localIndex] = id
+                        insertResults +=
+                            CalendarProviderInsertResult(subBatch.startOperationIndex + localIndex, id)
+                    }
+                    is CalendarProviderBatchOperation.EventUpdate -> Unit
+                    is CalendarProviderBatchOperation.EventDelete -> {
+                        val parentIds = rows.values.filter { row -> row.syncId == operation.syncId }.map(StatefulEventRow::id)
+                        parentIds.forEach(::deleteEventAndExceptions)
+                    }
+                    is CalendarProviderBatchOperation.AttendeesDelete ->
+                        checkNotNull(rows[operation.eventId]).attendees.clear()
+                    is CalendarProviderBatchOperation.OrganizerDelete ->
+                        row(operation.event, localInsertIds).organizerEmail = null
+                    is CalendarProviderBatchOperation.AttendeeInsert -> {
+                        val row = row(operation.event, localInsertIds)
+                        val email = checkNotNull(operation.values[CalendarProviderField.ATTENDEE_EMAIL] as? String)
+                        if (
+                            operation.values[CalendarProviderField.ATTENDEE_RELATIONSHIP] ==
+                            ProviderInteger.ORGANIZER_RELATIONSHIP
+                        ) {
+                            row.organizerEmail = email
+                        } else {
+                            row.attendees += email
+                        }
+                    }
+                    is CalendarProviderBatchOperation.RemindersDelete ->
+                        row(operation.event, localInsertIds).hasReminder = false
+                    is CalendarProviderBatchOperation.ReminderInsert ->
+                        row(operation.event, localInsertIds).hasReminder = true
+                    is CalendarProviderBatchOperation.ExceptionsDelete ->
+                        rows.values.filter { row -> row.originalId == operation.seriesId }
+                            .map(StatefulEventRow::id)
+                            .forEach(rows::remove)
+                    is CalendarProviderBatchOperation.ExceptionInsert -> {
+                        val id = nextRowId++
+                        rows[id] =
+                            StatefulEventRow(
+                                id = id,
+                                syncId = checkNotNull(operation.values[CalendarProviderField.SYNC_ID] as? String),
+                                originalId = row(operation.series, localInsertIds).id,
+                            )
+                        localInsertIds[localIndex] = id
+                        insertResults +=
+                            CalendarProviderInsertResult(subBatch.startOperationIndex + localIndex, id)
+                    }
+                    is CalendarProviderBatchOperation.ExceptionResponseUpdate -> Unit
                 }
             }
+            if (applyCalls == failOnCall && failAfterApply) throw CalendarProviderAccessException()
+            return CalendarProviderSubBatchResult(subBatch.operations.size, insertResults)
         }
+
+        fun clearFailure() {
+            failOnCall = null
+        }
+
+        private fun row(
+            reference: EventReference,
+            localInsertIds: Map<Int, Long>,
+        ): StatefulEventRow {
+            val id =
+                when (reference) {
+                    is EventReference.Existing -> reference.eventId
+                    is EventReference.Inserted -> checkNotNull(localInsertIds[reference.operationIndex])
+                }
+            return checkNotNull(rows[id])
+        }
+
+        private fun deleteEventAndExceptions(eventId: Long) {
+            rows.values.filter { row -> row.originalId == eventId }
+                .map(StatefulEventRow::id)
+                .forEach(rows::remove)
+            rows.remove(eventId)
+        }
+
+        private data class StatefulEventRow(
+            val id: Long,
+            val syncId: String,
+            val originalId: Long? = null,
+            val attendees: MutableList<String> = mutableListOf(),
+            var organizerEmail: String? = null,
+            var hasReminder: Boolean = false,
+        )
     }
 
     private companion object {
         const val OWNED_CALENDAR = 12L
         val PROFILE = ConnectionProfile("calendar@example.test", "DOMAIN\\user", "mail.example.test", "cert")
+
+        fun successfulResult(subBatch: CalendarProviderSubBatch): CalendarProviderSubBatchResult =
+            CalendarProviderSubBatchResult(
+                appliedOperationCount = subBatch.operations.size,
+                insertResults =
+                    subBatch.operations.mapIndexedNotNull { localIndex, operation ->
+                        if (
+                            operation !is CalendarProviderBatchOperation.EventInsert &&
+                            operation !is CalendarProviderBatchOperation.ExceptionInsert
+                        ) {
+                            return@mapIndexedNotNull null
+                        }
+                        CalendarProviderInsertResult(subBatch.startOperationIndex + localIndex, 71L + localIndex)
+                    },
+            )
     }
 }

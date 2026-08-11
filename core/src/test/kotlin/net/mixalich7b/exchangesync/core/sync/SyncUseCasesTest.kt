@@ -1362,11 +1362,12 @@ class SyncUseCasesTest {
             val remote = FakeRemote(mutableListOf(page(next, false), page(next, false)), trace)
             val scheduler = FakeScheduler(trace)
             val diagnostics = RecordingSyncDiagnostics()
+            val calendar = FakeCalendar(trace, LocalPageOutcome.TransactionTooLarge)
             val tooLargeExecutor =
                 executor(
                     stateRepository,
                     remote,
-                    FakeCalendar(trace, LocalPageOutcome.TransactionTooLarge),
+                    calendar,
                     scheduler,
                     trace,
                     diagnostics = diagnostics,
@@ -1377,6 +1378,7 @@ class SyncUseCasesTest {
             assertEquals(SyncSliceOutcome.Continued, retryOutcome)
             assertEquals("sync-16", stateRepository.current.checkpoints.collectionSyncKey)
             assertEquals(50, stateRepository.current.checkpoints.windowSize)
+            assertEquals(listOf(next), calendar.appliedPages.map(RemoteCalendarPage::nextCheckpoints))
             assertEquals(listOf(SyncFence(2, 3)), scheduler.continuations)
             val capacity = diagnostics.events.single { event -> event.kind == SyncDiagnosticKind.CAPACITY }
             assertEquals(SyncCapacityKind.CALENDAR_PROVIDER_TRANSACTION, capacity.capacityKind)
@@ -1473,11 +1475,12 @@ class SyncUseCasesTest {
                     trace,
                 )
             val diagnostics = RecordingSyncDiagnostics()
+            val calendar = FakeCalendar(trace, LocalPageOutcome.TransactionTooLarge)
             val executor =
                 executor(
                     stateRepository,
                     FakeRemote(mutableListOf(page(checkpoints("sync-18"), false)), trace),
-                    FakeCalendar(trace, LocalPageOutcome.TransactionTooLarge),
+                    calendar,
                     FakeScheduler(trace),
                     trace,
                     diagnostics = diagnostics,
@@ -1488,6 +1491,7 @@ class SyncUseCasesTest {
             assertEquals(SyncSliceOutcome.Blocked(SyncProblem.CALENDAR_PROVIDER), outcome)
             assertEquals("sync-16", stateRepository.current.checkpoints.collectionSyncKey)
             assertEquals(1, stateRepository.current.checkpoints.windowSize)
+            assertEquals(1, calendar.appliedPages.size)
             val capacity = diagnostics.events.single { event -> event.kind == SyncDiagnosticKind.CAPACITY }
             assertEquals(SyncCapacityKind.CALENDAR_PROVIDER_TRANSACTION, capacity.capacityKind)
             assertEquals(SyncCapacityOutcome.MINIMUM_WINDOW_BLOCK, capacity.capacityOutcome)

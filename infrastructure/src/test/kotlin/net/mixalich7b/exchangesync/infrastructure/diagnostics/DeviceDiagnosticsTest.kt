@@ -58,6 +58,58 @@ class DeviceDiagnosticsTest {
     }
 
     @Test
+    fun `large-entity and provider sub-batch diagnostics format only allow-listed aggregate fields`() {
+        val record =
+            format(
+                DeviceDiagnosticEvent(
+                    severity = DiagnosticSeverity.WARN,
+                    component = DiagnosticComponent.CALENDAR,
+                    stage = DiagnosticStage.PROVIDER_BATCH,
+                    operation = DeviceDiagnostics().operation(DiagnosticOperationKind.SYNCHRONIZATION, 3, 9),
+                    attendeeLimit = 100,
+                    attendeeInputCount = 101,
+                    attendeeOmittedCount = 101,
+                    attendeeRepresentation = DiagnosticAttendeeRepresentation.ORGANIZER_ONLY,
+                    providerOperationCount = 121,
+                    subBatchCount = 3,
+                    subBatchOrdinal = 2,
+                    subBatchOperationCount = 50,
+                    confirmedOperationCount = 50,
+                    providerCallOutcome = DiagnosticProviderCallOutcome.UNKNOWN,
+                    providerFailureCause = DiagnosticProviderFailureCause.REMOTE,
+                    reasonCode = "secret-cause-detail",
+                    serverId = "secret-event-id",
+                    command = "secret-sync-key",
+                    path = "/secret-payload",
+                    throwable = IllegalStateException("owner@example.test Private meeting row=987654321"),
+                ),
+            )
+
+        listOf(
+            "attendee_limit=100",
+            "attendee_input_count=101",
+            "attendee_omitted_count=101",
+            "attendee_representation=organizer_only",
+            "provider_operation_count=121",
+            "sub_batch_count=3",
+            "sub_batch_ordinal=2",
+            "sub_batch_operation_count=50",
+            "confirmed_operation_count=50",
+            "provider_call_outcome=unknown",
+            "provider_failure_cause=remote",
+        ).forEach { expected -> assertTrue(record.contains(expected), record) }
+        listOf(
+            "secret-event-id",
+            "secret-sync-key",
+            "/secret-payload",
+            "owner@example.test",
+            "Private meeting",
+            "987654321",
+            "secret-cause-detail",
+        ).forEach { secret -> assertFalse(record.contains(secret), secret) }
+    }
+
+    @Test
     fun `progress event model has no slots for keys identities rows timestamps payload or WBXML`() {
         val propertyNames = DeviceDiagnosticEvent::class.java.declaredFields.map { field -> field.name }.toSet()
 
@@ -73,6 +125,9 @@ class DeviceDiagnosticsTest {
             "payload",
             "responseBody",
             "wbxml",
+            "attendeeEmail",
+            "organizerEmail",
+            "providerRowId",
         ).forEach { forbidden -> assertFalse(forbidden in propertyNames, forbidden) }
     }
 

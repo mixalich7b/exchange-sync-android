@@ -1,14 +1,9 @@
 package net.mixalich7b.exchangesync.infrastructure.calendar
 
 import android.Manifest
-import android.content.ContentProviderOperation
 import android.content.ContentResolver
-import android.content.ContentValues
 import android.content.Context
 import android.database.Cursor
-import android.os.OperationCanceledException
-import android.os.RemoteException
-import android.os.TransactionTooLargeException
 import android.content.pm.PackageManager
 import android.provider.BaseColumns
 import android.provider.CalendarContract
@@ -18,6 +13,8 @@ import android.provider.CalendarContract.Events
 import android.provider.CalendarContract.Reminders
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.time.Instant
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncAvailability
@@ -51,14 +48,33 @@ import net.mixalich7b.exchangesync.infrastructure.diagnostics.CleanupTrigger
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnosticEvent
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticComponent
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticAttendeeRepresentation
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperationKind
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticProviderCallOutcome
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticProviderFailureCause
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticSeverity
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.OwnedCalendarAction
 
 internal class CalendarProviderTransactionTooLargeException : RuntimeException()
 
-internal class CalendarProviderAccessException(cause: Throwable? = null) : RuntimeException(cause)
+internal enum class CalendarProviderFailureCause {
+    ACCESS,
+    REMOTE,
+    OPERATION_APPLICATION,
+    OPERATION_CANCELLED,
+    INVALID_ARGUMENT,
+    INVALID_REQUEST,
+    INVALID_RESULT,
+    INVALID_REFERENCE,
+    UNSUPPORTED_VALUE,
+    UNEXPECTED,
+}
+
+internal class CalendarProviderAccessException(
+    cause: Throwable? = null,
+    val failureCause: CalendarProviderFailureCause = CalendarProviderFailureCause.ACCESS,
+) : RuntimeException(cause)
 
 internal interface OwnedCalendarProviderGateway {
     fun resolveOwned(profileEmail: String): OwnedCalendarResolution
@@ -70,7 +86,7 @@ internal interface OwnedCalendarProviderGateway {
         syncIds: Set<String>,
     ): List<ExistingProviderEvent>
 
-    fun applyBatch(plan: CalendarProviderBatchPlan)
+    fun applySubBatch(subBatch: CalendarProviderSubBatch): CalendarProviderSubBatchResult
 }
 
 internal object OwnedCalendarRecreationPolicy {
@@ -231,6 +247,8 @@ public class AndroidOwnedCalendarAdapter internal constructor(
             )
         var stage = DiagnosticStage.OWNERSHIP
         var attemptedOperations: Int? = null
+        var confirmedOperations = 0
+        var activeSubBatch: CalendarProviderSubBatch? = null
         return try {
             val owned = callCalendarProvider { gateway.resolveOwned(profile.email) }
             diagnostics.emit(
@@ -268,8 +286,54 @@ public class AndroidOwnedCalendarAdapter internal constructor(
             stage = DiagnosticStage.PROVIDER_BATCH
             val batchPlan = CalendarProviderBatchPlanner.plan(pagePlan, timeZoneResolver)
             attemptedOperations = batchPlan.operations.size
-            if (!isFenceCurrent(fence)) return LocalPageOutcome.Obsolete
-            callCalendarProvider { gateway.applyBatch(batchPlan) }
+            batchPlan.attendeeSuppressions.forEach { suppression ->
+                diagnostics.emit(
+                    DeviceDiagnosticEvent(
+                        severity = DiagnosticSeverity.INFO,
+                        component = DiagnosticComponent.CALENDAR,
+                        stage = DiagnosticStage.ATTENDEE_SUPPRESSION,
+                        operation = operation,
+                        outcome = "suppressed",
+                        attendeeLimit = MAX_MATERIALIZED_NON_ORGANIZER_ATTENDEES,
+                        attendeeInputCount = suppression.inputCount,
+                        attendeeOmittedCount = suppression.inputCount,
+                        attendeeRepresentation =
+                            if (suppression.organizerRetained) {
+                                DiagnosticAttendeeRepresentation.ORGANIZER_ONLY
+                            } else {
+                                DiagnosticAttendeeRepresentation.EMPTY
+                            },
+                    ),
+                )
+            }
+            val cursor = CalendarProviderSubBatchCursor(batchPlan)
+            while (true) {
+                val subBatch = cursor.next() ?: break
+                currentCoroutineContext().ensureActive()
+                if (!isFenceCurrent(fence)) return LocalPageOutcome.Obsolete
+                activeSubBatch = subBatch
+                val result = callCalendarProvider { gateway.applySubBatch(subBatch) }
+                cursor.record(result)
+                confirmedOperations += result.appliedOperationCount
+                diagnostics.emit(
+                    DeviceDiagnosticEvent(
+                        severity = DiagnosticSeverity.INFO,
+                        component = DiagnosticComponent.CALENDAR,
+                        stage = DiagnosticStage.PROVIDER_BATCH,
+                        operation = operation,
+                        attemptedOperationCount = subBatch.operations.size,
+                        appliedOperationCount = result.appliedOperationCount,
+                        providerOperationCount = subBatch.totalOperationCount,
+                        subBatchCount = subBatch.totalSubBatchCount,
+                        subBatchOrdinal = subBatch.ordinal,
+                        subBatchOperationCount = subBatch.operations.size,
+                        confirmedOperationCount = confirmedOperations,
+                        providerCallOutcome = DiagnosticProviderCallOutcome.CONFIRMED,
+                        outcome = "success",
+                    ),
+                )
+                activeSubBatch = null
+            }
             diagnostics.emit(
                 DeviceDiagnosticEvent(
                     severity = DiagnosticSeverity.INFO,
@@ -277,8 +341,15 @@ public class AndroidOwnedCalendarAdapter internal constructor(
                     stage = DiagnosticStage.PROVIDER_BATCH,
                     operation = operation,
                     attemptedOperationCount = attemptedOperations,
-                    appliedOperationCount = attemptedOperations,
-                    outcome = "success",
+                    appliedOperationCount = confirmedOperations,
+                    providerOperationCount = attemptedOperations,
+                    subBatchCount =
+                        (attemptedOperations + MAX_PROVIDER_OPERATIONS_PER_SUB_BATCH - 1) /
+                            MAX_PROVIDER_OPERATIONS_PER_SUB_BATCH,
+                    confirmedOperationCount = confirmedOperations,
+                    providerCallOutcome =
+                        DiagnosticProviderCallOutcome.CONFIRMED.takeIf { attemptedOperations > 0 },
+                    outcome = "page_success",
                 ),
             )
             LocalPageOutcome.Applied
@@ -289,6 +360,9 @@ public class AndroidOwnedCalendarAdapter internal constructor(
                 SyncProblem.CALENDAR_PROVIDER,
                 failure,
                 attemptedOperationCount = attemptedOperations ?: 0,
+                appliedOperationCount = confirmedOperations,
+                activeSubBatch = activeSubBatch,
+                confirmedOperationCount = confirmedOperations,
             )
             LocalPageOutcome.TransactionTooLarge
         } catch (failure: CalendarMirrorResetRequiredException) {
@@ -354,6 +428,9 @@ public class AndroidOwnedCalendarAdapter internal constructor(
                 SyncProblem.CALENDAR_PROVIDER,
                 failure,
                 attemptedOperationCount = attemptedOperations ?: 0,
+                appliedOperationCount = confirmedOperations,
+                activeSubBatch = activeSubBatch,
+                confirmedOperationCount = confirmedOperations,
             )
             LocalPageOutcome.Failed(SyncProblem.CALENDAR_PROVIDER)
         } catch (failure: SecurityException) {
@@ -364,6 +441,9 @@ public class AndroidOwnedCalendarAdapter internal constructor(
                 problem,
                 failure,
                 attemptedOperationCount = attemptedOperations ?: 0,
+                appliedOperationCount = confirmedOperations,
+                activeSubBatch = activeSubBatch,
+                confirmedOperationCount = confirmedOperations,
             )
             LocalPageOutcome.Failed(problem)
         }
@@ -379,6 +459,9 @@ public class AndroidOwnedCalendarAdapter internal constructor(
         acceptedCount: Int? = null,
         rejectedCount: Int? = null,
         attemptedOperationCount: Int? = null,
+        appliedOperationCount: Int? = null,
+        activeSubBatch: CalendarProviderSubBatch? = null,
+        confirmedOperationCount: Int? = null,
         cleanupTrigger: CleanupTrigger? = null,
     ) {
         diagnostics.emit(
@@ -393,8 +476,25 @@ public class AndroidOwnedCalendarAdapter internal constructor(
                 inputCount = inputCount,
                 acceptedCount = acceptedCount,
                 rejectedCount = rejectedCount,
-                attemptedOperationCount = attemptedOperationCount,
-                appliedOperationCount = attemptedOperationCount?.let { 0 },
+                attemptedOperationCount = activeSubBatch?.operations?.size ?: attemptedOperationCount,
+                appliedOperationCount = appliedOperationCount ?: attemptedOperationCount?.let { 0 },
+                providerOperationCount = activeSubBatch?.totalOperationCount,
+                subBatchCount = activeSubBatch?.totalSubBatchCount,
+                subBatchOrdinal = activeSubBatch?.ordinal,
+                subBatchOperationCount = activeSubBatch?.operations?.size,
+                confirmedOperationCount = confirmedOperationCount,
+                providerCallOutcome = activeSubBatch?.let { DiagnosticProviderCallOutcome.UNKNOWN },
+                providerFailureCause =
+                    activeSubBatch?.let {
+                        when (throwable) {
+                            is CalendarProviderTransactionTooLargeException ->
+                                DiagnosticProviderFailureCause.TRANSACTION_TOO_LARGE
+                            is CalendarProviderAccessException ->
+                                DiagnosticProviderFailureCause.valueOf(throwable.failureCause.name)
+                            is SecurityException -> DiagnosticProviderFailureCause.SECURITY
+                            else -> DiagnosticProviderFailureCause.ACCESS
+                        }
+                    },
                 cleanupTrigger = cleanupTrigger,
                 outcome = "failure",
                 throwable = throwable,
@@ -443,7 +543,7 @@ public class AndroidOwnedCalendarAdapter internal constructor(
         } catch (failure: OwnedCalendarProviderException) {
             throw failure
         } catch (failure: RuntimeException) {
-            throw CalendarProviderAccessException(failure)
+            throw CalendarProviderAccessException(failure, CalendarProviderFailureCause.UNEXPECTED)
         }
 
     private fun RemoteCalendarPage.indexOfServerId(serverId: String): Int =
@@ -465,6 +565,8 @@ private class AndroidOwnedCalendarProviderGateway(
     private val contentResolver: ContentResolver,
 ) : OwnedCalendarProviderGateway {
     private val resolver = OwnedCalendarResolver(AndroidOwnedCalendarStore(contentResolver))
+    private val subBatchGateway =
+        AndroidCalendarProviderSubBatchGateway(AndroidContentResolverBatchExecutor(contentResolver))
 
     override fun resolveOwned(profileEmail: String): OwnedCalendarResolution = resolver.resolve(profileEmail)
 
@@ -603,158 +705,8 @@ private class AndroidOwnedCalendarProviderGateway(
         }
     }
 
-    override fun applyBatch(plan: CalendarProviderBatchPlan) {
-        val operations = ArrayList<ContentProviderOperation>(plan.operations.size)
-        plan.operations.forEach { operation -> operations += operation.toAndroidOperation() }
-        try {
-            contentResolver.applyBatch(CalendarContract.AUTHORITY, operations)
-        } catch (_: TransactionTooLargeException) {
-            throw CalendarProviderTransactionTooLargeException()
-        } catch (error: RemoteException) {
-            throw CalendarProviderAccessException(error)
-        } catch (error: android.content.OperationApplicationException) {
-            throw CalendarProviderAccessException(error)
-        } catch (error: OperationCanceledException) {
-            throw CalendarProviderAccessException(error)
-        } catch (error: IllegalArgumentException) {
-            throw CalendarProviderAccessException(error)
-        }
-    }
-
-    private fun CalendarProviderBatchOperation.toAndroidOperation(): ContentProviderOperation =
-        when (this) {
-            is CalendarProviderBatchOperation.EventInsert ->
-                ContentProviderOperation.newInsert(syncAdapterUri(Events.CONTENT_URI))
-                    .withValues(values.toContentValues().withCalendar(calendarId))
-                    .build()
-            is CalendarProviderBatchOperation.EventUpdate ->
-                ContentProviderOperation.newUpdate(syncAdapterUri(Events.CONTENT_URI))
-                    .withSelection(
-                        "${BaseColumns._ID}=? AND ${Events.CALENDAR_ID}=?",
-                        arrayOf(eventId.toString(), calendarId.toString()),
-                    )
-                    .withValues(values.toContentValues())
-                    .withExpectedCount(1)
-                    .build()
-            is CalendarProviderBatchOperation.EventDelete ->
-                ContentProviderOperation.newDelete(syncAdapterUri(Events.CONTENT_URI))
-                    .withSelection(
-                        "${Events.CALENDAR_ID}=? AND ${Events._SYNC_ID}=?",
-                        arrayOf(calendarId.toString(), syncId),
-                    )
-                    .build()
-            is CalendarProviderBatchOperation.AttendeesDelete ->
-                ContentProviderOperation.newDelete(syncAdapterUri(Attendees.CONTENT_URI))
-                    .withSelection(
-                        "${Attendees.EVENT_ID}=? AND ${Attendees.ATTENDEE_RELATIONSHIP}<>?",
-                        arrayOf(eventId.toString(), Attendees.RELATIONSHIP_ORGANIZER.toString()),
-                    )
-                    .build()
-            is CalendarProviderBatchOperation.OrganizerDelete ->
-                ContentProviderOperation.newDelete(syncAdapterUri(Attendees.CONTENT_URI))
-                    .withOrganizerSelection(event)
-                    .build()
-            is CalendarProviderBatchOperation.AttendeeInsert ->
-                ContentProviderOperation.newInsert(syncAdapterUri(Attendees.CONTENT_URI))
-                    .withValues(values.toContentValues())
-                    .withEventValue(Attendees.EVENT_ID, event)
-                    .build()
-            is CalendarProviderBatchOperation.RemindersDelete ->
-                ContentProviderOperation.newDelete(syncAdapterUri(Reminders.CONTENT_URI))
-                    .withEventSelection(event, "${Reminders.EVENT_ID}=?", 0)
-                    .build()
-            is CalendarProviderBatchOperation.ReminderInsert ->
-                ContentProviderOperation.newInsert(syncAdapterUri(Reminders.CONTENT_URI))
-                    .withValues(values.toContentValues())
-                    .withEventValue(Reminders.EVENT_ID, event)
-                    .build()
-            is CalendarProviderBatchOperation.ExceptionsDelete ->
-                ContentProviderOperation.newDelete(syncAdapterUri(Events.CONTENT_URI))
-                    .withSelection(
-                        "${Events.CALENDAR_ID}=? AND ${Events.ORIGINAL_ID}=?",
-                        arrayOf(calendarId.toString(), seriesId.toString()),
-                    )
-                    .build()
-            is CalendarProviderBatchOperation.ExceptionInsert ->
-                ContentProviderOperation.newInsert(syncAdapterUri(Events.CONTENT_URI))
-                    .withValues(values.toContentValues().withCalendar(calendarId))
-                    .withEventValue(Events.ORIGINAL_ID, series)
-                    .build()
-            is CalendarProviderBatchOperation.ExceptionResponseUpdate ->
-                ContentProviderOperation.newUpdate(syncAdapterUri(Events.CONTENT_URI))
-                    .withSelection(
-                        "${Events.CALENDAR_ID}=? AND ${Events.ORIGINAL_ID}=? AND " +
-                            "${CalendarProviderField.ORIGINAL_INSTANCE_TIME}=?",
-                        arrayOf(
-                            calendarId.toString(),
-                            seriesId.toString(),
-                            originalInstance.toEpochMilli().toString(),
-                        ),
-                    )
-                    .withValues(values.toContentValues())
-                    .withExpectedCount(1)
-                    .build()
-        }
-
-    private fun ContentProviderOperation.Builder.withEventValue(
-        column: String,
-        reference: EventReference,
-    ): ContentProviderOperation.Builder =
-        when (reference) {
-            is EventReference.Existing -> withValue(column, reference.eventId)
-            is EventReference.Inserted -> withValueBackReference(column, reference.operationIndex)
-        }
-
-    private fun ContentProviderOperation.Builder.withEventSelection(
-        reference: EventReference,
-        selection: String,
-        argumentIndex: Int,
-    ): ContentProviderOperation.Builder =
-        when (reference) {
-            is EventReference.Existing -> withSelection(selection, arrayOf(reference.eventId.toString()))
-            is EventReference.Inserted ->
-                withSelection(selection, arrayOf("0"))
-                    .withSelectionBackReference(argumentIndex, reference.operationIndex)
-        }
-
-    private fun ContentProviderOperation.Builder.withOrganizerSelection(
-        reference: EventReference,
-    ): ContentProviderOperation.Builder =
-        when (reference) {
-            is EventReference.Existing ->
-                withSelection(
-                    "${Attendees.EVENT_ID}=? AND ${Attendees.ATTENDEE_RELATIONSHIP}=?",
-                    arrayOf(reference.eventId.toString(), Attendees.RELATIONSHIP_ORGANIZER.toString()),
-                )
-            is EventReference.Inserted ->
-                withSelection(
-                    "${Attendees.EVENT_ID}=? AND ${Attendees.ATTENDEE_RELATIONSHIP}=?",
-                    arrayOf("0", Attendees.RELATIONSHIP_ORGANIZER.toString()),
-                ).withSelectionBackReference(0, reference.operationIndex)
-        }
-
-    private fun syncAdapterUri(uri: android.net.Uri): android.net.Uri =
-        uri.buildUpon()
-            .appendQueryParameter(CalendarContract.CALLER_IS_SYNCADAPTER, "true")
-            .appendQueryParameter(Calendars.ACCOUNT_NAME, OwnedCalendarIdentity.ACCOUNT_NAME)
-            .appendQueryParameter(Calendars.ACCOUNT_TYPE, OwnedCalendarIdentity.ACCOUNT_TYPE)
-            .build()
-
-    private fun Map<String, Any?>.toContentValues(): ContentValues =
-        ContentValues(size).apply {
-            this@toContentValues.forEach { (key, value) ->
-                when (value) {
-                    null -> putNull(key)
-                    is String -> put(key, value)
-                    is Int -> put(key, value)
-                    is Long -> put(key, value)
-                    else -> throw CalendarProviderAccessException()
-                }
-            }
-        }
-
-    private fun ContentValues.withCalendar(calendarId: Long): ContentValues =
-        apply { put(Events.CALENDAR_ID, calendarId) }
+    override fun applySubBatch(subBatch: CalendarProviderSubBatch): CalendarProviderSubBatchResult =
+        subBatchGateway.apply(subBatch)
 
     private companion object {
         val EVENT_IDENTITY_PROJECTION =

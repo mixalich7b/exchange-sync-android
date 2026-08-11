@@ -131,6 +131,107 @@ class CalendarProviderBatchPlannerTest {
     }
 
     @Test
+    fun `top-level attendee materialization preserves one hundred and suppresses all one hundred one`() {
+        val batches =
+            listOf(100, 101).associateWith { count ->
+                CalendarProviderBatchPlanner.plan(
+                    plan(
+                        ActiveSyncCalendarMutation.Upsert(
+                            baseItem().copy(
+                                organizerEmail = ActiveSyncField.Value("owner@example.test"),
+                                organizerName = ActiveSyncField.Value("Owner"),
+                                attendees = ActiveSyncField.Value(attendees(count)),
+                            ),
+                            isAddition = true,
+                        ),
+                    ),
+                    FixedTimeZoneResolver("UTC"),
+                )
+            }
+
+        assertEquals(100, batches.getValue(100).nonOrganizerAttendeeInserts().size)
+        assertEquals(0, batches.getValue(101).nonOrganizerAttendeeInserts().size)
+        assertEquals(1, batches.getValue(101).organizerAttendeeInserts().size)
+    }
+
+    @Test
+    fun `oversized attendee list without organizer emits no attendee representation`() {
+        val batch =
+            CalendarProviderBatchPlanner.plan(
+                plan(
+                    ActiveSyncCalendarMutation.Upsert(
+                        baseItem().copy(attendees = ActiveSyncField.Value(attendees(101))),
+                        isAddition = true,
+                    ),
+                ),
+                FixedTimeZoneResolver("UTC"),
+            )
+
+        val eventInsert = batch.operations.first() as CalendarProviderBatchOperation.EventInsert
+        assertEquals(0, eventInsert.values[CalendarProviderField.HAS_ATTENDEE_DATA])
+        assertTrue(batch.operations.none { it is CalendarProviderBatchOperation.AttendeeInsert })
+    }
+
+    @Test
+    fun `attendee replacement removes a prior small list when it grows and restores a later bounded list`() {
+        val organizerFields =
+            baseItem().copy(
+                organizerEmail = ActiveSyncField.Value("owner@example.test"),
+                organizerName = ActiveSyncField.Value("Owner"),
+            )
+        val smallPrevious = organizerFields.copy(attendees = ActiveSyncField.Value(attendees(2)))
+        val growBatch = replacementBatch(smallPrevious, attendees(101))
+        val oversizedPrevious = organizerFields.copy(attendees = ActiveSyncField.Value(attendees(101)))
+        val shrinkBatch = replacementBatch(oversizedPrevious, attendees(100))
+
+        assertTrue(growBatch.operations.contains(CalendarProviderBatchOperation.AttendeesDelete(OWNED_CALENDAR, EVENT_ID)))
+        assertEquals(0, growBatch.nonOrganizerAttendeeInserts().size)
+        assertEquals(1, (growBatch.operations.first() as CalendarProviderBatchOperation.EventUpdate)
+            .values[CalendarProviderField.HAS_ATTENDEE_DATA])
+        assertTrue(shrinkBatch.operations.contains(CalendarProviderBatchOperation.AttendeesDelete(OWNED_CALENDAR, EVENT_ID)))
+        assertEquals(100, shrinkBatch.nonOrganizerAttendeeInserts().size)
+    }
+
+    @Test
+    fun `recurrence exceptions apply the attendee limit independently including inherited attendees`() {
+        val firstInstance = Instant.parse("2026-08-16T09:00:00Z")
+        val inheritedInstance = Instant.parse("2026-08-17T09:00:00Z")
+        val item =
+            baseItem().copy(
+                organizerEmail = ActiveSyncField.Value("owner@example.test"),
+                attendees = ActiveSyncField.Value(attendees(101)),
+                recurrence = ActiveSyncField.Value(dailyRecurrence()),
+                exceptions =
+                    ActiveSyncField.Value(
+                        listOf(
+                            ActiveSyncCalendarException(
+                                instanceStart = firstInstance,
+                                deleted = false,
+                                attendees = ActiveSyncField.Value(attendees(100)),
+                            ),
+                            ActiveSyncCalendarException(
+                                instanceStart = inheritedInstance,
+                                deleted = false,
+                            ),
+                        ),
+                    ),
+            )
+
+        val batch =
+            CalendarProviderBatchPlanner.plan(
+                plan(ActiveSyncCalendarMutation.Upsert(item, isAddition = true)),
+                FixedTimeZoneResolver("UTC"),
+            )
+        val exceptions = batch.operations.withIndex()
+            .filter { (_, operation) -> operation is CalendarProviderBatchOperation.ExceptionInsert }
+
+        assertEquals(2, exceptions.size)
+        assertEquals(100, batch.attendeeInsertsFor(EventReference.Inserted(exceptions[0].index)).size)
+        assertEquals(0, batch.attendeeInsertsFor(EventReference.Inserted(exceptions[1].index)).size)
+        assertEquals(0, batch.nonOrganizerAttendeeInserts().count { it.event == EventReference.Inserted(0) })
+    }
+
+    @Test
     fun `timed exception of all-day series keeps original marker and timed row semantics`() {
         val originalInstance = Instant.parse("2026-08-11T00:00:00Z")
         val item =
@@ -395,6 +496,63 @@ class CalendarProviderBatchPlannerTest {
 
     private fun plan(mutation: ActiveSyncCalendarMutation): CalendarPagePlan =
         CalendarPagePlanner.plan(page(mutation), resolution(), emptyList())
+
+    private fun replacementBatch(
+        previousItem: ActiveSyncCalendarItem,
+        replacementAttendees: List<ActiveSyncAttendee>,
+    ): CalendarProviderBatchPlan {
+        val previous =
+            (net.mixalich7b.exchangesync.core.calendar.CalendarEventMapper.map(
+                ActiveSyncCalendarMutation.Upsert(previousItem, isAddition = true),
+                resolution().color,
+            ) as net.mixalich7b.exchangesync.core.calendar.ProviderCalendarMutation.Upsert).event
+        val change =
+            ActiveSyncCalendarMutation.Upsert(
+                ActiveSyncCalendarItem(
+                    serverId = previousItem.serverId,
+                    attendees = ActiveSyncField.Value(replacementAttendees),
+                ),
+                isAddition = false,
+            )
+        val pagePlan =
+            CalendarPagePlanner.plan(
+                page(change),
+                resolution(),
+                listOf(ExistingProviderEvent(EVENT_ID, OWNED_CALENDAR, previousItem.serverId, previous)),
+            )
+        return CalendarProviderBatchPlanner.plan(pagePlan, FixedTimeZoneResolver("UTC"))
+    }
+
+    private fun attendees(count: Int): List<ActiveSyncAttendee> =
+        List(count) { index ->
+            ActiveSyncAttendee(
+                email = "guest-$index@example.test",
+                name = "Guest $index",
+                status = ActiveSyncAttendeeStatus.ACCEPTED,
+                type = ActiveSyncAttendeeType.REQUIRED,
+            )
+        }
+
+    private fun CalendarProviderBatchPlan.nonOrganizerAttendeeInserts():
+        List<CalendarProviderBatchOperation.AttendeeInsert> =
+        operations.filterIsInstance<CalendarProviderBatchOperation.AttendeeInsert>()
+            .filter { operation ->
+                operation.values[CalendarProviderField.ATTENDEE_RELATIONSHIP] ==
+                    ProviderInteger.ATTENDEE_RELATIONSHIP
+            }
+
+    private fun CalendarProviderBatchPlan.organizerAttendeeInserts():
+        List<CalendarProviderBatchOperation.AttendeeInsert> =
+        operations.filterIsInstance<CalendarProviderBatchOperation.AttendeeInsert>()
+            .filter { operation ->
+                operation.values[CalendarProviderField.ATTENDEE_RELATIONSHIP] ==
+                    ProviderInteger.ORGANIZER_RELATIONSHIP
+            }
+
+    private fun CalendarProviderBatchPlan.attendeeInsertsFor(
+        reference: EventReference,
+    ): List<CalendarProviderBatchOperation.AttendeeInsert> =
+        nonOrganizerAttendeeInserts().filter { operation -> operation.event == reference }
 
     private fun page(vararg mutations: ActiveSyncCalendarMutation): RemoteCalendarPage =
         RemoteCalendarPage(mutations.toList(), SyncCheckpoints.EMPTY, moreAvailable = false)

@@ -5,7 +5,9 @@
 Реализованы настройка единственного профиля Exchange, проверка HTTPS/mTLS и
 совместимости ActiveSync, а также одностороннее зеркало основного календаря
 Exchange в отдельный локальный календарь Android. Синхронизация переносит
-историю и будущие события, напоминания, attendees, recurrence и exceptions.
+историю и будущие события, напоминания, recurrence и exceptions. Attendees
+материализуются полностью до 100 non-organizer rows; при превышении порога они
+опускаются все, а organizer сохраняется отдельно.
 Непринятые приглашения сохраняются как tentative и получают бледный
 event-color override; после принятия та же запись обновляется без смены
 ServerId identity и без дубликата.
@@ -114,11 +116,14 @@ ViewModel хранит private snapshot последнего загруженн�
 результат не может быть показан для другого draft.
 
 Provider mutations и изменения generation/run token сериализуются общим
-`SynchronizationMutationLock`. Поэтому старый worker либо завершает атомарный
-Calendar Provider batch до profile/cancel/disable fence, либо после fence
-становится obsolete до `resolveOwned`, cleanup или `applyBatch`. Calendar page
-фиксируется provider-first; новый SyncKey сохраняется только после успешного
-batch, поэтому повтор после crash идемпотентен по ServerId.
+`SynchronizationMutationLock` на всю Calendar page. Упорядоченный provider plan
+применяется атомарными вызовами не более чем по 50 операций; перед каждым
+вызовом повторно проверяются cancellation и fence. Поэтому старый worker не
+начинает следующий sub-batch, `resolveOwned` или cleanup после
+profile/cancel/disable fence. Уже подтверждённый префикс page может быть видим
+после поздней или неоднозначной ошибки, но новый SyncKey сохраняется только
+после всех sub-batches. Повтор страницы идемпотентен по ServerId и сходится без
+дубликатов parent/child rows.
 
 Получение материала из KeyChain и создание TLS transport выполняются вне Main
 dispatcher. Создание trust managers, `SSLContext` и OkHttp-клиента синхронно и
@@ -157,7 +162,9 @@ Process-local cookie/capability sessions и структурированные d
 тегом `ExchangeSync`; приложение не создаёт архив, экран просмотра или канал
 upload. Корреляция сетевых, protocol, provider и worker boundaries выполняется
 process-local operation ID и, для sync, generation/run token. Безопасные поля и
-ADB-команды описаны в [диагностике](diagnostics.md).
+ADB-команды описаны в [диагностике](diagnostics.md). Отдельные узкие records
+показывают только агрегаты attendee suppression и provider sub-batch progress;
+event identity, provider row IDs, SyncKey и payload туда не попадают.
 
 ## Проверка реализации
 
