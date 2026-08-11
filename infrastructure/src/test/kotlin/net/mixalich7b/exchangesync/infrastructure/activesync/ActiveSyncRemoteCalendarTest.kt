@@ -18,12 +18,17 @@ import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.ActiveSyncWbx
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.ActiveSyncWbxmlTokens.Calendar
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.ActiveSyncWbxmlTokens.FolderHierarchy
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlElement
+import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlLimits
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlReader
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlTag
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlWriter
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnosticEvent
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCapacityKind
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCapacityOutcome
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticActiveSyncCommand
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.FolderPreparationOutcome
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.SyncRequestMode
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -342,7 +347,7 @@ class ActiveSyncRemoteCalendarTest {
 
             assertTrue(outcome is RemotePageOutcome.Page)
             assertTrue(continuation is RemotePageOutcome.Page)
-            assertEquals(listOf("OPTIONS", "FolderSync", "Sync", "FolderSync", "Sync"), calls)
+            assertEquals(listOf("OPTIONS", "FolderSync", "Sync", "Sync"), calls)
             assertEquals(ActiveSyncVersion.V14_1, sessions.acquire(profile()).liveCapability()?.version)
         }
 
@@ -649,13 +654,496 @@ class ActiveSyncRemoteCalendarTest {
             )
         }
 
+    @Test
+    fun `page-scaled WBXML capacity maps Calendar Sync to window too large`() =
+        runBlocking {
+            val events = mutableListOf<DeviceDiagnosticEvent>()
+            listOf(documentCapacityResponse(), elementCapacityResponse()).forEach { capacityResponse ->
+                val remote =
+                    ActiveSyncRemoteCalendar(
+                        capabilities = ActiveSyncCapabilityGateway { error("Saved capability must be reused") },
+                        commands =
+                            ActiveSyncCommandGateway { _, endpoint, command, _, _, _ ->
+                                ActiveSyncCommandOutcome.Success(
+                                    endpoint,
+                                    if (command == ActiveSyncCommand.FOLDER_SYNC) {
+                                        emptyFolderResponse("new-folder-key")
+                                    } else {
+                                        capacityResponse
+                                    },
+                                )
+                            },
+                        sessions = liveSessions(ActiveSyncVersion.V16_1),
+                        diagnostics = DeviceDiagnostics { event -> events += event },
+                    )
+
+                assertEquals(
+                    RemotePageOutcome.Failure(SyncFailureKind.WINDOW_TOO_LARGE, null),
+                    remote.fetchPage(request(fullSync = false, checkpoints = persistedCheckpoints())),
+                )
+            }
+            assertEquals(
+                listOf(
+                    DiagnosticCapacityKind.WBXML_DOCUMENT_BYTES,
+                    DiagnosticCapacityKind.WBXML_ELEMENT_COUNT,
+                ),
+                events.mapNotNull { event -> event.capacityKind },
+            )
+        }
+
+    @Test
+    fun `HTTP response capacity emits typed window recovery diagnostics`() =
+        runBlocking {
+            val events = mutableListOf<DeviceDiagnosticEvent>()
+            val remote =
+                ActiveSyncRemoteCalendar(
+                    capabilities = ActiveSyncCapabilityGateway { error("Saved capability must be reused") },
+                    commands =
+                        ActiveSyncCommandGateway { _, endpoint, command, _, _, _ ->
+                            if (command == ActiveSyncCommand.FOLDER_SYNC) {
+                                ActiveSyncCommandOutcome.Success(endpoint, emptyFolderResponse("new-folder-key"))
+                            } else {
+                                ActiveSyncCommandOutcome.Failure(
+                                    SyncFailureKind.WINDOW_TOO_LARGE,
+                                    null,
+                                    ActiveSyncPageCapacityKind.HTTP_RESPONSE_BYTES,
+                                )
+                            }
+                        },
+                    sessions = liveSessions(ActiveSyncVersion.V16_1),
+                    diagnostics = DeviceDiagnostics { event -> events += event },
+                )
+
+            assertEquals(
+                RemotePageOutcome.Failure(SyncFailureKind.WINDOW_TOO_LARGE, null),
+                remote.fetchPage(request(false, persistedCheckpoints())),
+            )
+            assertEquals(
+                RemotePageOutcome.Failure(SyncFailureKind.WINDOW_TOO_LARGE, null),
+                remote.fetchPage(request(false, persistedCheckpoints().copy(windowSize = 1))),
+            )
+            val capacity = events.filter { event -> event.capacityKind != null }
+            assertEquals(
+                listOf(DiagnosticCapacityKind.HTTP_RESPONSE_BYTES, DiagnosticCapacityKind.HTTP_RESPONSE_BYTES),
+                capacity.map { event -> event.capacityKind },
+            )
+            assertTrue(capacity.all { event -> event.capacityCommand == DiagnosticActiveSyncCommand.SYNC })
+            assertEquals(
+                listOf(
+                    DiagnosticCapacityOutcome.WINDOW_REDUCTION,
+                    DiagnosticCapacityOutcome.MINIMUM_WINDOW_BLOCK,
+                ),
+                capacity.map { event -> event.capacityOutcome },
+            )
+            assertEquals(listOf(100, 1), capacity.map { event -> event.windowSize })
+            assertEquals(listOf(50, null), capacity.map { event -> event.reducedWindowSize })
+        }
+
+    @Test
+    fun `WBXML capacity during FolderSync remains a critical protocol outcome`() =
+        runBlocking {
+            listOf(documentCapacityResponse(), elementCapacityResponse()).forEach { capacityResponse ->
+                val remote =
+                    ActiveSyncRemoteCalendar(
+                        capabilities = ActiveSyncCapabilityGateway { error("Saved capability must be reused") },
+                        commands =
+                            ActiveSyncCommandGateway { _, endpoint, command, _, _, _ ->
+                                check(command == ActiveSyncCommand.FOLDER_SYNC)
+                                ActiveSyncCommandOutcome.Success(endpoint, capacityResponse)
+                            },
+                        sessions = liveSessions(ActiveSyncVersion.V16_1),
+                    )
+
+                assertEquals(
+                    RemotePageOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.PROTOCOL_DATA),
+                    remote.fetchPage(request(fullSync = false, checkpoints = persistedCheckpoints())),
+                )
+            }
+        }
+
+    @Test
+    fun `non-page-scaled Calendar WBXML limits remain critical protocol outcomes`() =
+        runBlocking {
+            val events = mutableListOf<DeviceDiagnosticEvent>()
+            listOf(depthCapacityResponse(), inlineCapacityResponse()).forEach { capacityResponse ->
+                val remote =
+                    ActiveSyncRemoteCalendar(
+                        capabilities = ActiveSyncCapabilityGateway { error("Saved capability must be reused") },
+                        commands =
+                            ActiveSyncCommandGateway { _, endpoint, command, _, _, _ ->
+                                ActiveSyncCommandOutcome.Success(
+                                    endpoint,
+                                    if (command == ActiveSyncCommand.FOLDER_SYNC) {
+                                        emptyFolderResponse("new-folder-key")
+                                    } else {
+                                        capacityResponse
+                                    },
+                                )
+                            },
+                        sessions = liveSessions(ActiveSyncVersion.V16_1),
+                        diagnostics = DeviceDiagnostics { event -> events += event },
+                    )
+
+                assertEquals(
+                    RemotePageOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.PROTOCOL_DATA),
+                    remote.fetchPage(request(fullSync = false, checkpoints = persistedCheckpoints())),
+                )
+            }
+            assertEquals(
+                listOf(
+                    DiagnosticCapacityKind.WBXML_DEPTH,
+                    DiagnosticCapacityKind.WBXML_INLINE_STRING_BYTES,
+                ),
+                events.mapNotNull { event -> event.capacityKind },
+            )
+            assertTrue(
+                events.filter { event -> event.capacityKind != null }
+                    .all { event -> event.capacityOutcome == DiagnosticCapacityOutcome.TERMINAL },
+            )
+        }
+
+    @Test
+    fun `one prepared folder is reused across adaptive retry pages and continuation slices`() =
+        runBlocking {
+            var folderCalls = 0
+            var syncCalls = 0
+            val events = mutableListOf<DeviceDiagnosticEvent>()
+            val sessions = liveSessions(ActiveSyncVersion.V16_1)
+            val remote =
+                ActiveSyncRemoteCalendar(
+                    capabilities = ActiveSyncCapabilityGateway { error("Saved capability must be reused") },
+                    commands =
+                        ActiveSyncCommandGateway { _, endpoint, command, _, _, _ ->
+                            when (command) {
+                                ActiveSyncCommand.FOLDER_SYNC -> {
+                                    folderCalls += 1
+                                    ActiveSyncCommandOutcome.Success(endpoint, emptyFolderResponse("folder-key-2"))
+                                }
+                                ActiveSyncCommand.SYNC -> {
+                                    syncCalls += 1
+                                    ActiveSyncCommandOutcome.Success(
+                                        endpoint,
+                                        when (syncCalls) {
+                                            1 -> elementCapacityResponse()
+                                            2 -> calendarResponse("known-primary", "calendar-key-2", moreAvailable = true)
+                                            else -> emptyCalendarResponse("known-primary", "calendar-key-3")
+                                        },
+                                    )
+                                }
+                            }
+                        },
+                    sessions = sessions,
+                    diagnostics = DeviceDiagnostics { event -> events += event },
+                )
+            val firstCheckpoints = persistedCheckpoints()
+
+            assertEquals(
+                RemotePageOutcome.Failure(SyncFailureKind.WINDOW_TOO_LARGE, null),
+                remote.fetchPage(request(fullSync = false, checkpoints = firstCheckpoints)),
+            )
+            val second =
+                remote.fetchPage(
+                    request(
+                        fullSync = false,
+                        checkpoints = firstCheckpoints.copy(windowSize = 50),
+                    ),
+                ) as RemotePageOutcome.Page
+            val third =
+                remote.fetchPage(request(fullSync = false, checkpoints = second.page.nextCheckpoints))
+                    as RemotePageOutcome.Page
+
+            assertTrue(second.page.moreAvailable)
+            assertFalse(third.page.moreAvailable)
+            assertEquals(1, folderCalls)
+            assertEquals(
+                listOf(
+                    FolderPreparationOutcome.COLD_REFRESH,
+                    FolderPreparationOutcome.REUSE,
+                    FolderPreparationOutcome.REUSE,
+                ),
+                events.mapNotNull { event -> event.folderPreparationOutcome },
+            )
+        }
+
+    @Test
+    fun `failed folder refresh still emits its bounded preparation reason`() =
+        runBlocking {
+            val events = mutableListOf<DeviceDiagnosticEvent>()
+            val remote =
+                ActiveSyncRemoteCalendar(
+                    capabilities = ActiveSyncCapabilityGateway { error("Saved capability must be reused") },
+                    commands =
+                        ActiveSyncCommandGateway { _, _, command, _, _, _ ->
+                            check(command == ActiveSyncCommand.FOLDER_SYNC)
+                            ActiveSyncCommandOutcome.Failure(SyncFailureKind.TRANSIENT, null)
+                        },
+                    sessions = liveSessions(ActiveSyncVersion.V16_1),
+                    diagnostics = DeviceDiagnostics { event -> events += event },
+                )
+
+            assertEquals(
+                RemotePageOutcome.Failure(SyncFailureKind.TRANSIENT, null),
+                remote.fetchPage(request(false, persistedCheckpoints())),
+            )
+            assertEquals(
+                listOf(FolderPreparationOutcome.COLD_REFRESH),
+                events.mapNotNull { event -> event.folderPreparationOutcome },
+            )
+        }
+
+    @Test
+    fun `element capacity diagnostics request window recovery without malformed classification`() =
+        runBlocking {
+            val events = mutableListOf<DeviceDiagnosticEvent>()
+            val remote =
+                ActiveSyncRemoteCalendar(
+                    capabilities = ActiveSyncCapabilityGateway { error("Saved capability must be reused") },
+                    commands =
+                        ActiveSyncCommandGateway { _, endpoint, command, _, _, _ ->
+                            ActiveSyncCommandOutcome.Success(
+                                endpoint,
+                                if (command == ActiveSyncCommand.FOLDER_SYNC) {
+                                    emptyFolderResponse("folder-key-2")
+                                } else {
+                                    elementCapacityResponse()
+                                },
+                            )
+                        },
+                    sessions = liveSessions(ActiveSyncVersion.V16_1),
+                    diagnostics = DeviceDiagnostics { event -> events += event },
+                )
+
+            assertEquals(
+                RemotePageOutcome.Failure(SyncFailureKind.WINDOW_TOO_LARGE, null),
+                remote.fetchPage(request(false, persistedCheckpoints())),
+            )
+            val capacity = events.single { event -> event.capacityKind != null }
+            assertEquals(DiagnosticCapacityKind.WBXML_ELEMENT_COUNT, capacity.capacityKind)
+            assertEquals(DiagnosticCapacityOutcome.WINDOW_REDUCTION, capacity.capacityOutcome)
+            assertEquals(100, capacity.windowSize)
+            assertEquals(50, capacity.reducedWindowSize)
+            assertFalse(events.any { event -> event.reasonCode == "MALFORMED_WBXML" })
+        }
+
+    @Test
+    fun `genuinely malformed WBXML retains malformed protocol diagnostics`() =
+        runBlocking {
+            val events = mutableListOf<DeviceDiagnosticEvent>()
+            val remote =
+                ActiveSyncRemoteCalendar(
+                    capabilities = ActiveSyncCapabilityGateway { error("Saved capability must be reused") },
+                    commands =
+                        ActiveSyncCommandGateway { _, endpoint, command, _, _, _ ->
+                            ActiveSyncCommandOutcome.Success(
+                                endpoint,
+                                if (command == ActiveSyncCommand.FOLDER_SYNC) {
+                                    emptyFolderResponse("folder-key-2")
+                                } else {
+                                    byteArrayOf(0x02, 0x01, 0x6A, 0x00, 0x05)
+                                },
+                            )
+                        },
+                    sessions = liveSessions(ActiveSyncVersion.V16_1),
+                    diagnostics = DeviceDiagnostics { event -> events += event },
+                )
+
+            assertEquals(
+                RemotePageOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.PROTOCOL_DATA),
+                remote.fetchPage(request(false, persistedCheckpoints())),
+            )
+            assertTrue(events.any { event -> event.reasonCode == "MALFORMED_WBXML" })
+            assertFalse(events.any { event -> event.capacityKind != null })
+        }
+
+    @Test
+    fun `new run token and selected protocol version refresh prepared folder state`() =
+        runBlocking {
+            var folderCalls = 0
+            val events = mutableListOf<DeviceDiagnosticEvent>()
+            val sessions =
+                ActiveSyncProfileSessionRegistry().also { registry ->
+                    registry.acquire(profile()).recordCapability(
+                        ActiveSyncLiveCapability(
+                            endpoint(),
+                            ActiveSyncVersion.V16_1,
+                            setOf(ActiveSyncVersion.V14_1, ActiveSyncVersion.V16_1),
+                        ),
+                    )
+                }
+            val remote =
+                ActiveSyncRemoteCalendar(
+                    capabilities = ActiveSyncCapabilityGateway { error("Saved capability must be reused") },
+                    commands =
+                        ActiveSyncCommandGateway { _, endpoint, command, _, _, _ ->
+                            ActiveSyncCommandOutcome.Success(
+                                endpoint,
+                                if (command == ActiveSyncCommand.FOLDER_SYNC) {
+                                    folderCalls += 1
+                                    emptyFolderResponse("folder-key-$folderCalls")
+                                } else {
+                                    byteArrayOf()
+                                },
+                            )
+                        },
+                    sessions = sessions,
+                    diagnostics = DeviceDiagnostics { event -> events += event },
+                )
+
+            remote.fetchPage(request(false, persistedCheckpoints(), fence = SyncFence(3, 9)))
+            remote.fetchPage(request(false, persistedCheckpoints(), fence = SyncFence(3, 10)))
+            remote.fetchPage(
+                request(
+                    false,
+                    persistedCheckpoints(version = ActiveSyncVersion.V14_1),
+                    fence = SyncFence(3, 10),
+                ),
+            )
+
+            assertEquals(3, folderCalls)
+            assertEquals(
+                listOf(
+                    FolderPreparationOutcome.COLD_REFRESH,
+                    FolderPreparationOutcome.REFRESH,
+                    FolderPreparationOutcome.REFRESH,
+                ),
+                events.mapNotNull { event -> event.folderPreparationOutcome },
+            )
+        }
+
+    @Test
+    fun `invalid key clears prepared folder state before another request`() =
+        runBlocking {
+            var folderCalls = 0
+            var syncCalls = 0
+            val events = mutableListOf<DeviceDiagnosticEvent>()
+            val remote =
+                ActiveSyncRemoteCalendar(
+                    capabilities = ActiveSyncCapabilityGateway { error("Saved capability must be reused") },
+                    commands =
+                        ActiveSyncCommandGateway { _, endpoint, command, _, _, _ ->
+                            ActiveSyncCommandOutcome.Success(
+                                endpoint,
+                                if (command == ActiveSyncCommand.FOLDER_SYNC) {
+                                    folderCalls += 1
+                                    emptyFolderResponse("folder-key-$folderCalls")
+                                } else {
+                                    syncCalls += 1
+                                    if (syncCalls == 2) {
+                                        calendarStatusResponse("known-primary", "3")
+                                    } else {
+                                        byteArrayOf()
+                                    }
+                                },
+                            )
+                        },
+                    sessions = liveSessions(ActiveSyncVersion.V16_1),
+                    diagnostics = DeviceDiagnostics { event -> events += event },
+                )
+            val request = request(false, persistedCheckpoints())
+
+            assertTrue(remote.fetchPage(request) is RemotePageOutcome.Page)
+            assertEquals(
+                RemotePageOutcome.Failure(SyncFailureKind.INVALID_KEY, null),
+                remote.fetchPage(request),
+            )
+            assertTrue(remote.fetchPage(request) is RemotePageOutcome.Page)
+
+            assertEquals(2, folderCalls)
+            assertTrue(
+                events.any { event -> event.folderPreparationOutcome == FolderPreparationOutcome.INVALIDATED },
+            )
+        }
+
+    @Test
+    fun `full reset outcome clears prepared folder state`() =
+        runBlocking {
+            var folderCalls = 0
+            val sessions =
+                ActiveSyncProfileSessionRegistry().also { registry ->
+                    registry.acquire(profile()).recordCapability(
+                        ActiveSyncLiveCapability(
+                            endpoint(),
+                            ActiveSyncVersion.V16_1,
+                            setOf(ActiveSyncVersion.V14_1, ActiveSyncVersion.V16_1),
+                        ),
+                    )
+                }
+            val commands =
+                ActiveSyncCommandGateway { _, endpoint, command, _, _, _ ->
+                    ActiveSyncCommandOutcome.Success(
+                        endpoint,
+                        if (command == ActiveSyncCommand.FOLDER_SYNC) {
+                            folderCalls += 1
+                            emptyFolderResponse("folder-key-$folderCalls")
+                        } else {
+                            byteArrayOf()
+                        },
+                    )
+                }
+            val remote =
+                ActiveSyncRemoteCalendar(
+                    capabilities = ActiveSyncCapabilityGateway { error("Saved capability must be reused") },
+                    commands = commands,
+                    sessions = sessions,
+                )
+            val v14Request = request(false, persistedCheckpoints(ActiveSyncVersion.V14_1))
+
+            assertTrue(remote.fetchPage(v14Request) is RemotePageOutcome.Page)
+            sessions.acquire(profile()).recordCapability(
+                ActiveSyncLiveCapability(endpoint(), ActiveSyncVersion.V16_1, setOf(ActiveSyncVersion.V16_1)),
+            )
+            assertEquals(
+                RemotePageOutcome.Failure(SyncFailureKind.FULL_RESET_REQUIRED, null),
+                remote.fetchPage(v14Request),
+            )
+            sessions.acquire(profile()).recordCapability(
+                ActiveSyncLiveCapability(endpoint(), ActiveSyncVersion.V14_1, setOf(ActiveSyncVersion.V14_1)),
+            )
+            assertTrue(remote.fetchPage(v14Request) is RemotePageOutcome.Page)
+
+            assertEquals(2, folderCalls)
+        }
+
+    @Test
+    fun `explicit full reset invalidation forces folder preparation for the same fence`() =
+        runBlocking {
+            var folderCalls = 0
+            val sessions = liveSessions(ActiveSyncVersion.V16_1)
+            val remote =
+                ActiveSyncRemoteCalendar(
+                    capabilities = ActiveSyncCapabilityGateway { error("Saved capability must be reused") },
+                    commands =
+                        ActiveSyncCommandGateway { _, endpoint, command, _, _, _ ->
+                            ActiveSyncCommandOutcome.Success(
+                                endpoint,
+                                if (command == ActiveSyncCommand.FOLDER_SYNC) {
+                                    folderCalls += 1
+                                    emptyFolderResponse("folder-key-$folderCalls")
+                                } else {
+                                    byteArrayOf()
+                                },
+                            )
+                        },
+                    sessions = sessions,
+                )
+            val request = request(false, persistedCheckpoints())
+
+            assertTrue(remote.fetchPage(request) is RemotePageOutcome.Page)
+            remote.invalidatePreparedState(request.profile, request.fence)
+            assertTrue(remote.fetchPage(request) is RemotePageOutcome.Page)
+
+            assertEquals(2, folderCalls)
+        }
+
     private fun request(
         fullSync: Boolean,
         checkpoints: SyncCheckpoints = SyncCheckpoints.EMPTY,
+        fence: SyncFence = SyncFence(3, 9),
+        profile: ConnectionProfile = profile(),
     ) =
         SyncPageRequest(
-            profile = profile(),
-            fence = SyncFence(3, 9),
+            profile = profile,
+            fence = fence,
             deviceId = "STABLEDEVICE",
             checkpoints = checkpoints,
             fullSyncRequired = fullSync,
@@ -873,6 +1361,31 @@ class ActiveSyncRemoteCalendarTest {
                     ),
                 ),
             ),
+        )
+
+    private fun documentCapacityResponse(): ByteArray = ByteArray(2 * 1024 * 1024 + 1)
+
+    private fun elementCapacityResponse(): ByteArray =
+        WbxmlWriter(WbxmlLimits(maxElements = 20_001)).write(
+            WbxmlElement(
+                AirSync.SYNC,
+                children = List(20_000) { WbxmlElement(AirSync.MORE_AVAILABLE) },
+            ),
+        )
+
+    private fun depthCapacityResponse(): ByteArray {
+        var nested = WbxmlElement(AirSync.MORE_AVAILABLE)
+        repeat(32) {
+            nested = WbxmlElement(AirSync.COLLECTIONS, children = listOf(nested))
+        }
+        return WbxmlWriter(WbxmlLimits(maxDepth = 34)).write(
+            WbxmlElement(AirSync.SYNC, children = listOf(nested)),
+        )
+    }
+
+    private fun inlineCapacityResponse(): ByteArray =
+        WbxmlWriter(WbxmlLimits(maxInlineStringBytes = 256 * 1024 + 1)).write(
+            WbxmlElement(AirSync.SYNC, text = "x".repeat(256 * 1024 + 1)),
         )
 
     private fun profile() =

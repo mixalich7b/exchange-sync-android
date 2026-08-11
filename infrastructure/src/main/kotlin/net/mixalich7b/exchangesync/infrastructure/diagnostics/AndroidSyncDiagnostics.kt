@@ -34,6 +34,22 @@ public class AndroidSyncDiagnostics : SyncDiagnosticsPort {
                 reasonCode = event.failureKind?.name,
                 failureCategory = event.problem?.name,
                 checkpointOutcome = event.checkpointOutcome?.let { outcome -> CheckpointOutcome.valueOf(outcome.name) },
+                capacityKind =
+                    event.capacityKind?.let { kind -> DiagnosticCapacityKind.valueOf(kind.name) },
+                capacityCommand =
+                    event.capacityKind?.let { DiagnosticActiveSyncCommand.SYNC },
+                capacityOutcome =
+                    event.capacityOutcome?.let { outcome -> DiagnosticCapacityOutcome.valueOf(outcome.name) },
+                capacityProblem =
+                    event.capacityKind?.let {
+                        when (event.problem) {
+                            net.mixalich7b.exchangesync.core.sync.SyncProblem.CALENDAR_PROVIDER ->
+                                DiagnosticCapacityProblem.CALENDAR_PROVIDER
+                            else -> DiagnosticCapacityProblem.PROTOCOL_DATA
+                        }
+                    },
+                windowSize = event.windowSize,
+                reducedWindowSize = event.reducedWindowSize,
                 outcome = event.outcome,
                 throwable = throwable,
             ),
@@ -51,6 +67,7 @@ public class AndroidSyncDiagnostics : SyncDiagnosticsPort {
             SyncDiagnosticKind.CHECKPOINT_FAILURE,
             SyncDiagnosticKind.RETRY,
             SyncDiagnosticKind.RESET,
+            SyncDiagnosticKind.CAPACITY,
             SyncDiagnosticKind.WINDOW_REDUCTION,
             -> DiagnosticSeverity.WARN
             else -> DiagnosticSeverity.INFO
@@ -68,6 +85,7 @@ public class AndroidSyncDiagnostics : SyncDiagnosticsPort {
             SyncDiagnosticKind.CHECKPOINT_FAILURE -> DiagnosticStage.CHECKPOINT
             SyncDiagnosticKind.RETRY -> DiagnosticStage.RETRY
             SyncDiagnosticKind.RESET -> DiagnosticStage.RESET
+            SyncDiagnosticKind.CAPACITY -> DiagnosticStage.PROVIDER_BATCH
             SyncDiagnosticKind.WINDOW_REDUCTION -> DiagnosticStage.WINDOW_REDUCTION
             SyncDiagnosticKind.BLOCK -> DiagnosticStage.BLOCK
             SyncDiagnosticKind.OBSOLETE -> DiagnosticStage.OBSOLETE

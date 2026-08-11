@@ -1,6 +1,7 @@
 package net.mixalich7b.exchangesync.core.sync
 
 import kotlinx.coroutines.flow.Flow
+import net.mixalich7b.exchangesync.core.connection.ConnectionProfile
 
 public interface SyncStateRepository {
     public val states: Flow<SyncState>
@@ -12,6 +13,11 @@ public interface SyncStateRepository {
 
 public fun interface RemoteCalendarPort {
     public suspend fun fetchPage(request: SyncPageRequest): RemotePageOutcome
+
+    public fun invalidatePreparedState(
+        profile: ConnectionProfile,
+        fence: SyncFence,
+    ) {}
 
     public suspend fun fetchPage(
         request: SyncPageRequest,

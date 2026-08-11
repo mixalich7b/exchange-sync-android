@@ -107,6 +107,38 @@ internal enum class CheckpointOutcome {
     FAILED,
 }
 
+internal enum class DiagnosticCapacityKind {
+    HTTP_RESPONSE_BYTES,
+    WBXML_DOCUMENT_BYTES,
+    WBXML_ELEMENT_COUNT,
+    WBXML_DEPTH,
+    WBXML_INLINE_STRING_BYTES,
+    CALENDAR_PROVIDER_TRANSACTION,
+}
+
+internal enum class DiagnosticActiveSyncCommand {
+    FOLDER_SYNC,
+    SYNC,
+}
+
+internal enum class DiagnosticCapacityOutcome {
+    WINDOW_REDUCTION,
+    MINIMUM_WINDOW_BLOCK,
+    TERMINAL,
+}
+
+internal enum class DiagnosticCapacityProblem {
+    PROTOCOL_DATA,
+    CALENDAR_PROVIDER,
+}
+
+internal enum class FolderPreparationOutcome {
+    COLD_REFRESH,
+    REFRESH,
+    REUSE,
+    INVALIDATED,
+}
+
 internal data class DiagnosticOperation(
     val id: String,
     val kind: DiagnosticOperationKind,
@@ -140,6 +172,12 @@ internal data class DeviceDiagnosticEvent(
     val fingerprint: String? = null,
     val syncMode: SyncRequestMode? = null,
     val windowSize: Int? = null,
+    val reducedWindowSize: Int? = null,
+    val capacityKind: DiagnosticCapacityKind? = null,
+    val capacityCommand: DiagnosticActiveSyncCommand? = null,
+    val capacityOutcome: DiagnosticCapacityOutcome? = null,
+    val capacityProblem: DiagnosticCapacityProblem? = null,
+    val folderPreparationOutcome: FolderPreparationOutcome? = null,
     val responseBytes: Int? = null,
     val responseEmpty: Boolean? = null,
     val commandCount: Int? = null,
@@ -225,6 +263,16 @@ private object DeviceDiagnosticFormatter {
             operation.generation?.let { values += "generation=$it" }
             operation.runToken?.let { values += "run_token=$it" }
         }
+        if (event.capacityKind != null || event.folderPreparationOutcome != null) {
+            event.capacityKind?.let { values += "capacity_kind=${it.name.lowercase()}" }
+            event.capacityCommand?.let { values += "capacity_command=${it.name.lowercase()}" }
+            event.capacityOutcome?.let { values += "capacity_outcome=${it.name.lowercase()}" }
+            event.capacityProblem?.let { values += "capacity_problem=${it.name.lowercase()}" }
+            event.folderPreparationOutcome?.let { values += "folder_preparation=${it.name.lowercase()}" }
+            appendCount(values, "window_size", event.windowSize)
+            appendCount(values, "reduced_window_size", event.reducedWindowSize)
+            return values.joinToString(" ").take(MAX_RECORD_LENGTH)
+        }
         append(values, "trigger", event.trigger)
         append(values, "phase", event.phase)
         append(values, "method", event.method)
@@ -246,6 +294,7 @@ private object DeviceDiagnosticFormatter {
         append(values, "fingerprint", event.fingerprint)
         event.syncMode?.let { values += "sync_mode=${it.name.lowercase()}" }
         appendCount(values, "window_size", event.windowSize)
+        appendCount(values, "reduced_window_size", event.reducedWindowSize)
         appendCount(values, "response_bytes", event.responseBytes)
         event.responseEmpty?.let { values += "response_empty=$it" }
         appendCount(values, "command_count", event.commandCount)

@@ -31,6 +31,16 @@ telemetry или analytics нет. Доступны только records, кот
   `window_size`, `response_bytes`, `response_empty`, `command_count`,
   `add_count`, `change_count`, `delete_count`, `more_available` и
   `key_advanced` без значений ключей;
+- для bounded page/provider capacity — `capacity_kind` (`http_response_bytes`,
+  `wbxml_document_bytes`, `wbxml_element_count`, `wbxml_depth`,
+  `wbxml_inline_string_bytes`, `calendar_provider_transaction`), typed
+  `capacity_command`, `capacity_outcome` (`window_reduction`,
+  `minimum_window_block`, `terminal`), safe `capacity_problem`, текущий
+  `window_size` и `reduced_window_size`, когда уменьшение возможно;
+- для подготовки основной папки — `folder_preparation` (`cold_refresh`,
+  `refresh`, `reuse`, `invalidated`); успешный `reuse` не сопровождается новым
+  successful `FolderSync` request record, а причина refresh фиксируется до
+  отдельного command outcome даже при неуспешном запросе;
 - для owned-calendar/provider boundaries — `ownership_action` (`created`,
   `reused`, `repaired`, `deleted`, `unchanged`), `input_count`,
   `accepted_count`, `rejected_count`, `planned_operation_count`,
@@ -53,6 +63,18 @@ telemetry или analytics нет. Доступны только records, кот
 строки с тем же `operation`. Для синхронизации дополнительно сопоставляются
 `generation` и `run_token`. Идентификаторы operation начинаются заново после
 перезапуска процесса и не являются persisted IDs.
+
+`http_response_bytes`, `wbxml_document_bytes` и `wbxml_element_count` на обычной
+Calendar page при window больше одного означают adaptive recovery, а не
+malformed server data:
+связанные записи показывают старое и уменьшенное window и неизменённый
+checkpoint. `minimum_window_block` означает terminal `PROTOCOL_DATA` без
+пропуска элемента. `wbxml_depth` и `wbxml_inline_string_bytes` остаются
+terminal, а настоящий syntax/encoding/token/structure defect сохраняет
+`MALFORMED_WBXML`. `folder_preparation` позволяет отличить cold/new-run refresh,
+reuse в page/retry/continuation и invalidation, не раскрывая содержимое cache.
+`calendar_provider_transaction` использует тот же typed window outcome, но
+сохраняет terminal problem `CALENDAR_PROVIDER` при window один.
 
 Уровень `INFO` отмечает начало, capability/phase и terminal
 success/cancellation/obsolete. На нём же пишутся успешные `RESPONSE`, decoded
@@ -84,6 +106,14 @@ booleans и enums. `response_bytes` — только ограниченный р
 опускаются для `WBXML`, `FolderSync`, `CalendarSync`, event parse/map, Calendar
 Provider и core synchronization stages; там остаются только классы и
 ограниченные frames.
+
+Capacity и folder-preparation records имеют более узкий formatter path: кроме
+`component`, `stage`, process-local operation ID, `generation`/`run_token` он
+принимает только перечисленные typed enums и bounded window values. Свободные
+`command`/`reason`/`outcome`, host/path, `server_id` и exception text для этих
+records не форматируются. Поэтому collection ID, folder name, FolderSync и
+collection SyncKey, email, `domain\login`, payload и текст исключения не могут
+попасть в эти записи даже при ошибочном заполнении общего event model.
 
 Call sites передают только типизированные разрешённые поля. Дополнительный
 централизованный formatter ограничивает длину и глубину exception graph,

@@ -1,6 +1,7 @@
 package net.mixalich7b.exchangesync.core.sync
 
 import kotlinx.coroutines.CancellationException
+import net.mixalich7b.exchangesync.core.connection.ConnectionProfile
 import net.mixalich7b.exchangesync.core.connection.ConnectionProfileRepository
 
 public fun interface ExecuteSynchronizationAction {
@@ -88,8 +89,8 @@ public class ExecuteSynchronizationSlice(
             block(fence, SyncProblem.CALENDAR_PERMISSION)
             return SyncSliceOutcome.PermissionRequired
         }
-        if (stateRepository.load().calendarCleanupPending) return resumePendingCalendarReset(fence)
         val profile = profileRepository.load() ?: return SyncSliceOutcome.Obsolete
+        if (stateRepository.load().calendarCleanupPending) return resumePendingCalendarReset(fence, profile)
         val startedAt = clock.elapsedRealtimeMillis()
         var completedPages = 0
 
@@ -117,9 +118,9 @@ public class ExecuteSynchronizationSlice(
             if (!isCurrent(fence)) return SyncSliceOutcome.Obsolete
 
             when (remoteOutcome) {
-                is RemotePageOutcome.Failure -> return handleRemoteFailure(fence, remoteOutcome)
+                is RemotePageOutcome.Failure -> return handleRemoteFailure(fence, profile, remoteOutcome)
                 is RemotePageOutcome.Page -> {
-                    val outcome = applyPage(fence, remoteOutcome.page)
+                    val outcome = applyPage(fence, profile, remoteOutcome.page)
                     if (outcome != null) return outcome
                     completedPages += 1
 
@@ -145,6 +146,7 @@ public class ExecuteSynchronizationSlice(
 
     private suspend fun applyPage(
         fence: SyncFence,
+        profile: ConnectionProfile,
         page: RemoteCalendarPage,
     ): SyncSliceOutcome? {
         transitionPhase(fence, SyncPhase.APPLYING) ?: return SyncSliceOutcome.Obsolete
@@ -201,7 +203,7 @@ public class ExecuteSynchronizationSlice(
                 }
             }
             LocalPageOutcome.Obsolete -> SyncSliceOutcome.Obsolete
-            LocalPageOutcome.FullResetRequired -> requestFullReset(fence)
+            LocalPageOutcome.FullResetRequired -> requestFullReset(fence, profile)
             LocalPageOutcome.TransactionTooLarge -> reduceWindowAndContinue(fence, SyncProblem.CALENDAR_PROVIDER)
             is LocalPageOutcome.Failed -> block(fence, localOutcome.problem)
         }
@@ -221,7 +223,10 @@ public class ExecuteSynchronizationSlice(
         )
     }
 
-    private suspend fun requestFullReset(fence: SyncFence): SyncSliceOutcome {
+    private suspend fun requestFullReset(
+        fence: SyncFence,
+        profile: ConnectionProfile,
+    ): SyncSliceOutcome {
         diagnostics.record(SyncDiagnosticEvent(SyncDiagnosticKind.RESET, fence), null)
         val reset =
             stateRepository.update { latest ->
@@ -236,11 +241,12 @@ public class ExecuteSynchronizationSlice(
                 }
             }
         if (!SyncStateTransitions.mayPerformSideEffect(reset, fence)) return SyncSliceOutcome.Obsolete
-        return resumePendingCalendarReset(fence)
+        return resumePendingCalendarReset(fence, profile)
     }
 
     private suspend fun handleRemoteFailure(
         fence: SyncFence,
+        profile: ConnectionProfile,
         failure: RemotePageOutcome.Failure,
     ): SyncSliceOutcome {
         diagnostics.record(
@@ -254,8 +260,8 @@ public class ExecuteSynchronizationSlice(
         )
         return when (failure.kind) {
             SyncFailureKind.TRANSIENT -> recordTransientFailure(fence)
-            SyncFailureKind.INVALID_KEY -> resetInvalidKeyOrBlock(fence)
-            SyncFailureKind.FULL_RESET_REQUIRED -> requestFullReset(fence)
+            SyncFailureKind.INVALID_KEY -> resetInvalidKeyOrBlock(fence, profile)
+            SyncFailureKind.FULL_RESET_REQUIRED -> requestFullReset(fence, profile)
             SyncFailureKind.WINDOW_TOO_LARGE -> reduceWindowAndContinue(fence, SyncProblem.PROTOCOL_DATA)
             SyncFailureKind.CRITICAL -> block(fence, failure.problem ?: SyncProblem.PROTOCOL_DATA)
         }
@@ -298,7 +304,10 @@ public class ExecuteSynchronizationSlice(
         }
     }
 
-    private suspend fun resetInvalidKeyOrBlock(fence: SyncFence): SyncSliceOutcome {
+    private suspend fun resetInvalidKeyOrBlock(
+        fence: SyncFence,
+        profile: ConnectionProfile,
+    ): SyncSliceOutcome {
         val current = stateRepository.load()
         if (!SyncStateTransitions.mayPerformSideEffect(current, fence)) return SyncSliceOutcome.Obsolete
         if (current.invalidKeyRecoveryUsed) return block(fence, SyncProblem.REPEATED_INVALID_KEY)
@@ -317,11 +326,15 @@ public class ExecuteSynchronizationSlice(
                 }
             }
         if (!SyncStateTransitions.mayPerformSideEffect(reset, fence)) return SyncSliceOutcome.Obsolete
-        return resumePendingCalendarReset(fence)
+        return resumePendingCalendarReset(fence, profile)
     }
 
-    private suspend fun resumePendingCalendarReset(fence: SyncFence): SyncSliceOutcome {
+    private suspend fun resumePendingCalendarReset(
+        fence: SyncFence,
+        profile: ConnectionProfile,
+    ): SyncSliceOutcome {
         if (!isCurrent(fence)) return SyncSliceOutcome.Obsolete
+        remoteCalendar.invalidatePreparedState(profile, fence)
         when (val cleanup = ownedCalendar.deleteOwnedCalendar(fence, OwnedCalendarCleanupTrigger.FULL_RESET)) {
             OwnedCalendarCleanupOutcome.Completed -> Unit
             OwnedCalendarCleanupOutcome.Obsolete -> return SyncSliceOutcome.Obsolete
@@ -357,13 +370,38 @@ public class ExecuteSynchronizationSlice(
     ): SyncSliceOutcome {
         val current = stateRepository.load()
         if (!SyncStateTransitions.mayPerformSideEffect(current, fence)) return SyncSliceOutcome.Obsolete
+        if (minimumWindowProblem == SyncProblem.CALENDAR_PROVIDER) {
+            val canReduce = current.checkpoints.windowSize > 1
+            diagnostics.record(
+                SyncDiagnosticEvent(
+                    SyncDiagnosticKind.CAPACITY,
+                    fence,
+                    problem = SyncProblem.CALENDAR_PROVIDER,
+                    capacityKind = SyncCapacityKind.CALENDAR_PROVIDER_TRANSACTION,
+                    capacityOutcome =
+                        if (canReduce) {
+                            SyncCapacityOutcome.WINDOW_REDUCTION
+                        } else {
+                            SyncCapacityOutcome.MINIMUM_WINDOW_BLOCK
+                        },
+                    windowSize = current.checkpoints.windowSize,
+                    reducedWindowSize =
+                        (current.checkpoints.windowSize / 2)
+                            .coerceAtLeast(1)
+                            .takeIf { canReduce },
+                ),
+                null,
+            )
+        }
         if (current.checkpoints.windowSize == 1) return block(fence, minimumWindowProblem)
+        val reducedWindowSize = (current.checkpoints.windowSize / 2).coerceAtLeast(1)
         diagnostics.record(
             SyncDiagnosticEvent(
                 SyncDiagnosticKind.WINDOW_REDUCTION,
                 fence,
                 problem = minimumWindowProblem,
-                outcome = (current.checkpoints.windowSize / 2).coerceAtLeast(1).toString(),
+                windowSize = current.checkpoints.windowSize,
+                reducedWindowSize = reducedWindowSize,
             ),
             null,
         )
@@ -372,7 +410,7 @@ public class ExecuteSynchronizationSlice(
                 latest.copy(
                     checkpoints =
                         latest.checkpoints.copy(
-                            windowSize = (latest.checkpoints.windowSize / 2).coerceAtLeast(1),
+                            windowSize = reducedWindowSize,
                         ),
                     phase = SyncPhase.QUEUED,
                 )

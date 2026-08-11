@@ -144,8 +144,39 @@ class WbxmlCodecTest {
     }
 
     @Test
-    fun `malformed headers strings tokens depth counts and body sizes are rejected`() {
-        val reader = WbxmlReader()
+    fun `document and element reader capacity use typed read limits`() {
+        val nestedElements =
+            bytes(
+                0x03,
+                0x01,
+                0x6A,
+                0x00,
+                0x45,
+                0x4F,
+                0x4E,
+                0x03,
+                0x31,
+                0x00,
+                0x01,
+                0x01,
+                0x01,
+            )
+
+        val documentFailure =
+            assertThrows(WbxmlReadLimitException::class.java) {
+                WbxmlReader(WbxmlLimits(maxDocumentBytes = 4)).read(bytes(0x03, 0x01, 0x6A, 0x00, 0x05))
+            }
+        val elementFailure =
+            assertThrows(WbxmlReadLimitException::class.java) {
+                WbxmlReader(WbxmlLimits(maxElements = 1)).read(nestedElements)
+            }
+
+        assertEquals(WbxmlReadLimitKind.DOCUMENT_BYTES, documentFailure.kind)
+        assertEquals(WbxmlReadLimitKind.ELEMENT_COUNT, elementFailure.kind)
+    }
+
+    @Test
+    fun `depth and inline reader capacity remain distinct non-page-scaled limits`() {
         val tooDeep =
             bytes(
                 0x03,
@@ -164,23 +195,28 @@ class WbxmlCodecTest {
             )
         val tooLongString = bytes(0x03, 0x01, 0x6A, 0x00, 0x45, 0x03, 0x31, 0x32, 0x33, 0x34, 0x00, 0x01)
 
+        val depthFailure =
+            assertThrows(WbxmlReadLimitException::class.java) {
+                WbxmlReader(WbxmlLimits(maxDepth = 2)).read(tooDeep)
+            }
+        val inlineFailure =
+            assertThrows(WbxmlReadLimitException::class.java) {
+                WbxmlReader(WbxmlLimits(maxInlineStringBytes = 3)).read(tooLongString)
+            }
+
+        assertEquals(WbxmlReadLimitKind.DEPTH, depthFailure.kind)
+        assertEquals(WbxmlReadLimitKind.INLINE_STRING_BYTES, inlineFailure.kind)
+    }
+
+    @Test
+    fun `malformed syntax unsupported encoding and tokens remain format errors`() {
+        val reader = WbxmlReader()
+
         assertThrows(WbxmlFormatException::class.java) { reader.read(bytes(0x02, 0x01, 0x6A, 0x00, 0x05)) }
         assertThrows(WbxmlFormatException::class.java) { reader.read(bytes(0x03, 0x01, 0x6A, 0x01)) }
         assertThrows(WbxmlFormatException::class.java) { reader.read(bytes(0x03, 0x01, 0x6A, 0x00, 0x45, 0x03, 0x41)) }
         assertThrows(WbxmlFormatException::class.java) { reader.read(bytes(0x03, 0x01, 0x6A, 0x00, 0x02)) }
         assertThrows(WbxmlFormatException::class.java) { reader.read(bytes(0x03, 0x01, 0x6A, 0x00, 0x85)) }
-        assertThrows(WbxmlFormatException::class.java) {
-            WbxmlReader(WbxmlLimits(maxDepth = 2)).read(tooDeep)
-        }
-        assertThrows(WbxmlFormatException::class.java) {
-            WbxmlReader(WbxmlLimits(maxElements = 1)).read(tooDeep)
-        }
-        assertThrows(WbxmlFormatException::class.java) {
-            WbxmlReader(WbxmlLimits(maxInlineStringBytes = 3)).read(tooLongString)
-        }
-        assertThrows(WbxmlFormatException::class.java) {
-            WbxmlReader(WbxmlLimits(maxDocumentBytes = 4)).read(bytes(0x03, 0x01, 0x6A, 0x00, 0x05))
-        }
         assertThrows(WbxmlFormatException::class.java) {
             WbxmlMbUInt.decode(bytes(0x81, 0x80, 0x80, 0x80, 0x00))
         }

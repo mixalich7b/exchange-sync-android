@@ -22,12 +22,22 @@ Exchange в один принадлежащий приложению кален�
 Успешный `Sync` с пустым HTTP body означает отсутствие изменений: текущий
 collection SyncKey сохраняется, а run завершается без protocol-data ошибки.
 
-WBXML декодируется с ограничениями размера, глубины, количества элементов и
-inline strings; повторяющиеся singleton-поля отклоняются как malformed data.
-HTTP body ограничивается до выделения полного массива. Если
-страница `Sync` превышает этот предел, неизменённый checkpoint повторяется с
-уменьшенным window так же, как после слишком большого provider batch. Для
-14.0/14.1 initial и последующие запросы объявляют `Supported` properties. Для
+WBXML декодируется с ограничениями размера документа, глубины, количества
+элементов и размера отдельной inline string; повторяющиеся singleton-поля
+отклоняются как malformed data. Ограничения размера WBXML-документа и числа
+элементов типизированы отдельно от syntax/encoding/token errors и считаются
+page-scaled только для обычной Calendar `Sync` page. Вместе с bounded HTTP body
+и слишком большим provider batch они сохраняют committed calendar и collection
+SyncKey, уменьшают window вдвое с минимумом один и повторяют ту же страницу.
+Успешная меньшая страница применяется атомарно и продолжает `MoreAvailable`
+pagination уже с уменьшенным window. Если remote page остаётся больше лимита
+при window 1, run блокируется как `PROTOCOL_DATA`; provider batch при window 1
+блокируется как `CALENDAR_PROVIDER`. Данные не пропускаются и checkpoint не
+продвигается. Excessive depth, oversized отдельная inline string, malformed
+syntax/UTF-8/token/structure и те же decoder limits в `FolderSync` не становятся
+recoverable от уменьшения Calendar window. HTTP body ограничивается до
+выделения полного массива. Для 14.0/14.1 initial и последующие запросы объявляют
+`Supported` properties. Для
 16.0/16.1 omitted fields в `Change` объединяются только с clean snapshot
 собственной строки Calendar Provider; dirty row требует fenced full reset,
 чтобы локальная правка не стала новым server value. Explicit empty по-прежнему
@@ -61,6 +71,29 @@ Capability discovery и все календарные команды точно�
 `OPTIONS`, даже имея persisted checkpoints. Если сохранённая protocol version
 ещё предлагается, ключи продолжают использоваться; при смене версии сначала
 запрашивается существующий fenced full reset.
+
+Успешно подготовленное состояние основной папки также хранится только в этом
+profile session и привязано к protocol version, generation и run token. Один
+логический run выполняет `FolderSync` перед первой Calendar page и повторно
+использует полученные folder key, primary collection ID и terminal endpoint для
+остальных страниц, adaptive window retries и continuation workers того же
+fence. Новый run token, другая version/profile, cold process, invalid key,
+full reset или неуспешное согласование основной папки требуют refresh либо
+очищают это состояние. Durable checkpoint по-прежнему меняется только после
+успешного применения Calendar page; process death до commit безопасно повторяет
+`FolderSync` от последнего сохранённого key.
+
+Внутри активной синхронизации capability discovery, `FolderSync`, priming и
+обычные `Sync` pages используют общий profile-session pacer. Первый top-level
+exchange в cold session отправляется сразу; каждый следующий начинается не
+раньше чем через две секунды после завершения или transport failure предыдущего.
+Время локального применения, continuation и более длинного backoff засчитывается
+в интервал и не получает дополнительную задержку. Все разрешённые HTTPS redirect
+hops входят в один top-level exchange. Ожидание использует monotonic clock и
+coroutine cancellation; непосредственно перед transport dispatch повторно
+проверяется generation/run-token fence, поэтому отменённый или устаревший run не
+посылает ожидающий запрос. Connection verification вне синхронизации сохраняет
+прежнее поведение без этого pacer.
 
 ## Представление событий
 

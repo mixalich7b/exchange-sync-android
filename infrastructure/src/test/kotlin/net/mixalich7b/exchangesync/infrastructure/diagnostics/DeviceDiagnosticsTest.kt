@@ -1,5 +1,6 @@
 package net.mixalich7b.exchangesync.infrastructure.diagnostics
 
+import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -114,6 +115,121 @@ class DeviceDiagnosticsTest {
 
         assertTrue(record.contains("input_count=0"), record)
         assertTrue(record.contains("applied_operation_count=0"), record)
+    }
+
+    @Test
+    fun `capacity diagnostics format only typed classification and bounded window fields`() {
+        val operation = DeviceDiagnostics().operation(DiagnosticOperationKind.SYNCHRONIZATION, 3, 9)
+        val records =
+            DiagnosticCapacityKind.entries.associateWith { kind ->
+                format(
+                    DeviceDiagnosticEvent(
+                        severity = DiagnosticSeverity.WARN,
+                        component = DiagnosticComponent.ACTIVE_SYNC,
+                        stage = DiagnosticStage.WBXML,
+                        operation = operation,
+                        capacityKind = kind,
+                        capacityCommand = DiagnosticActiveSyncCommand.SYNC,
+                        capacityOutcome = DiagnosticCapacityOutcome.WINDOW_REDUCTION,
+                        capacityProblem = DiagnosticCapacityProblem.PROTOCOL_DATA,
+                        windowSize = 100,
+                        reducedWindowSize = 50,
+                        trigger = "WORK\\calendar",
+                        host = "exchange.private.test",
+                        path = "/secret-payload",
+                        command = "Sync secret-collection",
+                        reasonCode = "secret-folder-name",
+                        serverId = "secret-server-id",
+                        outcome = "secret-sync-key",
+                        throwable = IllegalStateException("secret payload calendar@example.test"),
+                    ),
+                )
+            }
+
+        assertEquals(DiagnosticCapacityKind.entries.toSet(), records.keys)
+        records.forEach { (kind, record) ->
+            assertTrue(record.contains("capacity_kind=${kind.name.lowercase()}"), record)
+            assertTrue(record.contains("capacity_command=sync"), record)
+            assertTrue(record.contains("capacity_outcome=window_reduction"), record)
+            assertTrue(record.contains("capacity_problem=protocol_data"), record)
+            assertTrue(record.contains("window_size=100"), record)
+            assertTrue(record.contains("reduced_window_size=50"), record)
+            assertTrue(record.contains("generation=3"), record)
+            assertTrue(record.contains("run_token=9"), record)
+            listOf(
+                "secret-collection",
+                "secret-folder-name",
+                "secret-server-id",
+                "secret-sync-key",
+                "secret payload",
+                "calendar@example.test",
+                "WORK\\calendar",
+                "exchange.private.test",
+                "/secret-payload",
+            ).forEach { secret -> assertFalse(record.contains(secret), secret) }
+        }
+    }
+
+    @Test
+    fun `minimum window and terminal capacity outcomes remain distinct`() {
+        val minimum =
+            format(
+                DeviceDiagnosticEvent(
+                    DiagnosticSeverity.WARN,
+                    DiagnosticComponent.ACTIVE_SYNC,
+                    DiagnosticStage.WBXML,
+                    capacityKind = DiagnosticCapacityKind.WBXML_ELEMENT_COUNT,
+                    capacityCommand = DiagnosticActiveSyncCommand.SYNC,
+                    capacityOutcome = DiagnosticCapacityOutcome.MINIMUM_WINDOW_BLOCK,
+                    capacityProblem = DiagnosticCapacityProblem.PROTOCOL_DATA,
+                    windowSize = 1,
+                ),
+            )
+        val terminal =
+            format(
+                DeviceDiagnosticEvent(
+                    DiagnosticSeverity.WARN,
+                    DiagnosticComponent.ACTIVE_SYNC,
+                    DiagnosticStage.WBXML,
+                    capacityKind = DiagnosticCapacityKind.WBXML_DEPTH,
+                    capacityCommand = DiagnosticActiveSyncCommand.SYNC,
+                    capacityOutcome = DiagnosticCapacityOutcome.TERMINAL,
+                    capacityProblem = DiagnosticCapacityProblem.PROTOCOL_DATA,
+                ),
+            )
+
+        assertTrue(minimum.contains("capacity_outcome=minimum_window_block"), minimum)
+        assertTrue(minimum.contains("window_size=1"), minimum)
+        assertFalse(minimum.contains("reduced_window_size="), minimum)
+        assertTrue(terminal.contains("capacity_outcome=terminal"), terminal)
+    }
+
+    @Test
+    fun `folder preparation diagnostics format only bounded outcomes and correlation`() {
+        val records =
+            FolderPreparationOutcome.entries.map { outcome ->
+                format(
+                    DeviceDiagnosticEvent(
+                        severity = DiagnosticSeverity.INFO,
+                        component = DiagnosticComponent.ACTIVE_SYNC,
+                        stage = DiagnosticStage.FOLDER_SYNC,
+                        operation = DeviceDiagnostics().operation(DiagnosticOperationKind.SYNCHRONIZATION, 7, 11),
+                        folderPreparationOutcome = outcome,
+                        command = "FolderSync secret-folder",
+                        serverId = "secret-collection",
+                        outcome = "secret-key",
+                    ),
+                )
+            }
+
+        assertEquals(FolderPreparationOutcome.entries.size, records.size)
+        records.zip(FolderPreparationOutcome.entries).forEach { (record, outcome) ->
+            assertTrue(record.contains("folder_preparation=${outcome.name.lowercase()}"), record)
+            assertTrue(record.contains("generation=7"), record)
+            assertTrue(record.contains("run_token=11"), record)
+            listOf("secret-folder", "secret-collection", "secret-key")
+                .forEach { secret -> assertFalse(record.contains(secret), secret) }
+        }
     }
 
     private fun format(event: DeviceDiagnosticEvent): String {

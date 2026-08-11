@@ -9,6 +9,7 @@ public enum class SyncDiagnosticKind {
     CHECKPOINT_FAILURE,
     RETRY,
     RESET,
+    CAPACITY,
     WINDOW_REDUCTION,
     BLOCK,
     OBSOLETE,
@@ -23,6 +24,15 @@ public enum class SyncCheckpointOutcome {
     FAILED,
 }
 
+public enum class SyncCapacityKind {
+    CALENDAR_PROVIDER_TRANSACTION,
+}
+
+public enum class SyncCapacityOutcome {
+    WINDOW_REDUCTION,
+    MINIMUM_WINDOW_BLOCK,
+}
+
 public data class SyncDiagnosticEvent(
     public val kind: SyncDiagnosticKind,
     public val fence: SyncFence,
@@ -32,6 +42,10 @@ public data class SyncDiagnosticEvent(
     public val failureKind: SyncFailureKind? = null,
     public val problem: SyncProblem? = null,
     public val checkpointOutcome: SyncCheckpointOutcome? = null,
+    public val capacityKind: SyncCapacityKind? = null,
+    public val capacityOutcome: SyncCapacityOutcome? = null,
+    public val windowSize: Int? = null,
+    public val reducedWindowSize: Int? = null,
     public val outcome: String? = null,
 )
 

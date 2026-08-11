@@ -2,14 +2,20 @@ package net.mixalich7b.exchangesync.infrastructure.activesync
 
 import java.security.cert.X509Certificate
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import net.mixalich7b.exchangesync.core.connection.ConnectionProfile
 import net.mixalich7b.exchangesync.core.sync.ActiveSyncVersion
 import net.mixalich7b.exchangesync.core.sync.SyncFailureKind
 import net.mixalich7b.exchangesync.core.sync.SyncProblem
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperationKind
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredential
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredentialResolution
@@ -238,6 +244,7 @@ class ActiveSyncCommandClientTest {
 
             assertEquals("WINDOW_TOO_LARGE", outcome.kind.name)
             assertNull(outcome.problem)
+            assertEquals(ActiveSyncPageCapacityKind.HTTP_RESPONSE_BYTES, outcome.capacityKind)
         }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -279,6 +286,272 @@ class ActiveSyncCommandClientTest {
         }
 
     @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `synchronization capability and command share pacing while redirects and verification do not`() =
+        runTest {
+            val credential = credential()
+            val requestTimes = mutableListOf<Long>()
+            val transport =
+                TimedCommandTransport(
+                    now = { testScheduler.currentTime },
+                    requestTimes = requestTimes,
+                    responses =
+                        listOf(
+                            SecureHttpResponse(302, mapOf("Location" to "/redirected")),
+                            SecureHttpResponse(
+                                200,
+                                mapOf(
+                                    "MS-ASProtocolVersions" to "16.1",
+                                    "MS-ASProtocolCommands" to "FolderSync,Sync",
+                                ),
+                                localCertificates = listOf(credential.leafCertificate),
+                            ),
+                            SecureHttpResponse(200, emptyMap(), localCertificates = listOf(credential.leafCertificate)),
+                            SecureHttpResponse(200, emptyMap(), localCertificates = listOf(credential.leafCertificate)),
+                        ),
+                )
+            val sessions = pacerRegistry()
+            val dispatcher = UnconfinedTestDispatcher(testScheduler)
+            val factory = SecureHttpTransportFactory { _, _, _ -> transport }
+            val operation = DeviceDiagnostics().operation(DiagnosticOperationKind.SYNCHRONIZATION, 3, 9)
+            val capabilities =
+                ActiveSyncCapabilityClient(
+                    resolver(credential),
+                    factory,
+                    transportDispatcher = dispatcher,
+                    sessions = sessions,
+                )
+            val commands =
+                ActiveSyncCommandClient(
+                    resolver(credential),
+                    factory,
+                    transportDispatcher = dispatcher,
+                    sessions = sessions,
+                )
+
+            capabilities.discover(profile(), operation)
+            commands.execute(
+                profile(),
+                endpoint(),
+                ActiveSyncCommand.FOLDER_SYNC,
+                "DEVICE123",
+                ActiveSyncVersion.V16_1,
+                byteArrayOf(),
+                operation,
+            )
+            val continuationOperation =
+                DeviceDiagnostics().operation(DiagnosticOperationKind.SYNCHRONIZATION, 3, 9)
+            commands.execute(
+                profile(),
+                endpoint(),
+                ActiveSyncCommand.SYNC,
+                "DEVICE123",
+                ActiveSyncVersion.V16_1,
+                byteArrayOf(),
+                continuationOperation,
+            )
+
+            assertEquals(listOf(0L, 0L, 2_000L, 4_000L), requestTimes)
+
+            val verificationTransport =
+                TimedCommandTransport(
+                    now = { testScheduler.currentTime },
+                    requestTimes = requestTimes,
+                    responses =
+                        listOf(
+                            SecureHttpResponse(
+                                200,
+                                mapOf(
+                                    "MS-ASProtocolVersions" to "16.1",
+                                    "MS-ASProtocolCommands" to "FolderSync,Sync",
+                                ),
+                                localCertificates = listOf(credential.leafCertificate),
+                            ),
+                        ),
+                )
+            ActiveSyncConnectionVerifier(
+                resolver(credential),
+                SecureHttpTransportFactory { _, _, _ -> verificationTransport },
+                transportDispatcher = dispatcher,
+                sessions = sessions,
+            ).verify(profile())
+
+            assertEquals(4_000L, requestTimes.last())
+        }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `cancelling a paced synchronization command sends no pending request`() =
+        runTest {
+            val credential = credential()
+            val transport =
+                RecordingCommandTransport(
+                    listOf(SecureHttpResponse(200, emptyMap(), localCertificates = listOf(credential.leafCertificate))),
+                )
+            val sessions = pacerRegistry()
+            val operation = DeviceDiagnostics().operation(DiagnosticOperationKind.SYNCHRONIZATION, 3, 9)
+            val client =
+                ActiveSyncCommandClient(
+                    resolver(credential),
+                    SecureHttpTransportFactory { _, _, _ -> transport },
+                    transportDispatcher = UnconfinedTestDispatcher(testScheduler),
+                    sessions = sessions,
+                )
+
+            client.execute(
+                profile(),
+                endpoint(),
+                ActiveSyncCommand.SYNC,
+                "DEVICE123",
+                ActiveSyncVersion.V16_1,
+                byteArrayOf(),
+                operation,
+            )
+            val waiting = launch {
+                client.execute(
+                    profile(),
+                    endpoint(),
+                    ActiveSyncCommand.SYNC,
+                    "DEVICE123",
+                    ActiveSyncVersion.V16_1,
+                    byteArrayOf(),
+                    operation,
+                )
+            }
+            runCurrent()
+            waiting.cancelAndJoin()
+
+            assertEquals(1, transport.requests.size)
+        }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `obsolete synchronization fence after pacing wait sends no pending request`() =
+        runTest {
+            val credential = credential()
+            val transport =
+                RecordingCommandTransport(
+                    listOf(SecureHttpResponse(200, emptyMap(), localCertificates = listOf(credential.leafCertificate))),
+                )
+            val sessions = pacerRegistry()
+            val operation = DeviceDiagnostics().operation(DiagnosticOperationKind.SYNCHRONIZATION, 3, 9)
+            var fenceCurrent = true
+            val client =
+                ActiveSyncCommandClient(
+                    resolver(credential),
+                    SecureHttpTransportFactory { _, _, _ -> transport },
+                    transportDispatcher = UnconfinedTestDispatcher(testScheduler),
+                    sessions = sessions,
+                    fenceValidator = ActiveSyncSynchronizationFenceValidator { fenceCurrent },
+                )
+
+            client.execute(
+                profile(),
+                endpoint(),
+                ActiveSyncCommand.SYNC,
+                "DEVICE123",
+                ActiveSyncVersion.V16_1,
+                byteArrayOf(),
+                operation,
+            )
+            val waiting = launch {
+                client.execute(
+                    profile(),
+                    endpoint(),
+                    ActiveSyncCommand.SYNC,
+                    "DEVICE123",
+                    ActiveSyncVersion.V16_1,
+                    byteArrayOf(),
+                    operation,
+                )
+            }
+            runCurrent()
+            fenceCurrent = false
+            advanceTimeBy(2_000)
+            runCurrent()
+
+            assertTrue(waiting.isCancelled)
+            assertEquals(1, transport.requests.size)
+        }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `fence invalidated during transport construction sends no capability or command request`() =
+        runTest {
+            val credential = credential()
+            val operation = DeviceDiagnostics().operation(DiagnosticOperationKind.SYNCHRONIZATION, 3, 9)
+            val dispatcher = UnconfinedTestDispatcher(testScheduler)
+
+            var commandFenceCurrent = true
+            val commandTransport =
+                RecordingCommandTransport(
+                    listOf(SecureHttpResponse(200, emptyMap(), localCertificates = listOf(credential.leafCertificate))),
+                )
+            val commandClient =
+                ActiveSyncCommandClient(
+                    resolver(credential),
+                    SecureHttpTransportFactory { _, _, _ ->
+                        commandFenceCurrent = false
+                        commandTransport
+                    },
+                    transportDispatcher = dispatcher,
+                    fenceValidator = ActiveSyncSynchronizationFenceValidator { commandFenceCurrent },
+                )
+
+            var commandCancelled = false
+            try {
+                commandClient.execute(
+                    profile(),
+                    endpoint(),
+                    ActiveSyncCommand.SYNC,
+                    "DEVICE123",
+                    ActiveSyncVersion.V16_1,
+                    byteArrayOf(),
+                    operation,
+                )
+            } catch (_: ObsoleteActiveSyncSynchronizationException) {
+                commandCancelled = true
+            }
+
+            var capabilityFenceCurrent = true
+            val capabilityTransport =
+                RecordingCommandTransport(
+                    listOf(
+                        SecureHttpResponse(
+                            200,
+                            mapOf(
+                                "MS-ASProtocolVersions" to "16.1",
+                                "MS-ASProtocolCommands" to "FolderSync,Sync",
+                            ),
+                            localCertificates = listOf(credential.leafCertificate),
+                        ),
+                    ),
+                )
+            val capabilityClient =
+                ActiveSyncCapabilityClient(
+                    resolver(credential),
+                    SecureHttpTransportFactory { _, _, _ ->
+                        capabilityFenceCurrent = false
+                        capabilityTransport
+                    },
+                    transportDispatcher = dispatcher,
+                    fenceValidator = ActiveSyncSynchronizationFenceValidator { capabilityFenceCurrent },
+                )
+
+            var capabilityCancelled = false
+            try {
+                capabilityClient.discover(profile(), operation)
+            } catch (_: ObsoleteActiveSyncSynchronizationException) {
+                capabilityCancelled = true
+            }
+
+            assertTrue(commandCancelled)
+            assertTrue(capabilityCancelled)
+            assertTrue(commandTransport.requests.isEmpty())
+            assertTrue(capabilityTransport.requests.isEmpty())
+        }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
     private fun TestScope.client(
         credential: ClientCredential,
         transport: RecordingCommandTransport,
@@ -300,6 +573,33 @@ class ActiveSyncCommandClientTest {
             return responses.removeFirst()
         }
     }
+
+    private class TimedCommandTransport(
+        private val now: () -> Long,
+        private val requestTimes: MutableList<Long>,
+        responses: List<SecureHttpResponse>,
+    ) : SecureHttpTransport {
+        private val responses = ArrayDeque(responses)
+
+        override suspend fun execute(request: Request): SecureHttpResponse {
+            requestTimes += now()
+            return responses.removeFirst()
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private fun TestScope.pacerRegistry(): ActiveSyncProfileSessionRegistry =
+        ActiveSyncProfileSessionRegistry(
+            pacerFactory = {
+                ActiveSyncRequestPacer(
+                    nanoTime = { testScheduler.currentTime * 1_000_000L },
+                    waitMillis = { millis -> delay(millis) },
+                )
+            },
+        )
+
+    private fun resolver(credential: ClientCredential): ClientCredentialResolver =
+        ClientCredentialResolver { ClientCredentialResolution.Available(credential) }
 
     private fun endpoint() = "https://exchange.example.test/Microsoft-Server-ActiveSync".toHttpUrl()
 

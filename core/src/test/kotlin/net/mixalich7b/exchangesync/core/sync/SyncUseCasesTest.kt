@@ -943,11 +943,12 @@ class SyncUseCasesTest {
             val stateRepository = FakeStateRepository(runningState(), trace)
             val calendar = FakeCalendar(trace, applyOutcome = LocalPageOutcome.FullResetRequired)
             val scheduler = FakeScheduler(trace)
+            val remote = FakeRemote(mutableListOf(page(checkpoints("sync-18"), false)), trace)
 
             val outcome =
                 executor(
                     stateRepository,
-                    FakeRemote(mutableListOf(page(checkpoints("sync-18"), false)), trace),
+                    remote,
                     calendar,
                     scheduler,
                     trace,
@@ -959,6 +960,7 @@ class SyncUseCasesTest {
             assertEquals(SyncCheckpoints.EMPTY, stateRepository.current.checkpoints)
             assertEquals(1, calendar.deleteAttempts)
             assertEquals(listOf(SyncFence(2, 3)), scheduler.continuations)
+            assertEquals(listOf(profile() to SyncFence(2, 3)), remote.preparedStateInvalidations)
         }
 
     @Test
@@ -1359,6 +1361,7 @@ class SyncUseCasesTest {
             val next = checkpoints("sync-18")
             val remote = FakeRemote(mutableListOf(page(next, false), page(next, false)), trace)
             val scheduler = FakeScheduler(trace)
+            val diagnostics = RecordingSyncDiagnostics()
             val tooLargeExecutor =
                 executor(
                     stateRepository,
@@ -1366,6 +1369,7 @@ class SyncUseCasesTest {
                     FakeCalendar(trace, LocalPageOutcome.TransactionTooLarge),
                     scheduler,
                     trace,
+                    diagnostics = diagnostics,
                 )
 
             val retryOutcome = tooLargeExecutor.execute(stateRepository.current.fence)
@@ -1374,6 +1378,12 @@ class SyncUseCasesTest {
             assertEquals("sync-16", stateRepository.current.checkpoints.collectionSyncKey)
             assertEquals(50, stateRepository.current.checkpoints.windowSize)
             assertEquals(listOf(SyncFence(2, 3)), scheduler.continuations)
+            val capacity = diagnostics.events.single { event -> event.kind == SyncDiagnosticKind.CAPACITY }
+            assertEquals(SyncCapacityKind.CALENDAR_PROVIDER_TRANSACTION, capacity.capacityKind)
+            assertEquals(SyncCapacityOutcome.WINDOW_REDUCTION, capacity.capacityOutcome)
+            assertEquals(SyncProblem.CALENDAR_PROVIDER, capacity.problem)
+            assertEquals(100, capacity.windowSize)
+            assertEquals(50, capacity.reducedWindowSize)
 
             val completedOutcome =
                 executor(
@@ -1407,8 +1417,9 @@ class SyncUseCasesTest {
                     trace,
                 )
             val calendar = FakeCalendar(trace)
+            val diagnostics = RecordingSyncDiagnostics()
 
-            val outcome = executor(stateRepository, remote, calendar, scheduler, trace)
+            val outcome = executor(stateRepository, remote, calendar, scheduler, trace, diagnostics = diagnostics)
                 .execute(stateRepository.current.fence)
 
             assertEquals(SyncSliceOutcome.Continued, outcome)
@@ -1416,6 +1427,9 @@ class SyncUseCasesTest {
             assertEquals(50, stateRepository.current.checkpoints.windowSize)
             assertTrue(calendar.appliedPages.isEmpty())
             assertEquals(listOf(SyncFence(2, 3)), scheduler.continuations)
+            val reduction = diagnostics.events.single { event -> event.kind == SyncDiagnosticKind.WINDOW_REDUCTION }
+            assertEquals(100, reduction.windowSize)
+            assertEquals(50, reduction.reducedWindowSize)
         }
 
     @Test
@@ -1458,6 +1472,7 @@ class SyncUseCasesTest {
                     runningState().copy(checkpoints = checkpoints("sync-16").copy(windowSize = 1)),
                     trace,
                 )
+            val diagnostics = RecordingSyncDiagnostics()
             val executor =
                 executor(
                     stateRepository,
@@ -1465,6 +1480,7 @@ class SyncUseCasesTest {
                     FakeCalendar(trace, LocalPageOutcome.TransactionTooLarge),
                     FakeScheduler(trace),
                     trace,
+                    diagnostics = diagnostics,
                 )
 
             val outcome = executor.execute(stateRepository.current.fence)
@@ -1472,6 +1488,11 @@ class SyncUseCasesTest {
             assertEquals(SyncSliceOutcome.Blocked(SyncProblem.CALENDAR_PROVIDER), outcome)
             assertEquals("sync-16", stateRepository.current.checkpoints.collectionSyncKey)
             assertEquals(1, stateRepository.current.checkpoints.windowSize)
+            val capacity = diagnostics.events.single { event -> event.kind == SyncDiagnosticKind.CAPACITY }
+            assertEquals(SyncCapacityKind.CALENDAR_PROVIDER_TRANSACTION, capacity.capacityKind)
+            assertEquals(SyncCapacityOutcome.MINIMUM_WINDOW_BLOCK, capacity.capacityOutcome)
+            assertEquals(1, capacity.windowSize)
+            assertEquals(null, capacity.reducedWindowSize)
         }
 
     @Test
@@ -1971,6 +1992,15 @@ class SyncUseCasesTest {
         private val onFetch: () -> Unit = {},
     ) : RemoteCalendarPort {
         val requests = mutableListOf<SyncPageRequest>()
+        val preparedStateInvalidations = mutableListOf<Pair<ConnectionProfile, SyncFence>>()
+
+        override fun invalidatePreparedState(
+            profile: ConnectionProfile,
+            fence: SyncFence,
+        ) {
+            preparedStateInvalidations += profile to fence
+            trace += "remote:invalidate-prepared-state"
+        }
 
         override suspend fun fetchPage(request: SyncPageRequest): RemotePageOutcome {
             requests += request

@@ -31,6 +31,8 @@ internal class ActiveSyncCapabilityClient(
     private val totalTimeoutMillis: Long = 30_000,
     private val transportDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val diagnostics: DeviceDiagnostics = DeviceDiagnostics(),
+    private val sessions: ActiveSyncProfileSessionRegistry = ActiveSyncProfileSessionRegistry(),
+    private val fenceValidator: ActiveSyncSynchronizationFenceValidator = AlwaysCurrentActiveSyncSynchronizationFence,
 ) : ActiveSyncCapabilityGateway {
     override suspend fun discover(profile: ConnectionProfile): ActiveSyncCapabilityOutcome =
         discover(profile, diagnostics.operation(DiagnosticOperationKind.CAPABILITY_DISCOVERY))
@@ -45,12 +47,15 @@ internal class ActiveSyncCapabilityClient(
             return ActiveSyncCapabilityOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.CLIENT_CERTIFICATE)
         }
         return try {
-            withTimeout(totalTimeoutMillis.milliseconds) {
-                val transport =
-                    withContext(transportDispatcher) {
-                        transportFactory.create(profile, resolution.credential, operation)
-                    }
-                discover(profile, resolution.credential, transport, operation)
+            pacedSynchronizationExchange(profile, operation) {
+                withTimeout(totalTimeoutMillis.milliseconds) {
+                    val transport =
+                        withContext(transportDispatcher) {
+                            transportFactory.create(profile, resolution.credential, operation)
+                        }
+                    ensureSynchronizationFenceIsCurrent(operation)
+                    discover(profile, resolution.credential, transport, operation)
+                }
             }
         } catch (failure: TimeoutCancellationException) {
             diagnostics.emit(
@@ -77,6 +82,29 @@ internal class ActiveSyncCapabilityClient(
                 failureEvent(operation, category.diagnosticStage(), outcome.problem).copy(throwable = failure),
             )
             outcome
+        }
+    }
+
+    private suspend fun <T> pacedSynchronizationExchange(
+        profile: ConnectionProfile,
+        operation: DiagnosticOperation,
+        exchange: suspend () -> T,
+    ): T =
+        if (operation.kind == DiagnosticOperationKind.SYNCHRONIZATION) {
+            sessions.acquire(profile).requestPacer.exchange(
+                beforeDispatch = { fenceValidator.isCurrent(operation) },
+                block = exchange,
+            )
+        } else {
+            exchange()
+        }
+
+    private suspend fun ensureSynchronizationFenceIsCurrent(operation: DiagnosticOperation) {
+        if (
+            operation.kind == DiagnosticOperationKind.SYNCHRONIZATION &&
+            !fenceValidator.isCurrent(operation)
+        ) {
+            throw ObsoleteActiveSyncSynchronizationException()
         }
     }
 

@@ -9,6 +9,8 @@ import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.ActiveSyncWbx
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.ActiveSyncWbxmlTokens.FolderHierarchy
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlElement
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlReader
+import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlReadLimitException
+import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlReadLimitKind
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlTag
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlWriter
 
@@ -86,6 +88,19 @@ internal class ActiveSyncProtocolDataException(
                 else -> ActiveSyncValidationReason.PROTOCOL_STRUCTURE
             }
     }
+}
+
+internal class ActiveSyncWbxmlReadLimitException(
+    val kind: WbxmlReadLimitKind,
+    val commandKind: String? = null,
+    cause: Throwable? = null,
+) : IllegalArgumentException("ActiveSync WBXML read limit exceeded", cause) {
+    fun withContext(commandKind: String): ActiveSyncWbxmlReadLimitException =
+        ActiveSyncWbxmlReadLimitException(
+            kind = kind,
+            commandKind = commandKind,
+            cause = this,
+        )
 }
 
 internal class PrimaryCalendarSelectionException : IllegalArgumentException("Primary Calendar folder is ambiguous")
@@ -356,6 +371,8 @@ private fun readRoot(body: ByteArray, expectedTag: WbxmlTag): WbxmlElement =
         WbxmlReader().read(body).also { root ->
             if (root.tag != expectedTag) throw ActiveSyncProtocolDataException("Unexpected ActiveSync response root")
         }
+    } catch (error: WbxmlReadLimitException) {
+        throw ActiveSyncWbxmlReadLimitException(error.kind, cause = error)
     } catch (error: ActiveSyncProtocolDataException) {
         throw error
     } catch (error: IllegalArgumentException) {

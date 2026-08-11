@@ -30,7 +30,6 @@ internal class AppContainer(context: Context) {
     private val applicationContext = context.applicationContext
     private val dataStore = applicationContext.applicationDataStore
     private val synchronizationMutationLock = SynchronizationMutationLock()
-    private val activeSyncRuntime = AndroidActiveSyncProcessRuntime(applicationContext)
     private val syncDiagnostics = AndroidSyncDiagnostics()
 
     val syncNotificationResources: SyncNotificationResources =
@@ -41,6 +40,9 @@ internal class AppContainer(context: Context) {
 
     val synchronizationStateRepository =
         DataStoreSynchronizationStateRepository(dataStore, mutationLock = synchronizationMutationLock)
+
+    private val activeSyncRuntime =
+        AndroidActiveSyncProcessRuntime(applicationContext, synchronizationStateRepository)
 
     val syncPermissions = AndroidSyncPermissionPort(applicationContext)
 

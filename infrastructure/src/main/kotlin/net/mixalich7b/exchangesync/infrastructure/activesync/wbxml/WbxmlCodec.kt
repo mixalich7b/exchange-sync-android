@@ -6,6 +6,17 @@ import java.nio.charset.CodingErrorAction
 
 class WbxmlFormatException(message: String) : IllegalArgumentException(message)
 
+enum class WbxmlReadLimitKind {
+    DOCUMENT_BYTES,
+    ELEMENT_COUNT,
+    DEPTH,
+    INLINE_STRING_BYTES,
+}
+
+class WbxmlReadLimitException(
+    val kind: WbxmlReadLimitKind,
+) : IllegalArgumentException("WBXML read limit exceeded: ${kind.name}")
+
 data class WbxmlLimits(
     val maxDocumentBytes: Int = 2 * 1024 * 1024,
     val maxDepth: Int = 32,
@@ -87,7 +98,9 @@ class WbxmlReader(
     private val limits: WbxmlLimits = WbxmlLimits(),
 ) {
     fun read(bytes: ByteArray): WbxmlElement {
-        if (bytes.size > limits.maxDocumentBytes) throw WbxmlFormatException("WBXML document is too large")
+        if (bytes.size > limits.maxDocumentBytes) {
+            throw WbxmlReadLimitException(WbxmlReadLimitKind.DOCUMENT_BYTES)
+        }
         val cursor = Cursor(bytes)
         if (cursor.readByte() != VERSION_1_3) throw WbxmlFormatException("Unsupported WBXML version")
         if (cursor.readMbUInt() != ACTIVE_SYNC_PUBLIC_ID) {
@@ -126,14 +139,16 @@ class WbxmlReader(
             depth: Int,
             capture: Boolean,
         ): WbxmlElement? {
-            if (depth > limits.maxDepth) throw WbxmlFormatException("WBXML nesting is too deep")
+            if (depth > limits.maxDepth) throw WbxmlReadLimitException(WbxmlReadLimitKind.DEPTH)
             consumePageSwitches()
             val rawToken = readByte()
             if (rawToken and ATTRIBUTE_BIT != 0) throw WbxmlFormatException("WBXML attributes are unsupported")
             val token = rawToken and TOKEN_MASK
             if (token < MIN_TAG_TOKEN) throw WbxmlFormatException("Unsupported WBXML global token")
             elementCount += 1
-            if (elementCount > limits.maxElements) throw WbxmlFormatException("Too many WBXML elements")
+            if (elementCount > limits.maxElements) {
+                throw WbxmlReadLimitException(WbxmlReadLimitKind.ELEMENT_COUNT)
+            }
 
             val tag = ActiveSyncWbxmlTokens.find(codePage, token)
             val shouldCapture = capture && tag != null
@@ -185,7 +200,7 @@ class WbxmlReader(
             val start = index
             while (index < bytes.size && bytes[index].toInt() != 0) {
                 if (index - start >= limits.maxInlineStringBytes) {
-                    throw WbxmlFormatException("WBXML inline string is too long")
+                    throw WbxmlReadLimitException(WbxmlReadLimitKind.INLINE_STRING_BYTES)
                 }
                 index += 1
             }

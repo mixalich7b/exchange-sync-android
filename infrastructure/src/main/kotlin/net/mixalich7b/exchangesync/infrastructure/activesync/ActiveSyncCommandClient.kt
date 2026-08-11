@@ -78,7 +78,12 @@ internal sealed interface ActiveSyncCommandOutcome {
     data class Failure(
         val kind: SyncFailureKind,
         val problem: SyncProblem?,
+        val capacityKind: ActiveSyncPageCapacityKind? = null,
     ) : ActiveSyncCommandOutcome
+}
+
+internal enum class ActiveSyncPageCapacityKind {
+    HTTP_RESPONSE_BYTES,
 }
 
 internal fun interface ActiveSyncCommandGateway {
@@ -108,6 +113,8 @@ internal class ActiveSyncCommandClient(
     private val totalTimeoutMillis: Long = 30_000,
     private val transportDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val diagnostics: DeviceDiagnostics = DeviceDiagnostics(),
+    private val sessions: ActiveSyncProfileSessionRegistry = ActiveSyncProfileSessionRegistry(),
+    private val fenceValidator: ActiveSyncSynchronizationFenceValidator = AlwaysCurrentActiveSyncSynchronizationFence,
 ) : ActiveSyncCommandGateway {
     override suspend fun execute(
         profile: ConnectionProfile,
@@ -142,22 +149,25 @@ internal class ActiveSyncCommandClient(
             return ActiveSyncCommandOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.CLIENT_CERTIFICATE)
         }
         return try {
-            withTimeout(totalTimeoutMillis.milliseconds) {
-                val transport =
-                    withContext(transportDispatcher) {
-                        transportFactory.create(profile, resolution.credential, operation)
-                    }
-                executeRedirectChain(
-                    profile,
-                    endpoint,
-                    command,
-                    deviceId,
-                    version,
-                    body,
-                    resolution.credential,
-                    transport,
-                    operation,
-                )
+            pacedSynchronizationExchange(profile, operation) {
+                withTimeout(totalTimeoutMillis.milliseconds) {
+                    val transport =
+                        withContext(transportDispatcher) {
+                            transportFactory.create(profile, resolution.credential, operation)
+                        }
+                    ensureSynchronizationFenceIsCurrent(operation)
+                    executeRedirectChain(
+                        profile,
+                        endpoint,
+                        command,
+                        deviceId,
+                        version,
+                        body,
+                        resolution.credential,
+                        transport,
+                        operation,
+                    )
+                }
             }
         } catch (failure: TimeoutCancellationException) {
             emitFailure(
@@ -193,12 +203,39 @@ internal class ActiveSyncCommandClient(
                 reasonCode = "RESPONSE_TOO_LARGE",
                 throwable = failure,
             )
-            ActiveSyncCommandOutcome.Failure(SyncFailureKind.WINDOW_TOO_LARGE, null)
+            ActiveSyncCommandOutcome.Failure(
+                SyncFailureKind.WINDOW_TOO_LARGE,
+                null,
+                ActiveSyncPageCapacityKind.HTTP_RESPONSE_BYTES,
+            )
         } catch (failure: Exception) {
             val category = ConnectionExceptionClassifier.classify(failure)
             val outcome = category.toCommandFailure()
             emitFailure(operation, command, endpoint, outcome.problem, category.diagnosticStage(), throwable = failure)
             outcome
+        }
+    }
+
+    private suspend fun <T> pacedSynchronizationExchange(
+        profile: ConnectionProfile,
+        operation: DiagnosticOperation,
+        exchange: suspend () -> T,
+    ): T =
+        if (operation.kind == DiagnosticOperationKind.SYNCHRONIZATION) {
+            sessions.acquire(profile).requestPacer.exchange(
+                beforeDispatch = { fenceValidator.isCurrent(operation) },
+                block = exchange,
+            )
+        } else {
+            exchange()
+        }
+
+    private suspend fun ensureSynchronizationFenceIsCurrent(operation: DiagnosticOperation) {
+        if (
+            operation.kind == DiagnosticOperationKind.SYNCHRONIZATION &&
+            !fenceValidator.isCurrent(operation)
+        ) {
+            throw ObsoleteActiveSyncSynchronizationException()
         }
     }
 

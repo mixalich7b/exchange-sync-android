@@ -7,6 +7,7 @@ import net.mixalich7b.exchangesync.core.sync.RemoteCalendarPort
 import net.mixalich7b.exchangesync.core.sync.RemotePageOutcome
 import net.mixalich7b.exchangesync.core.sync.SyncCheckpoints
 import net.mixalich7b.exchangesync.core.sync.SyncFailureKind
+import net.mixalich7b.exchangesync.core.sync.SyncFence
 import net.mixalich7b.exchangesync.core.sync.SyncPageRequest
 import net.mixalich7b.exchangesync.core.sync.SyncPhase
 import net.mixalich7b.exchangesync.core.sync.SyncProblem
@@ -14,11 +15,17 @@ import okhttp3.HttpUrl
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnosticEvent
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticComponent
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticActiveSyncCommand
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCapacityKind
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCapacityOutcome
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCapacityProblem
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperation
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperationKind
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticSeverity
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.SyncRequestMode
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.FolderPreparationOutcome
+import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlReadLimitKind
 
 internal sealed interface ActiveSyncCapabilityOutcome {
     data class Success(
@@ -52,6 +59,16 @@ internal class ActiveSyncRemoteCalendar(
     private val sessions: ActiveSyncProfileSessionRegistry = ActiveSyncProfileSessionRegistry(),
     private val diagnostics: DeviceDiagnostics = DeviceDiagnostics(),
 ) : RemoteCalendarPort {
+    override fun invalidatePreparedState(
+        profile: ConnectionProfile,
+        fence: SyncFence,
+    ) {
+        invalidatePreparedFolder(
+            profile,
+            diagnostics.operation(DiagnosticOperationKind.SYNCHRONIZATION, fence.generation, fence.runToken),
+        )
+    }
+
     override suspend fun fetchPage(request: SyncPageRequest): RemotePageOutcome =
         fetchPage(request) {}
 
@@ -68,6 +85,9 @@ internal class ActiveSyncRemoteCalendar(
         return try {
             fetchProtocolPage(request, reportPhase, operation)
         } catch (status: ActiveSyncStatusException) {
+            if (status.kind.invalidatesPreparedFolder()) {
+                invalidatePreparedFolder(request.profile, operation)
+            }
             emitProtocolFailure(
                 operation = operation,
                 stage = status.commandKind.diagnosticStage(),
@@ -78,6 +98,7 @@ internal class ActiveSyncRemoteCalendar(
             )
             RemotePageOutcome.Failure(status.kind, status.problem)
         } catch (failure: PrimaryCalendarSelectionException) {
+            invalidatePreparedFolder(request.profile, operation)
             emitProtocolFailure(
                 operation,
                 DiagnosticStage.FOLDER_SYNC,
@@ -87,7 +108,24 @@ internal class ActiveSyncRemoteCalendar(
                 throwable = failure,
             )
             RemotePageOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.PRIMARY_CALENDAR)
+        } catch (failure: ActiveSyncWbxmlReadLimitException) {
+            if (failure.commandKind == ActiveSyncCommand.FOLDER_SYNC.wireValue) {
+                invalidatePreparedFolder(request.profile, operation)
+            }
+            emitWbxmlCapacity(
+                operation = operation,
+                kind = failure.kind,
+                command = failure.commandKind.toDiagnosticCommand(),
+                windowSize = request.checkpoints.windowSize.takeIf {
+                    failure.commandKind == ActiveSyncCommand.SYNC.wireValue
+                },
+                pageScaled = false,
+            )
+            RemotePageOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.PROTOCOL_DATA)
         } catch (failure: ActiveSyncProtocolDataException) {
+            if (failure.commandKind == ActiveSyncCommand.FOLDER_SYNC.wireValue) {
+                invalidatePreparedFolder(request.profile, operation)
+            }
             emitProtocolFailure(
                 operation = operation,
                 stage = DiagnosticStage.EVENT_PARSE,
@@ -151,7 +189,15 @@ internal class ActiveSyncRemoteCalendar(
                     operation = operation,
                 )
             when (priming) {
-                is ActiveSyncCommandOutcome.Failure -> return priming.toRemoteFailure()
+                is ActiveSyncCommandOutcome.Failure -> {
+                    priming.capacityKind?.let { capacityKind ->
+                        emitPageCapacity(operation, capacityKind, request.checkpoints.windowSize)
+                    }
+                    if (priming.kind.invalidatesPreparedFolder()) {
+                        invalidatePreparedFolder(request.profile, operation)
+                    }
+                    return priming.toRemoteFailure()
+                }
                 is ActiveSyncCommandOutcome.Success -> {
                     emitSyncResponse(
                         operation = operation,
@@ -195,7 +241,15 @@ internal class ActiveSyncRemoteCalendar(
                 operation = operation,
             )
         return when (calendarOutcome) {
-            is ActiveSyncCommandOutcome.Failure -> calendarOutcome.toRemoteFailure()
+            is ActiveSyncCommandOutcome.Failure -> {
+                calendarOutcome.capacityKind?.let { capacityKind ->
+                    emitPageCapacity(operation, capacityKind, request.checkpoints.windowSize)
+                }
+                if (calendarOutcome.kind.invalidatesPreparedFolder()) {
+                    invalidatePreparedFolder(request.profile, operation)
+                }
+                calendarOutcome.toRemoteFailure()
+            }
             is ActiveSyncCommandOutcome.Success -> {
                 val mode =
                     if (request.fullSyncRequired) {
@@ -217,7 +271,21 @@ internal class ActiveSyncRemoteCalendar(
                             moreAvailable = false,
                         )
                     } else {
-                        decodeCalendarResponse(calendarOutcome.body, folder.primaryCalendarId)
+                        try {
+                            decodeCalendarResponse(calendarOutcome.body, folder.primaryCalendarId)
+                        } catch (failure: ActiveSyncWbxmlReadLimitException) {
+                            if (failure.kind.isPageScaled()) {
+                                emitWbxmlCapacity(
+                                    operation = operation,
+                                    kind = failure.kind,
+                                    command = DiagnosticActiveSyncCommand.SYNC,
+                                    windowSize = request.checkpoints.windowSize,
+                                    pageScaled = true,
+                                )
+                                return RemotePageOutcome.Failure(SyncFailureKind.WINDOW_TOO_LARGE, null)
+                            }
+                            throw failure
+                        }
                     }
                 emitDecodedPage(operation, mode, collectionKey, page)
                 if (page.moreAvailable && page.syncKey == collectionKey) {
@@ -320,6 +388,7 @@ internal class ActiveSyncRemoteCalendar(
                 }
         session.recordCapability(capability)
         if (savedVersion != null && savedVersion !in capability.supportedVersions) {
+            invalidatePreparedFolder(request.profile, operation)
             return Preparation.Failure(
                 RemotePageOutcome.Failure(SyncFailureKind.FULL_RESET_REQUIRED, null),
             )
@@ -335,9 +404,27 @@ internal class ActiveSyncRemoteCalendar(
         capability: PreparedCapability,
         operation: DiagnosticOperation,
     ): Preparation<PreparedFolder> {
+        val session = sessions.acquire(request.profile)
+        session.preparedFolder(request.fence, capability.version)?.let { prepared ->
+            emitFolderPreparation(operation, FolderPreparationOutcome.REUSE)
+            return Preparation.Success(
+                PreparedFolder(
+                    folderSyncKey = prepared.folderSyncKey,
+                    primaryCalendarId = prepared.primaryCalendarId,
+                    endpoint = prepared.terminalEndpoint,
+                ),
+            )
+        }
+        val refreshOutcome =
+            if (session.hasPreparedFolder()) {
+                FolderPreparationOutcome.REFRESH
+            } else {
+                FolderPreparationOutcome.COLD_REFRESH
+            }
         val savedPrimary = request.checkpoints.primaryCalendarId
         val savedFolderKey = request.checkpoints.folderSyncKey
         val folderKey = savedFolderKey ?: "0"
+        emitFolderPreparation(operation, refreshOutcome)
         val outcome =
             commands.execute(
                 profile = request.profile,
@@ -350,6 +437,9 @@ internal class ActiveSyncRemoteCalendar(
             )
         return when (outcome) {
             is ActiveSyncCommandOutcome.Failure -> {
+                if (outcome.kind.invalidatesPreparedFolder()) {
+                    invalidatePreparedFolder(request.profile, operation)
+                }
                 Preparation.Failure(outcome.toRemoteFailure())
             }
             is ActiveSyncCommandOutcome.Success -> {
@@ -361,7 +451,22 @@ internal class ActiveSyncRemoteCalendar(
                         FolderHierarchyReducer.apply(FolderHierarchyState("0", emptyMap()), page)
                     }
                 val primary = PrimaryCalendarSelector.select(state.folders.values)
-                Preparation.Success(PreparedFolder(page.syncKey, primary.serverId, outcome.terminalEndpoint))
+                val prepared =
+                    ActiveSyncPreparedFolder(
+                        fence = request.fence,
+                        version = capability.version,
+                        terminalEndpoint = outcome.terminalEndpoint,
+                        folderSyncKey = page.syncKey,
+                        primaryCalendarId = primary.serverId,
+                    )
+                session.recordPreparedFolder(prepared)
+                Preparation.Success(
+                    PreparedFolder(
+                        prepared.folderSyncKey,
+                        prepared.primaryCalendarId,
+                        prepared.terminalEndpoint,
+                    ),
+                )
             }
         }
     }
@@ -427,6 +532,8 @@ internal class ActiveSyncRemoteCalendar(
             throw status.withCommand(ActiveSyncCommand.FOLDER_SYNC.wireValue)
         } catch (failure: ActiveSyncProtocolDataException) {
             throw failure.withContext(ActiveSyncCommand.FOLDER_SYNC.wireValue)
+        } catch (failure: ActiveSyncWbxmlReadLimitException) {
+            throw failure.withContext(ActiveSyncCommand.FOLDER_SYNC.wireValue)
         }
 
     private fun decodeCalendarResponse(
@@ -438,6 +545,8 @@ internal class ActiveSyncRemoteCalendar(
         } catch (status: ActiveSyncStatusException) {
             throw status.withCommand(ActiveSyncCommand.SYNC.wireValue)
         } catch (failure: ActiveSyncProtocolDataException) {
+            throw failure.withContext(ActiveSyncCommand.SYNC.wireValue)
+        } catch (failure: ActiveSyncWbxmlReadLimitException) {
             throw failure.withContext(ActiveSyncCommand.SYNC.wireValue)
         }
 
@@ -470,6 +579,114 @@ internal class ActiveSyncRemoteCalendar(
             ActiveSyncCommand.FOLDER_SYNC.wireValue -> DiagnosticStage.FOLDER_SYNC
             ActiveSyncCommand.SYNC.wireValue -> DiagnosticStage.CALENDAR_SYNC
             else -> DiagnosticStage.COMMAND
+        }
+
+    private fun WbxmlReadLimitKind.isPageScaled(): Boolean =
+        this == WbxmlReadLimitKind.DOCUMENT_BYTES || this == WbxmlReadLimitKind.ELEMENT_COUNT
+
+    private fun SyncFailureKind.invalidatesPreparedFolder(): Boolean =
+        this == SyncFailureKind.INVALID_KEY || this == SyncFailureKind.FULL_RESET_REQUIRED
+
+    private fun emitWbxmlCapacity(
+        operation: DiagnosticOperation,
+        kind: WbxmlReadLimitKind,
+        command: DiagnosticActiveSyncCommand?,
+        windowSize: Int?,
+        pageScaled: Boolean,
+    ) =
+        emitCapacity(
+            operation = operation,
+            kind = kind.toDiagnosticCapacityKind(),
+            command = command,
+            windowSize = windowSize,
+            pageScaled = pageScaled,
+        )
+
+    private fun emitPageCapacity(
+        operation: DiagnosticOperation,
+        kind: ActiveSyncPageCapacityKind,
+        windowSize: Int,
+    ) =
+        emitCapacity(
+            operation = operation,
+            kind =
+                when (kind) {
+                    ActiveSyncPageCapacityKind.HTTP_RESPONSE_BYTES -> DiagnosticCapacityKind.HTTP_RESPONSE_BYTES
+                },
+            command = DiagnosticActiveSyncCommand.SYNC,
+            windowSize = windowSize,
+            pageScaled = true,
+        )
+
+    private fun emitCapacity(
+        operation: DiagnosticOperation,
+        kind: DiagnosticCapacityKind,
+        command: DiagnosticActiveSyncCommand?,
+        windowSize: Int?,
+        pageScaled: Boolean,
+    ) {
+        val canReduce = pageScaled && windowSize != null && windowSize > 1
+        diagnostics.emit(
+            DeviceDiagnosticEvent(
+                severity = DiagnosticSeverity.WARN,
+                component = DiagnosticComponent.ACTIVE_SYNC,
+                stage = DiagnosticStage.WBXML,
+                operation = operation,
+                capacityKind = kind,
+                capacityCommand = command,
+                capacityOutcome =
+                    when {
+                        canReduce -> DiagnosticCapacityOutcome.WINDOW_REDUCTION
+                        pageScaled -> DiagnosticCapacityOutcome.MINIMUM_WINDOW_BLOCK
+                        else -> DiagnosticCapacityOutcome.TERMINAL
+                    },
+                capacityProblem = DiagnosticCapacityProblem.PROTOCOL_DATA,
+                windowSize = windowSize,
+                reducedWindowSize =
+                    windowSize
+                        ?.div(2)
+                        ?.coerceAtLeast(1)
+                        ?.takeIf { canReduce },
+            ),
+        )
+    }
+
+    private fun emitFolderPreparation(
+        operation: DiagnosticOperation,
+        outcome: FolderPreparationOutcome,
+    ) {
+        diagnostics.emit(
+            DeviceDiagnosticEvent(
+                severity = DiagnosticSeverity.INFO,
+                component = DiagnosticComponent.ACTIVE_SYNC,
+                stage = DiagnosticStage.FOLDER_SYNC,
+                operation = operation,
+                folderPreparationOutcome = outcome,
+            ),
+        )
+    }
+
+    private fun invalidatePreparedFolder(
+        profile: ConnectionProfile,
+        operation: DiagnosticOperation,
+    ) {
+        sessions.acquire(profile).clearPreparedFolder()
+        emitFolderPreparation(operation, FolderPreparationOutcome.INVALIDATED)
+    }
+
+    private fun WbxmlReadLimitKind.toDiagnosticCapacityKind(): DiagnosticCapacityKind =
+        when (this) {
+            WbxmlReadLimitKind.DOCUMENT_BYTES -> DiagnosticCapacityKind.WBXML_DOCUMENT_BYTES
+            WbxmlReadLimitKind.ELEMENT_COUNT -> DiagnosticCapacityKind.WBXML_ELEMENT_COUNT
+            WbxmlReadLimitKind.DEPTH -> DiagnosticCapacityKind.WBXML_DEPTH
+            WbxmlReadLimitKind.INLINE_STRING_BYTES -> DiagnosticCapacityKind.WBXML_INLINE_STRING_BYTES
+        }
+
+    private fun String?.toDiagnosticCommand(): DiagnosticActiveSyncCommand? =
+        when (this) {
+            ActiveSyncCommand.FOLDER_SYNC.wireValue -> DiagnosticActiveSyncCommand.FOLDER_SYNC
+            ActiveSyncCommand.SYNC.wireValue -> DiagnosticActiveSyncCommand.SYNC
+            else -> null
         }
 
     private companion object {

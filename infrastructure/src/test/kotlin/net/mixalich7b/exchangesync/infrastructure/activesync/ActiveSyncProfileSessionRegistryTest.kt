@@ -3,6 +3,7 @@ package net.mixalich7b.exchangesync.infrastructure.activesync
 import java.util.concurrent.TimeUnit
 import net.mixalich7b.exchangesync.core.connection.ConnectionProfile
 import net.mixalich7b.exchangesync.core.sync.ActiveSyncVersion
+import net.mixalich7b.exchangesync.core.sync.SyncFence
 import okhttp3.Cookie
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -81,6 +82,36 @@ class ActiveSyncProfileSessionRegistryTest {
 
         assertEquals(capability, registry.acquire(profile()).liveCapability())
         assertNull(registry.acquire(profile(email = "other@example.test")).liveCapability())
+    }
+
+    @Test
+    fun `prepared folder state requires the exact fence version profile and process session`() {
+        val registry = ActiveSyncProfileSessionRegistry(maximumProfiles = 2)
+        val session = registry.acquire(profile())
+        val prepared =
+            ActiveSyncPreparedFolder(
+                fence = SyncFence(3, 9),
+                version = ActiveSyncVersion.V16_1,
+                terminalEndpoint = endpoint(),
+                folderSyncKey = "folder-key",
+                primaryCalendarId = "primary-calendar",
+            )
+
+        session.recordPreparedFolder(prepared)
+
+        assertEquals(prepared, session.preparedFolder(SyncFence(3, 9), ActiveSyncVersion.V16_1))
+        assertNull(session.preparedFolder(SyncFence(3, 10), ActiveSyncVersion.V16_1))
+        assertNull(session.preparedFolder(SyncFence(4, 9), ActiveSyncVersion.V16_1))
+        assertNull(session.preparedFolder(SyncFence(3, 9), ActiveSyncVersion.V14_1))
+        assertNull(registry.acquire(profile(email = "other@example.test")).preparedFolder(SyncFence(3, 9), ActiveSyncVersion.V16_1))
+        assertNull(
+            ActiveSyncProfileSessionRegistry()
+                .acquire(profile())
+                .preparedFolder(SyncFence(3, 9), ActiveSyncVersion.V16_1),
+        )
+
+        session.clearPreparedFolder()
+        assertNull(session.preparedFolder(SyncFence(3, 9), ActiveSyncVersion.V16_1))
     }
 
     private fun profile(

@@ -6,6 +6,7 @@ import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.ActiveSyncWbx
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlElement
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlFormatException
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlReader
+import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlReadLimitKind
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlWriter
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -213,6 +214,18 @@ class ActiveSyncProtocolCodecTest {
             )
 
         assertFalse(CalendarSyncCodec.decodeResponse(response, "calendar-1").moreAvailable)
+    }
+
+    @Test
+    fun `calendar decoder preserves a typed WBXML document capacity outcome`() {
+        val oversizedDocument = ByteArray(2 * 1024 * 1024 + 1)
+
+        val failure =
+            assertThrows(ActiveSyncWbxmlReadLimitException::class.java) {
+                CalendarSyncCodec.decodeResponse(oversizedDocument, "calendar-1")
+            }
+
+        assertEquals(WbxmlReadLimitKind.DOCUMENT_BYTES, failure.kind)
     }
 
     private fun wbxml(root: WbxmlElement): ByteArray = WbxmlWriter().write(root)
