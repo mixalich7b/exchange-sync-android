@@ -93,10 +93,13 @@ UI показывает progress и не принимает редактиров
 OPTIONS https://<hostname>:443/Microsoft-Server-ActiveSync
 ```
 
-Автоматические redirects OkHttp отключены. Verifier самостоятельно обрабатывает
-коды 300, 301, 302, 303, 307 и 308, повторяя `OPTIONS` и сохраняя ту же mTLS
-конфигурацию. Разрешены относительные и cross-host HTTPS destinations. Каждый
-destination проходит обычную проверку hostname и цепочки сертификатов.
+Автоматические redirects OkHttp отключены. Общий `RedirectTracker` остаётся
+единственным источником redirect policy для capability и command paths: он
+обрабатывает коды 300, 301, 302, 303, 307 и 308, сохраняет исходный HTTP method
+и, для `POST`, неизменное WBXML body. Разрешены относительные и cross-host HTTPS
+destinations. Каждый destination проходит обычную проверку hostname и цепочки
+сертификатов. Такой явный цикл нужен, чтобы OkHttp не переписал ActiveSync
+method/body и чтобы каждый hop попал в общую проверку и diagnostics.
 
 Probe завершается ошибкой redirect policy, если `Location` отсутствует или
 некорректен, содержит embedded credentials, переводит соединение на HTTP,
@@ -120,8 +123,16 @@ capability check значимы только terminal status, обязатель
 diagnostics.
 
 Токены заголовков разделяются запятыми и очищаются от пробелов; имена команд
-сопоставляются без учёта регистра. Terminal TLS handshake также должен содержать
-leaf выбранного клиентского сертификата, иначе mTLS считается неподтверждённым.
+сопоставляются без учёта регистра. Выбранные KeyChain private key и certificate
+chain настраиваются как единственная client identity TLS transport. После
+успешного проверенного HTTPS response пустой `Handshake.localCertificates`
+считается отсутствующей у Android/Conscrypt participation metadata, а не
+отказом mTLS. Если provider всё же возвращает local chain, её leaf должна
+совпадать с настроенной identity; наблюдаемое несовпадение остаётся ошибкой.
+Недоступный KeyChain material, TLS/hostname/server-chain failure и HTTP
+authentication rejection также сохраняют прежние устойчивые категории ошибок.
+Diagnostics поэтому различают факт настройки fixed identity и доступность
+platform evidence, но не заявляют недоказанное участие конкретных байтов.
 
 После успешного terminal response приложение показывает эфемерную TLS-сводку:
 конечный hostname и доступную из проверенного handshake цепочку server X.509

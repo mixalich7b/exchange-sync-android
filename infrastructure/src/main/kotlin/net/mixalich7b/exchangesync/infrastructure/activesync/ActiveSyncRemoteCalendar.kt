@@ -18,6 +18,7 @@ import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperatio
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperationKind
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticSeverity
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.SyncRequestMode
 
 internal sealed interface ActiveSyncCapabilityOutcome {
     data class Success(
@@ -152,7 +153,19 @@ internal class ActiveSyncRemoteCalendar(
             when (priming) {
                 is ActiveSyncCommandOutcome.Failure -> return priming.toRemoteFailure()
                 is ActiveSyncCommandOutcome.Success -> {
+                    emitSyncResponse(
+                        operation = operation,
+                        mode = SyncRequestMode.PRIMING,
+                        windowSize = request.checkpoints.windowSize,
+                        body = priming.body,
+                    )
                     val primed = decodeCalendarResponse(priming.body, folder.primaryCalendarId)
+                    emitDecodedPage(
+                        operation = operation,
+                        mode = SyncRequestMode.PRIMING,
+                        previousKey = "0",
+                        page = primed,
+                    )
                     if (primed.commands.isNotEmpty() || primed.moreAvailable || primed.syncKey == "0") {
                         throw ActiveSyncProtocolDataException(
                             "Invalid Calendar Sync priming response",
@@ -184,6 +197,18 @@ internal class ActiveSyncRemoteCalendar(
         return when (calendarOutcome) {
             is ActiveSyncCommandOutcome.Failure -> calendarOutcome.toRemoteFailure()
             is ActiveSyncCommandOutcome.Success -> {
+                val mode =
+                    if (request.fullSyncRequired) {
+                        SyncRequestMode.FULL
+                    } else {
+                        SyncRequestMode.INCREMENTAL
+                    }
+                emitSyncResponse(
+                    operation = operation,
+                    mode = mode,
+                    windowSize = request.checkpoints.windowSize,
+                    body = calendarOutcome.body,
+                )
                 val page =
                     if (calendarOutcome.body.isEmpty()) {
                         RawCalendarSyncPage(
@@ -194,6 +219,7 @@ internal class ActiveSyncRemoteCalendar(
                     } else {
                         decodeCalendarResponse(calendarOutcome.body, folder.primaryCalendarId)
                     }
+                emitDecodedPage(operation, mode, collectionKey, page)
                 if (page.moreAvailable && page.syncKey == collectionKey) {
                     throw ActiveSyncProtocolDataException(
                         "Calendar SyncKey did not advance while more changes are available",
@@ -220,6 +246,58 @@ internal class ActiveSyncRemoteCalendar(
                 )
             }
         }
+    }
+
+    private fun emitSyncResponse(
+        operation: DiagnosticOperation,
+        mode: SyncRequestMode,
+        windowSize: Int,
+        body: ByteArray,
+    ) {
+        diagnostics.emit(
+            DeviceDiagnosticEvent(
+                severity = DiagnosticSeverity.INFO,
+                component = DiagnosticComponent.ACTIVE_SYNC,
+                stage = DiagnosticStage.RESPONSE,
+                operation = operation,
+                method = "POST",
+                command = ActiveSyncCommand.SYNC.wireValue,
+                syncMode = mode,
+                windowSize = windowSize,
+                responseBytes = body.size,
+                responseEmpty = body.isEmpty(),
+                outcome = "success",
+            ),
+        )
+    }
+
+    private fun emitDecodedPage(
+        operation: DiagnosticOperation,
+        mode: SyncRequestMode,
+        previousKey: String,
+        page: RawCalendarSyncPage,
+    ) {
+        diagnostics.emit(
+            DeviceDiagnosticEvent(
+                severity = DiagnosticSeverity.INFO,
+                component = DiagnosticComponent.ACTIVE_SYNC,
+                stage = DiagnosticStage.CALENDAR_SYNC,
+                operation = operation,
+                command = ActiveSyncCommand.SYNC.wireValue,
+                syncMode = mode,
+                commandCount = page.commands.size,
+                addCount = page.commands.count { command -> command.kind == RawCalendarCommandKind.ADD },
+                changeCount = page.commands.count { command -> command.kind == RawCalendarCommandKind.CHANGE },
+                deleteCount =
+                    page.commands.count { command ->
+                        command.kind == RawCalendarCommandKind.DELETE ||
+                            command.kind == RawCalendarCommandKind.SOFT_DELETE
+                    },
+                moreAvailable = page.moreAvailable,
+                keyAdvanced = page.syncKey != previousKey,
+                outcome = "decoded",
+            ),
+        )
     }
 
     private suspend fun prepareCapability(

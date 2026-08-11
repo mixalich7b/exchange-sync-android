@@ -75,6 +75,7 @@ class SettingsResourcesTest {
                 "sync_cancel",
                 "sync_disable",
                 "sync_enable",
+                "sync_retry_cleanup",
                 "sync_grant_calendar_access",
                 "sync_open_notification_settings",
                 "sync_grant_notification_access",

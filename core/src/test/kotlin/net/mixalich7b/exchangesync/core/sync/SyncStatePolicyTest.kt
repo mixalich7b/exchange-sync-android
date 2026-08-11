@@ -314,6 +314,42 @@ class SyncStatePolicyTest {
     }
 
     @Test
+    fun `manual retry from blocked preserves committed progress and pending full reset`() {
+        val committed =
+            SyncCheckpoints(
+                terminalCommandUrl = "https://mail.example.test/Microsoft-Server-ActiveSync",
+                protocolVersion = ActiveSyncVersion.V16_1,
+                folderSyncKey = "folder-7",
+                primaryCalendarId = "calendar-1",
+                collectionSyncKey = "sync-19",
+                windowSize = 50,
+            )
+        val blocked =
+            SyncState.initial().copy(
+                enabled = true,
+                generation = 3,
+                runToken = 8,
+                fullSyncRequired = true,
+                checkpoints = committed,
+                phase = SyncPhase.BLOCKED,
+                problem = SyncProblem.TLS,
+            )
+
+        val queued = SyncStateTransitions.requestRun(blocked, SyncTrigger.MANUAL)
+        val coalesced = SyncStateTransitions.requestRun(queued.state, SyncTrigger.PERIODIC)
+
+        assertTrue(queued is SyncRunRequest.Queued)
+        assertEquals(SyncPhase.QUEUED, queued.state.phase)
+        assertEquals(SyncTrigger.MANUAL, queued.state.currentTrigger)
+        assertNull(queued.state.problem)
+        assertEquals(committed, queued.state.checkpoints)
+        assertTrue(queued.state.fullSyncRequired)
+        assertTrue(coalesced is SyncRunRequest.Coalesced)
+        assertEquals(queued.state.runToken, coalesced.state.runToken)
+        assertTrue(coalesced.state.followUpRequested)
+    }
+
+    @Test
     fun `persisted problems expose only stable localized category codes`() {
         val expected =
             mapOf(

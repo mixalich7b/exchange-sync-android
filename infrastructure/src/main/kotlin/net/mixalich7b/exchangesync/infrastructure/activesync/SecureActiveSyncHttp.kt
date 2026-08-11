@@ -1,6 +1,7 @@
 package net.mixalich7b.exchangesync.infrastructure.activesync
 
 import java.security.cert.Certificate
+import java.security.cert.X509Certificate
 import net.mixalich7b.exchangesync.core.connection.ConnectionProfile
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperation
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredential
@@ -17,6 +18,25 @@ internal data class SecureHttpResponse(
     fun header(name: String): String? =
         headers.entries.firstOrNull { (key, _) -> key.equals(name, ignoreCase = true) }?.value
 }
+
+internal enum class ClientIdentityParticipationEvidence(
+    val diagnosticValue: String,
+) {
+    MATCHED("participation_metadata_matched"),
+    UNAVAILABLE("participation_metadata_unavailable"),
+    MISMATCHED("participation_metadata_mismatched"),
+}
+
+internal fun SecureHttpResponse.clientIdentityParticipation(
+    expected: X509Certificate,
+): ClientIdentityParticipationEvidence =
+    when {
+        localCertificates.isEmpty() -> ClientIdentityParticipationEvidence.UNAVAILABLE
+        localCertificates.any { certificate ->
+            certificate is X509Certificate && certificate.encoded.contentEquals(expected.encoded)
+        } -> ClientIdentityParticipationEvidence.MATCHED
+        else -> ClientIdentityParticipationEvidence.MISMATCHED
+    }
 
 internal fun interface SecureHttpTransport {
     suspend fun execute(request: Request): SecureHttpResponse

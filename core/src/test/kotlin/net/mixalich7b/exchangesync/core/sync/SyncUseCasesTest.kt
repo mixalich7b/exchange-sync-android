@@ -352,7 +352,7 @@ class SyncUseCasesTest {
             val trace = mutableListOf<String>()
             val stateRepository = FakeStateRepository(idleState(), trace)
             val scheduler = FakeScheduler(trace)
-            val runNow = RequestSynchronizationNow(stateRepository, scheduler)
+            val runNow = RequestSynchronizationNow(stateRepository, scheduler, FakeProblems(trace))
 
             val queued = runNow.execute()
             val coalesced = runNow.execute()
@@ -369,6 +369,44 @@ class SyncUseCasesTest {
                 ),
                 trace,
             )
+        }
+
+    @Test
+    fun `manual retry can return to the same blocked problem without losing committed progress`() =
+        runTest {
+            val trace = mutableListOf<String>()
+            val committed = checkpoints(collectionKey = "sync-17")
+            val stateRepository =
+                FakeStateRepository(
+                    idleState().copy(
+                        checkpoints = committed,
+                        phase = SyncPhase.BLOCKED,
+                        problem = SyncProblem.TLS,
+                    ),
+                    trace,
+                )
+            val scheduler = FakeScheduler(trace)
+
+            val requested = RequestSynchronizationNow(stateRepository, scheduler, FakeProblems(trace)).execute()
+            val outcome =
+                executor(
+                    stateRepository,
+                    FakeRemote(
+                        mutableListOf(RemotePageOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.TLS)),
+                        trace,
+                    ),
+                    FakeCalendar(trace),
+                    scheduler,
+                    trace,
+                ).execute(stateRepository.current.fence)
+
+            assertTrue(requested is SyncRunRequest.Queued)
+            assertEquals(SyncSliceOutcome.Blocked(SyncProblem.TLS), outcome)
+            assertEquals(SyncPhase.BLOCKED, stateRepository.current.phase)
+            assertEquals(SyncProblem.TLS, stateRepository.current.problem)
+            assertEquals(committed, stateRepository.current.checkpoints)
+            assertEquals(listOf(SyncFence(2, 4)), scheduler.executions)
+            assertTrue(trace.indexOf("problem:clear") < trace.indexOf("scheduler:execute:2:4"))
         }
 
     @Test
@@ -445,12 +483,20 @@ class SyncUseCasesTest {
         runTest {
             val trace = mutableListOf<String>()
             val committed = checkpoints(collectionKey = "sync-17")
+            val calendar = FakeCalendar(trace)
             val stateRepository =
                 FakeStateRepository(
                     runningState(runToken = 9).copy(checkpoints = committed),
                     trace,
                 )
-            val lifecycle = lifecycle(stateRepository, trace)
+            val lifecycle =
+                SynchronizationLifecycle(
+                    stateRepository,
+                    FakeScheduler(trace),
+                    FakePermissions(calendar = true, notifications = true, trace),
+                    calendar,
+                    FakeProblems(trace),
+                )
 
             val outcome = lifecycle.cancel()
 
@@ -464,6 +510,7 @@ class SyncUseCasesTest {
             assertEquals(10L, stateRepository.current.runToken)
             assertEquals(committed, stateRepository.current.checkpoints)
             assertEquals(SyncPhase.IDLE, stateRepository.current.phase)
+            assertEquals(0, calendar.deleteAttempts)
         }
 
     @Test
@@ -553,6 +600,61 @@ class SyncUseCasesTest {
             assertTrue(stateRepository.current.calendarCleanupPending)
             assertEquals(SyncCheckpoints.EMPTY, stateRepository.current.checkpoints)
             assertTrue(trace.none { it == "calendar:delete" })
+        }
+
+    @Test
+    fun `explicit retry completes disabled cleanup without restoring network work`() =
+        runTest {
+            val trace = mutableListOf<String>()
+            val stateRepository =
+                FakeStateRepository(
+                    disabledState(generation = 8, runToken = 12).copy(
+                        calendarCleanupPending = true,
+                        problem = SyncProblem.CALENDAR_PROVIDER,
+                    ),
+                    trace,
+                )
+            val calendar = FakeCalendar(trace)
+            val lifecycle =
+                SynchronizationLifecycle(
+                    stateRepository,
+                    FakeScheduler(trace),
+                    FakePermissions(calendar = true, notifications = true, trace),
+                    calendar,
+                    FakeProblems(trace),
+                )
+
+            val outcome = lifecycle.disable()
+
+            assertEquals(SyncDisableOutcome.Disabled, outcome)
+            assertFalse(stateRepository.current.enabled)
+            assertEquals(SyncPhase.DISABLED, stateRepository.current.phase)
+            assertFalse(stateRepository.current.calendarCleanupPending)
+            assertNull(stateRepository.current.problem)
+            assertEquals(1, calendar.deleteAttempts)
+            assertEquals(listOf(OwnedCalendarCleanupTrigger.USER_RETRY), calendar.deleteTriggers)
+            assertTrue(trace.none { event -> event == "scheduler:periodic" || event.startsWith("scheduler:execute") })
+        }
+
+    @Test
+    fun `disable persists the exact cleanup failure category returned by the calendar adapter`() =
+        runTest {
+            val trace = mutableListOf<String>()
+            val stateRepository = FakeStateRepository(runningState(), trace)
+            val lifecycle =
+                SynchronizationLifecycle(
+                    stateRepository,
+                    FakeScheduler(trace),
+                    FakePermissions(calendar = true, notifications = true, trace),
+                    FakeCalendar(trace, deleteProblem = SyncProblem.CALENDAR_PERMISSION),
+                    FakeProblems(trace),
+                )
+
+            val outcome = lifecycle.disable()
+
+            assertEquals(SyncDisableOutcome.CleanupPending(SyncProblem.CALENDAR_PERMISSION), outcome)
+            assertEquals(SyncProblem.CALENDAR_PERMISSION, stateRepository.current.problem)
+            assertTrue(stateRepository.current.calendarCleanupPending)
         }
 
     @Test
@@ -725,7 +827,53 @@ class SyncUseCasesTest {
             assertFalse(stateRepository.current.calendarCleanupPending)
             assertNull(stateRepository.current.problem)
             assertEquals(1, calendar.deleteAttempts)
+            assertEquals(listOf(OwnedCalendarCleanupTrigger.PERMISSION_RECOVERY), calendar.deleteTriggers)
             assertEquals(profile(), profileRepository.load())
+        }
+
+    @Test
+    fun `provider cleanup failure remains durable across restart until retry succeeds`() =
+        runTest {
+            val trace = mutableListOf<String>()
+            val stateRepository = FakeStateRepository(runningState(), trace)
+            val failedLifecycle =
+                SynchronizationLifecycle(
+                    stateRepository,
+                    FakeScheduler(trace),
+                    FakePermissions(calendar = true, notifications = true, trace),
+                    FakeCalendar(trace, deleteResult = false),
+                    FakeProblems(trace),
+                )
+
+            val pending = failedLifecycle.disable()
+
+            assertEquals(SyncDisableOutcome.CleanupPending(SyncProblem.CALENDAR_PROVIDER), pending)
+            assertFalse(stateRepository.current.enabled)
+            assertTrue(stateRepository.current.calendarCleanupPending)
+            assertEquals(SyncProblem.CALENDAR_PROVIDER, stateRepository.current.problem)
+            val deleteCountBeforeRestart = trace.count { event -> event == "calendar:delete" }
+
+            val restartedCalendar = FakeCalendar(trace)
+            val restartedLifecycle =
+                SynchronizationLifecycle(
+                    stateRepository,
+                    FakeScheduler(trace),
+                    FakePermissions(calendar = true, notifications = true, trace),
+                    restartedCalendar,
+                    FakeProblems(trace),
+                )
+            val retry = restartedLifecycle.resumePendingCalendarCleanup()
+
+            assertEquals(SyncLifecycleOutcome.Ignored, retry)
+            assertFalse(stateRepository.current.enabled)
+            assertFalse(stateRepository.current.calendarCleanupPending)
+            assertNull(stateRepository.current.problem)
+            assertEquals(deleteCountBeforeRestart + 1, trace.count { event -> event == "calendar:delete" })
+            assertEquals(
+                listOf(OwnedCalendarCleanupTrigger.STARTUP),
+                restartedCalendar.deleteTriggers,
+            )
+            assertTrue(trace.none { event -> event == "scheduler:periodic" || event.startsWith("scheduler:execute") })
         }
 
     @Test
@@ -746,7 +894,7 @@ class SyncUseCasesTest {
                     FakeProblems(trace),
                 )
 
-            val outcome = lifecycle.onCalendarPermissionResult()
+            val outcome = lifecycle.resumePendingCalendarCleanup()
 
             assertEquals(SyncLifecycleOutcome.PermissionRequired(8), outcome)
             assertTrue(stateRepository.current.calendarCleanupPending)
@@ -850,7 +998,7 @@ class SyncUseCasesTest {
             val stateRepository = FakeStateRepository(disabledState(generation = 8, runToken = 12), trace)
             val scheduler = FakeScheduler(trace)
 
-            val outcome = RequestSynchronizationNow(stateRepository, scheduler).execute()
+            val outcome = RequestSynchronizationNow(stateRepository, scheduler, FakeProblems(trace)).execute()
 
             assertTrue(outcome is SyncRunRequest.Ignored)
             assertTrue(trace.none { it.startsWith("scheduler:") })
@@ -1134,6 +1282,73 @@ class SyncUseCasesTest {
 
             assertEquals(SyncSliceOutcome.Blocked(SyncProblem.CALENDAR_PROVIDER), outcome)
             assertEquals("sync-16", stateRepository.current.checkpoints.collectionSyncKey)
+        }
+
+    @Test
+    fun `checkpoint summary distinguishes committed skipped and failed outcomes`() =
+        runTest {
+            suspend fun executeWith(
+                stateRepository: FakeStateRepository,
+                localOutcome: LocalPageOutcome,
+                diagnostics: RecordingSyncDiagnostics,
+            ): SyncSliceOutcome =
+                executor(
+                    stateRepository,
+                    FakeRemote(mutableListOf(page(checkpoints("sync-18"), false)), mutableListOf()),
+                    FakeCalendar(mutableListOf(), localOutcome),
+                    FakeScheduler(mutableListOf()),
+                    mutableListOf(),
+                    diagnostics = diagnostics,
+                ).execute(stateRepository.current.fence)
+
+            val committedDiagnostics = RecordingSyncDiagnostics()
+            val committedState = FakeStateRepository(runningState(), mutableListOf())
+            assertEquals(
+                SyncSliceOutcome.Completed,
+                executeWith(committedState, LocalPageOutcome.Applied, committedDiagnostics),
+            )
+            assertEquals(
+                SyncCheckpointOutcome.COMMITTED,
+                committedDiagnostics.events.single { event -> event.kind == SyncDiagnosticKind.CHECKPOINT }.checkpointOutcome,
+            )
+
+            val skippedDiagnostics = RecordingSyncDiagnostics()
+            val skippedState = FakeStateRepository(runningState(), mutableListOf())
+            assertEquals(
+                SyncSliceOutcome.Blocked(SyncProblem.CALENDAR_PROVIDER),
+                executeWith(
+                    skippedState,
+                    LocalPageOutcome.Failed(SyncProblem.CALENDAR_PROVIDER),
+                    skippedDiagnostics,
+                ),
+            )
+            assertEquals(
+                SyncCheckpointOutcome.SKIPPED,
+                skippedDiagnostics.events.single { event -> event.kind == SyncDiagnosticKind.CHECKPOINT }.checkpointOutcome,
+            )
+
+            val failedDiagnostics = RecordingSyncDiagnostics()
+            val failedState =
+                FakeStateRepository(
+                    runningState(),
+                    mutableListOf(),
+                    beforeCommit = { current, next ->
+                        if (current.checkpoints != next.checkpoints) {
+                            throw IllegalStateException("checkpoint storage unavailable")
+                        }
+                    },
+                )
+            assertEquals(
+                SyncSliceOutcome.Retry,
+                executeWith(failedState, LocalPageOutcome.Applied, failedDiagnostics),
+            )
+            assertEquals("sync-16", failedState.current.checkpoints.collectionSyncKey)
+            assertEquals(
+                SyncCheckpointOutcome.FAILED,
+                failedDiagnostics.events
+                    .single { event -> event.kind == SyncDiagnosticKind.CHECKPOINT_FAILURE }
+                    .checkpointOutcome,
+            )
         }
 
     @Test
@@ -1717,18 +1932,28 @@ class SyncUseCasesTest {
         private val applyOutcome: LocalPageOutcome = LocalPageOutcome.Applied,
         private val onApply: () -> Unit = {},
         private val deleteResult: Boolean = true,
+        private val deleteProblem: SyncProblem? = null,
         private val onDelete: () -> Unit = {},
     ) : OwnedCalendarPort {
         var deleteAttempts: Int = 0
         val deleteFences = mutableListOf<SyncFence?>()
+        val deleteTriggers = mutableListOf<OwnedCalendarCleanupTrigger>()
         val appliedPages = mutableListOf<RemoteCalendarPage>()
 
-        override suspend fun deleteOwnedCalendar(fence: SyncFence?): Boolean {
+        override suspend fun deleteOwnedCalendar(
+            fence: SyncFence?,
+            trigger: OwnedCalendarCleanupTrigger,
+        ): OwnedCalendarCleanupOutcome {
             deleteAttempts += 1
             deleteFences += fence
+            deleteTriggers += trigger
             trace += "calendar:delete"
             onDelete()
-            return deleteResult
+            return when {
+                deleteProblem != null -> OwnedCalendarCleanupOutcome.Failed(deleteProblem)
+                deleteResult -> OwnedCalendarCleanupOutcome.Completed
+                else -> OwnedCalendarCleanupOutcome.Failed(SyncProblem.CALENDAR_PROVIDER)
+            }
         }
 
         override suspend fun applyPage(fence: SyncFence, page: RemoteCalendarPage): LocalPageOutcome {

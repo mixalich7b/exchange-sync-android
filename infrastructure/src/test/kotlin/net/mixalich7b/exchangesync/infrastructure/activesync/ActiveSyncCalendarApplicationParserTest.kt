@@ -194,8 +194,8 @@ class ActiveSyncCalendarApplicationParserTest {
     }
 
     @Test
-    fun `16_x application data uses structured location and InstanceId exception identity`() {
-        val instance = "2026-08-10T09:00:00.000Z"
+    fun `16_x application data uses structured location and Compact InstanceId exception identity`() {
+        val instance = "20260810T090000Z"
         val data =
             element(
                 AirSync.APPLICATION_DATA,
@@ -237,6 +237,42 @@ class ActiveSyncCalendarApplicationParserTest {
         assertEquals(ActiveSyncField.Value(true), exception.responseRequested)
         assertEquals(3, (exception.sensitivity as ActiveSyncField.Value).value.wireValue)
         assertEquals("guest@example.test", (exception.attendees as ActiveSyncField.Value).value.single().email)
+    }
+
+    @Test
+    fun `16_x exception rejects malformed and extended InstanceId values`() {
+        listOf(
+            "2026-08-10T09:00:00.000Z",
+            "20260810T090000.000Z",
+            "20260810T090000+0300",
+            "not-an-instance",
+        ).forEach { instanceId ->
+            val data =
+                element(
+                    AirSync.APPLICATION_DATA,
+                    *ordinaryChildren(subject = "Series").toTypedArray(),
+                    element(
+                        Calendar.EXCEPTIONS,
+                        element(
+                            Calendar.EXCEPTION,
+                            text(AirSyncBase.INSTANCE_ID, instanceId),
+                            text(Calendar.DELETED, "1"),
+                        ),
+                    ),
+                )
+
+            assertThrows(
+                ActiveSyncProtocolDataException::class.java,
+                {
+                    ActiveSyncCalendarApplicationParser.parse(
+                        RawCalendarCommand(RawCalendarCommandKind.ADD, "series-16", data),
+                        PROFILE_EMAIL,
+                        ActiveSyncVersion.V16_1,
+                    )
+                },
+                instanceId,
+            )
+        }
     }
 
     @Test

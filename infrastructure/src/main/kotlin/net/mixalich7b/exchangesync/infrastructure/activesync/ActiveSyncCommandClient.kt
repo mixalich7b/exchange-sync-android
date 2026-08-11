@@ -1,6 +1,5 @@
 package net.mixalich7b.exchangesync.infrastructure.activesync
 
-import java.security.cert.X509Certificate
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -268,7 +267,31 @@ internal class ActiveSyncCommandClient(
                 }
                 continue
             }
-            if (!response.used(credential.leafCertificate)) {
+            val identityEvidence = response.clientIdentityParticipation(credential.leafCertificate)
+            diagnostics.emit(
+                DeviceDiagnosticEvent(
+                    severity =
+                        if (identityEvidence == ClientIdentityParticipationEvidence.MISMATCHED) {
+                            DiagnosticSeverity.ERROR
+                        } else {
+                            DiagnosticSeverity.INFO
+                        },
+                    component = DiagnosticComponent.TLS,
+                    stage = DiagnosticStage.CLIENT_CERTIFICATE_VERIFICATION,
+                    operation = operation,
+                    method = "POST",
+                    command = command.wireValue,
+                    host = currentEndpoint.diagnosticHost(),
+                    path = currentEndpoint.diagnosticPath(),
+                    chainLength = response.localCertificates.size,
+                    reasonCode = "FIXED_IDENTITY_CONFIGURED",
+                    failureCategory =
+                        SyncProblem.CLIENT_CERTIFICATE.name
+                            .takeIf { identityEvidence == ClientIdentityParticipationEvidence.MISMATCHED },
+                    outcome = identityEvidence.diagnosticValue,
+                ),
+            )
+            if (identityEvidence == ClientIdentityParticipationEvidence.MISMATCHED) {
                 emitFailure(
                     operation,
                     command,
@@ -334,11 +357,6 @@ internal class ActiveSyncCommandClient(
             449 -> ActiveSyncCommandOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.UNSUPPORTED_PROVISIONING)
             408, 429, in 500..599 -> ActiveSyncCommandOutcome.Failure(SyncFailureKind.TRANSIENT, null)
             else -> ActiveSyncCommandOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.COMPATIBILITY)
-        }
-
-    private fun SecureHttpResponse.used(expected: X509Certificate): Boolean =
-        localCertificates.any { certificate ->
-            certificate is X509Certificate && certificate.encoded.contentEquals(expected.encoded)
         }
 
     private fun ConnectionFailure.toCommandFailure(): ActiveSyncCommandOutcome.Failure =

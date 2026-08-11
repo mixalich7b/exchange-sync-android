@@ -14,6 +14,9 @@ import net.mixalich7b.exchangesync.core.connection.ConnectionFailure
 import net.mixalich7b.exchangesync.core.connection.ConnectionProfile
 import net.mixalich7b.exchangesync.core.connection.TlsCertificateDiagnostic
 import net.mixalich7b.exchangesync.core.connection.TlsConnectionDiagnostics
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticSeverity
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredential
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredentialResolution
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredentialResolver
@@ -70,6 +73,68 @@ class ActiveSyncConnectionVerifierTest {
             assertEquals(ConnectionCheckResult.Success(expectedDiagnostics("exchange.example.test")), result)
             assertEquals(1, factory.createCalls)
             assertEquals(listOf("OPTIONS"), factory.transport.requests.map { request -> request.method })
+        }
+
+    @Test
+    fun `successful validated capability is accepted when local certificate metadata is unavailable`() =
+        runTest {
+            val credential = credential()
+            val factory =
+                RecordingTransportFactory(
+                    listOf(
+                        ProbeResponse(
+                            statusCode = 200,
+                            headers =
+                                mapOf(
+                                    "MS-ASProtocolVersions" to "16.1",
+                                    "MS-ASProtocolCommands" to "FolderSync,Sync",
+                                ),
+                            peerCertificates = listOf(peerCertificate()),
+                        ),
+                    ),
+                )
+
+            val result = verifier(credential, factory).verify(profile())
+
+            assertEquals(ConnectionCheckResult.Success(expectedDiagnostics("exchange.example.test")), result)
+        }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `configured identity is distinguished from unavailable participation metadata`() =
+        runTest {
+            val credential = credential()
+            val events = mutableListOf<net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnosticEvent>()
+            val diagnostics = DeviceDiagnostics { event -> events += event }
+            val factory =
+                RecordingTransportFactory(
+                    listOf(
+                        ProbeResponse(
+                            statusCode = 200,
+                            headers =
+                                mapOf(
+                                    "MS-ASProtocolVersions" to "16.1",
+                                    "MS-ASProtocolCommands" to "FolderSync,Sync",
+                                ),
+                            peerCertificates = listOf(peerCertificate()),
+                        ),
+                    ),
+                )
+            val verifier =
+                ActiveSyncConnectionVerifier(
+                    credentialResolver = ClientCredentialResolver { ClientCredentialResolution.Available(credential) },
+                    transportFactory = factory,
+                    transportDispatcher = UnconfinedTestDispatcher(testScheduler),
+                    diagnostics = diagnostics,
+                )
+
+            verifier.verify(profile())
+
+            val evidence = events.single { event -> event.stage == DiagnosticStage.CLIENT_CERTIFICATE_VERIFICATION }
+            assertEquals(DiagnosticSeverity.INFO, evidence.severity)
+            assertEquals("FIXED_IDENTITY_CONFIGURED", evidence.reasonCode)
+            assertEquals("participation_metadata_unavailable", evidence.outcome)
+            assertEquals(0, evidence.chainLength)
         }
 
     @OptIn(ExperimentalCoroutinesApi::class)

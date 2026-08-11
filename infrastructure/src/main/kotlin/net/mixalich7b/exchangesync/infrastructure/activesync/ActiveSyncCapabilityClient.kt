@@ -1,6 +1,5 @@
 package net.mixalich7b.exchangesync.infrastructure.activesync
 
-import java.security.cert.X509Certificate
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -129,7 +128,30 @@ internal class ActiveSyncCapabilityClient(
                 }
                 continue
             }
-            if (!response.used(credential.leafCertificate)) {
+            val identityEvidence = response.clientIdentityParticipation(credential.leafCertificate)
+            diagnostics.emit(
+                DeviceDiagnosticEvent(
+                    severity =
+                        if (identityEvidence == ClientIdentityParticipationEvidence.MISMATCHED) {
+                            DiagnosticSeverity.ERROR
+                        } else {
+                            DiagnosticSeverity.INFO
+                        },
+                    component = DiagnosticComponent.TLS,
+                    stage = DiagnosticStage.CLIENT_CERTIFICATE_VERIFICATION,
+                    operation = operation,
+                    method = "OPTIONS",
+                    host = endpoint.diagnosticHost(),
+                    path = endpoint.diagnosticPath(),
+                    chainLength = response.localCertificates.size,
+                    reasonCode = "FIXED_IDENTITY_CONFIGURED",
+                    failureCategory =
+                        SyncProblem.CLIENT_CERTIFICATE.name
+                            .takeIf { identityEvidence == ClientIdentityParticipationEvidence.MISMATCHED },
+                    outcome = identityEvidence.diagnosticValue,
+                ),
+            )
+            if (identityEvidence == ClientIdentityParticipationEvidence.MISMATCHED) {
                 diagnostics.emit(
                     failureEvent(
                         operation,
@@ -236,11 +258,6 @@ internal class ActiveSyncCapabilityClient(
             !safeHeaderTokens(commands).map(String::lowercase).containsAll(setOf("foldersync", "sync")) ->
                 "MISSING_REQUIRED_COMMAND"
             else -> "INVALID_CAPABILITY"
-        }
-
-    private fun SecureHttpResponse.used(expected: X509Certificate): Boolean =
-        localCertificates.any { certificate ->
-            certificate is X509Certificate && certificate.encoded.contentEquals(expected.encoded)
         }
 
     private fun ConnectionFailure.toCapabilityFailure(): ActiveSyncCapabilityOutcome.Failure =

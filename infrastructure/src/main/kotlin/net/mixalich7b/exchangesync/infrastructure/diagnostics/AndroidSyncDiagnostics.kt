@@ -33,6 +33,7 @@ public class AndroidSyncDiagnostics : SyncDiagnosticsPort {
                 attempt = event.attempt,
                 reasonCode = event.failureKind?.name,
                 failureCategory = event.problem?.name,
+                checkpointOutcome = event.checkpointOutcome?.let { outcome -> CheckpointOutcome.valueOf(outcome.name) },
                 outcome = event.outcome,
                 throwable = throwable,
             ),
@@ -59,6 +60,7 @@ public class AndroidSyncDiagnostics : SyncDiagnosticsPort {
         when (this) {
             SyncDiagnosticKind.START -> DiagnosticStage.START
             SyncDiagnosticKind.PHASE -> DiagnosticStage.PHASE
+            SyncDiagnosticKind.CHECKPOINT -> DiagnosticStage.CHECKPOINT
             SyncDiagnosticKind.REMOTE_FAILURE,
             SyncDiagnosticKind.LOCAL_FAILURE,
             SyncDiagnosticKind.UNEXPECTED_EXCEPTION,

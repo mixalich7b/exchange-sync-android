@@ -9,6 +9,8 @@ import net.mixalich7b.exchangesync.core.connection.ConnectionProfile
 import net.mixalich7b.exchangesync.core.sync.ActiveSyncVersion
 import net.mixalich7b.exchangesync.core.sync.SyncFailureKind
 import net.mixalich7b.exchangesync.core.sync.SyncProblem
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredential
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredentialResolution
 import net.mixalich7b.exchangesync.infrastructure.tls.ClientCredentialResolver
@@ -74,6 +76,7 @@ class ActiveSyncCommandClientTest {
     fun `command follows permitted HTTPS redirect with POST and the same mTLS identity`() =
         runTest {
             val credential = credential()
+            val requestBody = byteArrayOf(1, 2, 3)
             val transport =
                 RecordingCommandTransport(
                     listOf(
@@ -98,7 +101,7 @@ class ActiveSyncCommandClientTest {
                     command = ActiveSyncCommand.FOLDER_SYNC,
                     deviceId = "DEVICE123",
                     version = ActiveSyncVersion.V14_1,
-                    body = byteArrayOf(1, 2, 3),
+                    body = requestBody,
                 )
 
             val success = result as ActiveSyncCommandOutcome.Success
@@ -109,7 +112,75 @@ class ActiveSyncCommandClientTest {
             transport.requests.forEach { request ->
                 assertEquals("FolderSync", request.url.queryParameter("Cmd"))
                 assertEquals("14.1", request.header("MS-ASProtocolVersion"))
+                assertArrayEquals(requestBody, request.bodyBytes())
             }
+        }
+
+    @Test
+    fun `command reports every followed redirect without changing method or body`() =
+        runTest {
+            val credential = credential()
+            val requestBody = byteArrayOf(9, 8, 7)
+            val events = mutableListOf<net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnosticEvent>()
+            val diagnostics = DeviceDiagnostics { event -> events += event }
+            val transport =
+                RecordingCommandTransport(
+                    listOf(
+                        SecureHttpResponse(301, mapOf("Location" to "/first")),
+                        SecureHttpResponse(307, mapOf("Location" to "https://mail.example.test/second")),
+                        SecureHttpResponse(200, emptyMap(), body = byteArrayOf(0x03, 0x01)),
+                    ),
+                )
+
+            client(credential, transport, diagnostics).execute(
+                profile(),
+                endpoint(),
+                ActiveSyncCommand.SYNC,
+                "DEVICE123",
+                ActiveSyncVersion.V16_1,
+                requestBody,
+            )
+
+            assertEquals(listOf("POST", "POST", "POST"), transport.requests.map { request -> request.method })
+            transport.requests.forEach { request -> assertArrayEquals(requestBody, request.bodyBytes()) }
+            val redirects = events.filter { event -> event.stage == DiagnosticStage.REDIRECT }
+            assertEquals(listOf(301, 307), redirects.map { event -> event.status })
+            assertEquals(listOf("exchange.example.test", "mail.example.test"), redirects.map { event -> event.host })
+            assertEquals(listOf("follow", "follow"), redirects.map { event -> event.outcome })
+        }
+
+    @Test
+    fun `successful command response is accepted when local certificate metadata is unavailable`() =
+        runTest {
+            val credential = credential()
+            val responseBody = byteArrayOf(0x03, 0x01)
+            val client =
+                client(
+                    credential,
+                    RecordingCommandTransport(
+                        listOf(
+                            SecureHttpResponse(
+                                statusCode = 200,
+                                headers = emptyMap(),
+                                body = responseBody,
+                            ),
+                        ),
+                    ),
+                )
+
+            val result =
+                client.execute(
+                    profile(),
+                    endpoint(),
+                    ActiveSyncCommand.SYNC,
+                    "DEVICE123",
+                    ActiveSyncVersion.V16_1,
+                    byteArrayOf(1, 2, 3),
+                )
+
+            val success = result as ActiveSyncCommandOutcome.Success
+            assertEquals(endpoint(), success.terminalEndpoint)
+            assertArrayEquals(responseBody, success.body)
         }
 
     @Test
@@ -211,11 +282,13 @@ class ActiveSyncCommandClientTest {
     private fun TestScope.client(
         credential: ClientCredential,
         transport: RecordingCommandTransport,
+        diagnostics: DeviceDiagnostics = DeviceDiagnostics(),
     ): ActiveSyncCommandClient =
         ActiveSyncCommandClient(
             credentialResolver = ClientCredentialResolver { ClientCredentialResolution.Available(credential) },
             transportFactory = SecureHttpTransportFactory { _, _, _ -> transport },
             transportDispatcher = UnconfinedTestDispatcher(testScheduler),
+            diagnostics = diagnostics,
         )
 
     private class RecordingCommandTransport(responses: List<SecureHttpResponse>) : SecureHttpTransport {

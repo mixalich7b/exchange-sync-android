@@ -152,6 +152,13 @@ public class SettingsViewModel(
         }
     }
 
+    public fun onRetryCalendarCleanup() {
+        val lifecycle = synchronizationLifecycle ?: return
+        runSyncControl(SyncControlOperation.CLEANUP, SettingsUiState::isCleanupRetryEnabled) {
+            lifecycle.disable()
+        }
+    }
+
     private fun runSyncControl(
         operation: SyncControlOperation,
         isAllowed: (SettingsUiState) -> Boolean,
@@ -292,5 +299,6 @@ public class SettingsViewModel(
             syncProblem = syncState.problem,
             lastSuccessfulSyncEpochMillis = syncState.lastSuccessfulEpochMillis,
             notificationPermissionDenied = syncState.notificationPermissionDenied,
+            calendarCleanupPending = syncState.calendarCleanupPending,
         )
 }

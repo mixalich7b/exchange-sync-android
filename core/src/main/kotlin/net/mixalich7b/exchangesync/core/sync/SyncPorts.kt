@@ -20,7 +20,10 @@ public fun interface RemoteCalendarPort {
 }
 
 public interface OwnedCalendarPort {
-    public suspend fun deleteOwnedCalendar(fence: SyncFence? = null): Boolean
+    public suspend fun deleteOwnedCalendar(
+        fence: SyncFence? = null,
+        trigger: OwnedCalendarCleanupTrigger = OwnedCalendarCleanupTrigger.FULL_RESET,
+    ): OwnedCalendarCleanupOutcome
 
     public suspend fun applyPage(
         fence: SyncFence,

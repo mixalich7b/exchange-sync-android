@@ -17,6 +17,7 @@ import android.provider.CalendarContract.Calendars
 import android.provider.CalendarContract.Events
 import android.provider.CalendarContract.Reminders
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
 import java.time.Instant
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncAvailability
@@ -34,6 +35,8 @@ import net.mixalich7b.exchangesync.core.calendar.ProviderSelfStatus
 import net.mixalich7b.exchangesync.core.calendar.CalendarMappingException
 import net.mixalich7b.exchangesync.core.connection.ConnectionProfileRepository
 import net.mixalich7b.exchangesync.core.sync.LocalPageOutcome
+import net.mixalich7b.exchangesync.core.sync.OwnedCalendarCleanupOutcome
+import net.mixalich7b.exchangesync.core.sync.OwnedCalendarCleanupTrigger
 import net.mixalich7b.exchangesync.core.sync.OwnedCalendarPort
 import net.mixalich7b.exchangesync.core.sync.RemoteCalendarPage
 import net.mixalich7b.exchangesync.core.sync.SyncFence
@@ -44,12 +47,14 @@ import net.mixalich7b.exchangesync.core.sync.SyncStateTransitions
 import net.mixalich7b.exchangesync.core.sync.SynchronizationMutationLock
 import net.mixalich7b.exchangesync.infrastructure.activesync.calendar.ActiveSyncCalendarValueParsers
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.AndroidLogcatDiagnosticSink
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.CleanupTrigger
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnosticEvent
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticComponent
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperationKind
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticSeverity
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.OwnedCalendarAction
 
 internal class CalendarProviderTransactionTooLargeException : RuntimeException()
 
@@ -58,7 +63,7 @@ internal class CalendarProviderAccessException(cause: Throwable? = null) : Runti
 internal interface OwnedCalendarProviderGateway {
     fun resolveOwned(profileEmail: String): OwnedCalendarResolution
 
-    fun deleteAllOwned(): Boolean
+    fun deleteAllOwned(): OwnedCalendarCleanupResult
 
     fun queryExisting(
         calendarId: Long,
@@ -114,27 +119,92 @@ public class AndroidOwnedCalendarAdapter internal constructor(
         diagnostics = DeviceDiagnostics(AndroidLogcatDiagnosticSink()),
     )
 
-    override suspend fun deleteOwnedCalendar(fence: SyncFence?): Boolean =
+    override suspend fun deleteOwnedCalendar(
+        fence: SyncFence?,
+        trigger: OwnedCalendarCleanupTrigger,
+    ): OwnedCalendarCleanupOutcome =
         withContext(Dispatchers.IO) {
             mutationLock.withLock {
-                if (fence != null && !isCleanupFenceCurrent(fence)) return@withLock false
+                if (fence != null && !isCleanupFenceCurrent(fence)) {
+                    return@withLock OwnedCalendarCleanupOutcome.Obsolete
+                }
                 val operation =
                     diagnostics.operation(
                         DiagnosticOperationKind.SYNCHRONIZATION,
                         fence?.generation,
                         fence?.runToken,
                     )
+                val cleanupTrigger = CleanupTrigger.valueOf(trigger.name)
                 try {
-                    gateway.deleteAllOwned()
+                    val result = gateway.deleteAllOwned()
+                    diagnostics.emit(
+                        DeviceDiagnosticEvent(
+                            severity =
+                                if (result.completed) {
+                                    DiagnosticSeverity.INFO
+                                } else {
+                                    DiagnosticSeverity.ERROR
+                                },
+                            component = DiagnosticComponent.CALENDAR,
+                            stage = DiagnosticStage.CLEANUP,
+                            operation = operation,
+                            ownershipAction =
+                                if (result.deletedRowCount == 0) {
+                                    OwnedCalendarAction.UNCHANGED
+                                } else {
+                                    OwnedCalendarAction.DELETED
+                                },
+                            inputCount = result.ownedRowCount,
+                            attemptedOperationCount = result.ownedRowCount,
+                            appliedOperationCount = result.deletedRowCount,
+                            cleanupTrigger = cleanupTrigger,
+                            failureCategory = SyncProblem.CALENDAR_PROVIDER.name.takeUnless { result.completed },
+                            outcome = if (result.completed) "success" else "failure",
+                        ),
+                    )
+                    if (result.completed) {
+                        OwnedCalendarCleanupOutcome.Completed
+                    } else {
+                        OwnedCalendarCleanupOutcome.Failed(SyncProblem.CALENDAR_PROVIDER)
+                    }
+                } catch (cancellation: CancellationException) {
+                    throw cancellation
                 } catch (failure: OwnedCalendarProviderException) {
-                    emitProviderFailure(operation, DiagnosticStage.CLEANUP, SyncProblem.CALENDAR_PROVIDER, failure)
-                    false
+                    emitProviderFailure(
+                        operation,
+                        DiagnosticStage.CLEANUP,
+                        SyncProblem.CALENDAR_PROVIDER,
+                        failure,
+                        cleanupTrigger = cleanupTrigger,
+                    )
+                    OwnedCalendarCleanupOutcome.Failed(SyncProblem.CALENDAR_PROVIDER)
                 } catch (failure: CalendarProviderAccessException) {
-                    emitProviderFailure(operation, DiagnosticStage.CLEANUP, SyncProblem.CALENDAR_PROVIDER, failure)
-                    false
+                    emitProviderFailure(
+                        operation,
+                        DiagnosticStage.CLEANUP,
+                        SyncProblem.CALENDAR_PROVIDER,
+                        failure,
+                        cleanupTrigger = cleanupTrigger,
+                    )
+                    OwnedCalendarCleanupOutcome.Failed(SyncProblem.CALENDAR_PROVIDER)
                 } catch (failure: SecurityException) {
-                    emitProviderFailure(operation, DiagnosticStage.CLEANUP, SyncProblem.CALENDAR_PERMISSION, failure)
-                    false
+                    emitProviderFailure(
+                        operation,
+                        DiagnosticStage.CLEANUP,
+                        SyncProblem.CALENDAR_PERMISSION,
+                        failure,
+                        cleanupTrigger = cleanupTrigger,
+                    )
+                    OwnedCalendarCleanupOutcome.Failed(SyncProblem.CALENDAR_PERMISSION)
+                } catch (failure: RuntimeException) {
+                    emitProviderFailure(
+                        operation,
+                        DiagnosticStage.CLEANUP,
+                        SyncProblem.CALENDAR_PROVIDER,
+                        failure,
+                        cleanupTrigger = cleanupTrigger,
+                    )
+                    OwnedCalendarCleanupOutcome.Failed(SyncProblem.CALENDAR_PROVIDER)
                 }
             }
         }
@@ -160,42 +230,141 @@ public class AndroidOwnedCalendarAdapter internal constructor(
                 fence.runToken,
             )
         var stage = DiagnosticStage.OWNERSHIP
+        var attemptedOperations: Int? = null
         return try {
-            val owned = gateway.resolveOwned(profile.email)
+            val owned = callCalendarProvider { gateway.resolveOwned(profile.email) }
+            diagnostics.emit(
+                DeviceDiagnosticEvent(
+                    severity = DiagnosticSeverity.INFO,
+                    component = DiagnosticComponent.CALENDAR,
+                    stage = DiagnosticStage.OWNERSHIP,
+                    operation = operation,
+                    ownershipAction = owned.action,
+                    inputCount = page.changes.size,
+                    outcome = "success",
+                ),
+            )
             if (owned.wasRecreated && !isFullSyncRequired(fence)) {
                 throw CalendarMirrorResetRequiredException()
             }
             stage = DiagnosticStage.PROVIDER_QUERY
             val syncIds = page.changes.mapTo(linkedSetOf(), CalendarChangeIdentity::requireSyncId)
-            val existing = gateway.queryExisting(owned.calendarId, syncIds)
+            val existing = callCalendarProvider { gateway.queryExisting(owned.calendarId, syncIds) }
             stage = DiagnosticStage.EVENT_MAP
             val pagePlan = CalendarPagePlanner.plan(page, owned, existing)
-            val batchPlan = CalendarProviderBatchPlanner.plan(pagePlan, timeZoneResolver)
-            if (!isFenceCurrent(fence)) return LocalPageOutcome.Obsolete
+            diagnostics.emit(
+                DeviceDiagnosticEvent(
+                    severity = DiagnosticSeverity.INFO,
+                    component = DiagnosticComponent.CALENDAR,
+                    stage = DiagnosticStage.EVENT_MAP,
+                    operation = operation,
+                    inputCount = page.changes.size,
+                    acceptedCount = page.changes.size,
+                    rejectedCount = 0,
+                    plannedOperationCount = pagePlan.operations.size,
+                    outcome = "success",
+                ),
+            )
             stage = DiagnosticStage.PROVIDER_BATCH
-            gateway.applyBatch(batchPlan)
+            val batchPlan = CalendarProviderBatchPlanner.plan(pagePlan, timeZoneResolver)
+            attemptedOperations = batchPlan.operations.size
+            if (!isFenceCurrent(fence)) return LocalPageOutcome.Obsolete
+            callCalendarProvider { gateway.applyBatch(batchPlan) }
+            diagnostics.emit(
+                DeviceDiagnosticEvent(
+                    severity = DiagnosticSeverity.INFO,
+                    component = DiagnosticComponent.CALENDAR,
+                    stage = DiagnosticStage.PROVIDER_BATCH,
+                    operation = operation,
+                    attemptedOperationCount = attemptedOperations,
+                    appliedOperationCount = attemptedOperations,
+                    outcome = "success",
+                ),
+            )
             LocalPageOutcome.Applied
         } catch (failure: CalendarProviderTransactionTooLargeException) {
-            emitProviderFailure(operation, stage, SyncProblem.CALENDAR_PROVIDER, failure)
+            emitProviderFailure(
+                operation,
+                stage,
+                SyncProblem.CALENDAR_PROVIDER,
+                failure,
+                attemptedOperationCount = attemptedOperations ?: 0,
+            )
             LocalPageOutcome.TransactionTooLarge
         } catch (failure: CalendarMirrorResetRequiredException) {
             emitProviderFailure(operation, stage, SyncProblem.PROTOCOL_DATA, failure, failure.serverId)
             LocalPageOutcome.FullResetRequired
         } catch (failure: CalendarMappingException) {
-            emitProviderFailure(operation, DiagnosticStage.EVENT_MAP, SyncProblem.PROTOCOL_DATA, failure)
+            emitProviderFailure(
+                operation,
+                stage,
+                SyncProblem.PROTOCOL_DATA,
+                failure,
+                inputCount = page.changes.size,
+                acceptedCount = 0,
+                rejectedCount = 1,
+                attemptedOperationCount = attemptedOperations,
+            )
             LocalPageOutcome.Failed(SyncProblem.PROTOCOL_DATA)
         } catch (failure: CalendarPlanningException) {
-            emitProviderFailure(operation, DiagnosticStage.EVENT_MAP, SyncProblem.PROTOCOL_DATA, failure, failure.serverId)
+            val failedIndex = failure.serverId?.let { serverId -> page.indexOfServerId(serverId) }
+            if (failure.serverId == null) {
+                emitProviderFailure(
+                    operation,
+                    stage,
+                    SyncProblem.PROTOCOL_DATA,
+                    failure,
+                    inputCount = page.changes.size,
+                    acceptedCount = failedIndex?.coerceAtLeast(0),
+                    rejectedCount = 1,
+                    attemptedOperationCount = attemptedOperations,
+                )
+            } else {
+                emitProviderFailure(
+                    operation,
+                    stage,
+                    SyncProblem.PROTOCOL_DATA,
+                    failure,
+                    serverId = failure.serverId,
+                )
+                emitProgressFailure(
+                    operation = operation,
+                    stage = stage,
+                    problem = SyncProblem.PROTOCOL_DATA,
+                    inputCount = page.changes.size,
+                    acceptedCount = failedIndex?.coerceAtLeast(0),
+                    rejectedCount = 1,
+                    attemptedOperationCount = attemptedOperations,
+                )
+            }
             LocalPageOutcome.Failed(SyncProblem.PROTOCOL_DATA)
         } catch (failure: OwnedCalendarProviderException) {
-            emitProviderFailure(operation, stage, SyncProblem.CALENDAR_PROVIDER, failure)
+            emitProviderFailure(
+                operation,
+                stage,
+                SyncProblem.CALENDAR_PROVIDER,
+                failure,
+                attemptedOperationCount = attemptedOperations,
+            )
             LocalPageOutcome.Failed(SyncProblem.CALENDAR_PROVIDER)
         } catch (failure: CalendarProviderAccessException) {
-            emitProviderFailure(operation, stage, SyncProblem.CALENDAR_PROVIDER, failure)
+            emitProviderFailure(
+                operation,
+                stage,
+                SyncProblem.CALENDAR_PROVIDER,
+                failure,
+                attemptedOperationCount = attemptedOperations ?: 0,
+            )
             LocalPageOutcome.Failed(SyncProblem.CALENDAR_PROVIDER)
         } catch (failure: SecurityException) {
             val problem = if (hasCalendarAccess()) SyncProblem.CALENDAR_PROVIDER else SyncProblem.CALENDAR_PERMISSION
-            emitProviderFailure(operation, stage, problem, failure)
+            emitProviderFailure(
+                operation,
+                stage,
+                problem,
+                failure,
+                attemptedOperationCount = attemptedOperations ?: 0,
+            )
             LocalPageOutcome.Failed(problem)
         }
     }
@@ -206,6 +375,11 @@ public class AndroidOwnedCalendarAdapter internal constructor(
         problem: SyncProblem,
         throwable: Throwable,
         serverId: String? = null,
+        inputCount: Int? = null,
+        acceptedCount: Int? = null,
+        rejectedCount: Int? = null,
+        attemptedOperationCount: Int? = null,
+        cleanupTrigger: CleanupTrigger? = null,
     ) {
         diagnostics.emit(
             DeviceDiagnosticEvent(
@@ -216,10 +390,66 @@ public class AndroidOwnedCalendarAdapter internal constructor(
                 reasonCode = throwable.javaClass.simpleName,
                 failureCategory = problem.name,
                 serverId = serverId,
+                inputCount = inputCount,
+                acceptedCount = acceptedCount,
+                rejectedCount = rejectedCount,
+                attemptedOperationCount = attemptedOperationCount,
+                appliedOperationCount = attemptedOperationCount?.let { 0 },
+                cleanupTrigger = cleanupTrigger,
+                outcome = "failure",
                 throwable = throwable,
             ),
         )
     }
+
+    private fun emitProgressFailure(
+        operation: net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperation,
+        stage: DiagnosticStage,
+        problem: SyncProblem,
+        inputCount: Int,
+        acceptedCount: Int?,
+        rejectedCount: Int,
+        attemptedOperationCount: Int?,
+    ) {
+        diagnostics.emit(
+            DeviceDiagnosticEvent(
+                severity = DiagnosticSeverity.ERROR,
+                component = DiagnosticComponent.CALENDAR,
+                stage = stage,
+                operation = operation,
+                reasonCode = "PROGRESS_SUMMARY",
+                failureCategory = problem.name,
+                inputCount = inputCount,
+                acceptedCount = acceptedCount,
+                rejectedCount = rejectedCount,
+                attemptedOperationCount = attemptedOperationCount,
+                appliedOperationCount = attemptedOperationCount?.let { 0 },
+                outcome = "failure",
+            ),
+        )
+    }
+
+    private inline fun <T> callCalendarProvider(block: () -> T): T =
+        try {
+            block()
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (failure: SecurityException) {
+            throw failure
+        } catch (failure: CalendarProviderTransactionTooLargeException) {
+            throw failure
+        } catch (failure: CalendarProviderAccessException) {
+            throw failure
+        } catch (failure: OwnedCalendarProviderException) {
+            throw failure
+        } catch (failure: RuntimeException) {
+            throw CalendarProviderAccessException(failure)
+        }
+
+    private fun RemoteCalendarPage.indexOfServerId(serverId: String): Int =
+        changes.indexOfFirst { change ->
+            runCatching { CalendarChangeIdentity.requireSyncId(change) }.getOrNull() == serverId
+        }
 }
 
 private object CalendarChangeIdentity {
@@ -238,7 +468,7 @@ private class AndroidOwnedCalendarProviderGateway(
 
     override fun resolveOwned(profileEmail: String): OwnedCalendarResolution = resolver.resolve(profileEmail)
 
-    override fun deleteAllOwned(): Boolean = resolver.deleteAllOwned()
+    override fun deleteAllOwned(): OwnedCalendarCleanupResult = resolver.deleteAllOwned()
 
     override fun queryExisting(
         calendarId: Long,

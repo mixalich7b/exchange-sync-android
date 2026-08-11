@@ -59,6 +59,7 @@ public fun SettingsRoute(
         onCancelSynchronization = viewModel::onCancelSynchronization,
         onDisableSynchronization = viewModel::onDisableSynchronization,
         onEnableSynchronization = viewModel::onEnableSynchronization,
+        onRetryCalendarCleanup = viewModel::onRetryCalendarCleanup,
         onRequestCalendarPermission = onRequestCalendarPermission,
         onRequestNotificationPermission = onRequestNotificationPermission,
         onOpenNotificationSettings = onOpenNotificationSettings,
@@ -79,6 +80,7 @@ public fun SettingsScreen(
     onCancelSynchronization: () -> Unit,
     onDisableSynchronization: () -> Unit,
     onEnableSynchronization: () -> Unit,
+    onRetryCalendarCleanup: () -> Unit,
     onRequestCalendarPermission: () -> Unit,
     onRequestNotificationPermission: () -> Unit,
     onOpenNotificationSettings: () -> Unit,
@@ -240,6 +242,7 @@ public fun SettingsScreen(
                     onCancelSynchronization = onCancelSynchronization,
                     onDisableSynchronization = onDisableSynchronization,
                     onEnableSynchronization = onEnableSynchronization,
+                    onRetryCalendarCleanup = onRetryCalendarCleanup,
                     onRequestCalendarPermission = onRequestCalendarPermission,
                     onRequestNotificationPermission = onRequestNotificationPermission,
                     onOpenNotificationSettings = onOpenNotificationSettings,
@@ -256,6 +259,7 @@ private fun SynchronizationSection(
     onCancelSynchronization: () -> Unit,
     onDisableSynchronization: () -> Unit,
     onEnableSynchronization: () -> Unit,
+    onRetryCalendarCleanup: () -> Unit,
     onRequestCalendarPermission: () -> Unit,
     onRequestNotificationPermission: () -> Unit,
     onOpenNotificationSettings: () -> Unit,
@@ -357,6 +361,16 @@ private fun SynchronizationSection(
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text(stringResource(R.string.sync_enable))
+        }
+    }
+    if (uiState.isCleanupRetryVisible) {
+        Spacer(modifier = Modifier.height(12.dp))
+        Button(
+            onClick = onRetryCalendarCleanup,
+            enabled = uiState.isCleanupRetryEnabled,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(stringResource(R.string.sync_retry_cleanup))
         }
     }
 }

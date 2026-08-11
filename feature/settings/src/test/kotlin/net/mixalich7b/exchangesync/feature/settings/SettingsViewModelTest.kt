@@ -366,6 +366,131 @@ class SettingsViewModelTest {
         }
 
     @Test
+    fun `saved profile can retry blocked synchronization but active and repeated attempts stay serialized`() =
+        runUiTest {
+            val syncRepository =
+                FakeSyncStateRepository(
+                    SyncState.initial().copy(
+                        enabled = true,
+                        generation = 3,
+                        runToken = 4,
+                        phase = SyncPhase.BLOCKED,
+                        problem = SyncProblem.TLS,
+                    ),
+                )
+            val request = RecordingSyncRequest()
+            val viewModel =
+                SettingsViewModel(
+                    FakeRepository(profile()),
+                    RecordingSaveAction(),
+                    RecordingVerifyAction(),
+                    syncRepository,
+                    request,
+                    RecordingSyncLifecycle(),
+                )
+            advanceUntilIdle()
+
+            assertTrue(viewModel.state.value.isSyncNowVisible)
+            assertTrue(viewModel.state.value.isSyncNowEnabled)
+            viewModel.onSyncNow()
+            advanceUntilIdle()
+            assertEquals(1, request.attempts)
+
+            syncRepository.replace(syncRepository.current.copy(phase = SyncPhase.QUEUED, problem = null))
+            advanceUntilIdle()
+            assertFalse(viewModel.state.value.isSyncNowEnabled)
+            viewModel.onSyncNow()
+            advanceUntilIdle()
+            assertEquals(1, request.attempts)
+
+            syncRepository.replace(syncRepository.current.copy(phase = SyncPhase.BLOCKED, problem = SyncProblem.TLS))
+            advanceUntilIdle()
+            assertTrue(viewModel.state.value.isSyncNowEnabled)
+            viewModel.onSyncNow()
+            advanceUntilIdle()
+            assertEquals(2, request.attempts)
+        }
+
+    @Test
+    fun `synchronization controls remain unavailable without a saved profile`() =
+        runUiTest {
+            val request = RecordingSyncRequest()
+            val lifecycle = RecordingSyncLifecycle()
+            val viewModel =
+                SettingsViewModel(
+                    FakeRepository(null),
+                    RecordingSaveAction(),
+                    RecordingVerifyAction(),
+                    FakeSyncStateRepository(
+                        SyncState.initial().copy(
+                            enabled = true,
+                            generation = 3,
+                            runToken = 4,
+                            phase = SyncPhase.BLOCKED,
+                            problem = SyncProblem.TLS,
+                        ),
+                    ),
+                    request,
+                    lifecycle,
+                )
+            advanceUntilIdle()
+
+            assertFalse(viewModel.state.value.isSyncNowVisible)
+            assertFalse(viewModel.state.value.isSyncNowEnabled)
+            assertFalse(viewModel.state.value.isDisableSyncVisible)
+            assertFalse(viewModel.state.value.isEnableSyncVisible)
+            assertFalse(viewModel.state.value.isCleanupRetryVisible)
+            viewModel.onSyncNow()
+            viewModel.onDisableSynchronization()
+            viewModel.onEnableSynchronization()
+            viewModel.onRetryCalendarCleanup()
+            advanceUntilIdle()
+            assertEquals(0, request.attempts)
+            assertEquals(0, lifecycle.disableAttempts)
+            assertEquals(0, lifecycle.enableAttempts)
+        }
+
+    @Test
+    fun `disabled pending cleanup exposes a serialized cleanup retry without enable`() =
+        runUiTest {
+            val cleanupGate = CompletableDeferred<Unit>()
+            val lifecycle = RecordingSyncLifecycle(disableGate = cleanupGate)
+            val viewModel =
+                SettingsViewModel(
+                    FakeRepository(profile()),
+                    RecordingSaveAction(),
+                    RecordingVerifyAction(),
+                    FakeSyncStateRepository(
+                        SyncState.initial().copy(
+                            generation = 5,
+                            runToken = 7,
+                            calendarCleanupPending = true,
+                            problem = SyncProblem.CALENDAR_PROVIDER,
+                        ),
+                    ),
+                    RecordingSyncRequest(),
+                    lifecycle,
+                )
+            advanceUntilIdle()
+
+            assertTrue(viewModel.state.value.calendarCleanupPending)
+            assertTrue(viewModel.state.value.isCleanupRetryVisible)
+            assertTrue(viewModel.state.value.isCleanupRetryEnabled)
+            assertFalse(viewModel.state.value.isEnableSyncVisible)
+            assertFalse(viewModel.state.value.isSyncNowVisible)
+
+            viewModel.onRetryCalendarCleanup()
+
+            assertEquals(SyncControlOperation.CLEANUP, viewModel.state.value.syncControlOperation)
+            assertFalse(viewModel.state.value.isCleanupRetryEnabled)
+            assertFalse(viewModel.state.value.isEnableSyncEnabled)
+            assertEquals(1, lifecycle.disableAttempts)
+            cleanupGate.complete(Unit)
+            advanceUntilIdle()
+            assertNull(viewModel.state.value.syncControlOperation)
+        }
+
+    @Test
     fun `synchronization controls delegate run cancel disable and enable actions`() =
         runUiTest {
             val syncRepository =

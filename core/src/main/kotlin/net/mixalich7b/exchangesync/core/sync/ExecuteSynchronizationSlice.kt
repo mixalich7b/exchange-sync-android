@@ -160,10 +160,12 @@ public class ExecuteSynchronizationSlice(
                 ),
                 null,
             )
+            recordCheckpoint(fence, SyncCheckpointOutcome.SKIPPED)
         }
         return when (localOutcome) {
             LocalPageOutcome.Applied -> {
                 if (!isCurrent(fence)) {
+                    recordCheckpoint(fence, SyncCheckpointOutcome.SKIPPED)
                     SyncSliceOutcome.Obsolete
                 } else {
                     val committed =
@@ -180,12 +182,22 @@ public class ExecuteSynchronizationSlice(
                             }
                         } catch (failure: Exception) {
                             diagnostics.record(
-                                SyncDiagnosticEvent(SyncDiagnosticKind.CHECKPOINT_FAILURE, fence),
+                                SyncDiagnosticEvent(
+                                    SyncDiagnosticKind.CHECKPOINT_FAILURE,
+                                    fence,
+                                    checkpointOutcome = SyncCheckpointOutcome.FAILED,
+                                ),
                                 failure,
                             )
                             throw failure
                         }
-                    if (SyncStateTransitions.mayPerformSideEffect(committed, fence)) null else SyncSliceOutcome.Obsolete
+                    if (SyncStateTransitions.mayPerformSideEffect(committed, fence)) {
+                        recordCheckpoint(fence, SyncCheckpointOutcome.COMMITTED)
+                        null
+                    } else {
+                        recordCheckpoint(fence, SyncCheckpointOutcome.SKIPPED)
+                        SyncSliceOutcome.Obsolete
+                    }
                 }
             }
             LocalPageOutcome.Obsolete -> SyncSliceOutcome.Obsolete
@@ -193,6 +205,20 @@ public class ExecuteSynchronizationSlice(
             LocalPageOutcome.TransactionTooLarge -> reduceWindowAndContinue(fence, SyncProblem.CALENDAR_PROVIDER)
             is LocalPageOutcome.Failed -> block(fence, localOutcome.problem)
         }
+    }
+
+    private fun recordCheckpoint(
+        fence: SyncFence,
+        outcome: SyncCheckpointOutcome,
+    ) {
+        diagnostics.record(
+            SyncDiagnosticEvent(
+                kind = SyncDiagnosticKind.CHECKPOINT,
+                fence = fence,
+                checkpointOutcome = outcome,
+            ),
+            null,
+        )
     }
 
     private suspend fun requestFullReset(fence: SyncFence): SyncSliceOutcome {
@@ -296,11 +322,13 @@ public class ExecuteSynchronizationSlice(
 
     private suspend fun resumePendingCalendarReset(fence: SyncFence): SyncSliceOutcome {
         if (!isCurrent(fence)) return SyncSliceOutcome.Obsolete
-        if (!ownedCalendar.deleteOwnedCalendar(fence)) {
-            if (!isCurrent(fence)) return SyncSliceOutcome.Obsolete
-            val problem =
-                if (permissions.hasCalendarAccess()) SyncProblem.CALENDAR_PROVIDER else SyncProblem.CALENDAR_PERMISSION
-            return block(fence, problem)
+        when (val cleanup = ownedCalendar.deleteOwnedCalendar(fence, OwnedCalendarCleanupTrigger.FULL_RESET)) {
+            OwnedCalendarCleanupOutcome.Completed -> Unit
+            OwnedCalendarCleanupOutcome.Obsolete -> return SyncSliceOutcome.Obsolete
+            is OwnedCalendarCleanupOutcome.Failed -> {
+                if (!isCurrent(fence)) return SyncSliceOutcome.Obsolete
+                return block(fence, cleanup.problem)
+            }
         }
         val reset =
             stateRepository.update { latest ->

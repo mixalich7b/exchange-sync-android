@@ -16,8 +16,9 @@ Exchange в один принадлежащий приложению кален�
 После capability discovery выбирается максимальная общая версия от 14.0 до
 16.1. Клиент выполняет `FolderSync`, требует ровно одну папку default Calendar
 типа 8, затем создаёт collection partnership через `SyncKey=0` и получает
-страницы `Sync` с `GetChanges`. Date filter не используется: сохраняется вся
-история и все будущие события, возвращённые сервером.
+страницы `Sync` с `GetChanges`. Priming request содержит `SyncKey=0`, а
+последующий full sync не содержит `FilterType` или другого date filter:
+сохраняется вся история и все будущие события, возвращённые сервером.
 Успешный `Sync` с пустым HTTP body означает отсутствие изменений: текущий
 collection SyncKey сохраняется, а run завершается без protocol-data ошибки.
 
@@ -34,6 +35,9 @@ HTTP body ограничивается до выделения полного м
 sync metadata exception row и переживает последующий partial `Change`. Structured
 `AirSyncBase:Location` и `InstanceId` recurrence exceptions разбираются с учётом
 версии.
+Для ActiveSync 16.0/16.1 `InstanceId` принимает только Compact DateTime UTC
+`yyyyMMdd'T'HHmmss'Z'`. Extended/fractional и malformed значения отклоняют всю
+страницу как protocol data, поэтому checkpoint такой страницы не продвигается.
 Series-only `ResponseType` change обновляет только response presentation
 унаследованных exception rows; их текст, время, attendees, reminders и deleted
 state не пересоздаются, а explicit exception override остаётся неизменным.
@@ -90,6 +94,13 @@ run, adapter запрашивает fenced full reset и сброс checkpoint �
 calendar/event predicates; чужие календари не сканируются для ownership и не
 включаются в batch или cleanup.
 
+Ровно одна owned calendar row определяется полным внутренним ownership tuple.
+Удаление использует collection URI Calendar Provider с sync-adapter query
+parameters и повторяет в selection provider `_id`, account name, account type и
+internal name; результат проверяется по числу удалённых строк. OEM-календари и,
+в частности, строки с `account_name_local` не принимаются за owned calendar, не
+ремонтируются и не удаляются.
+
 Provider mutation и generation/run-token invalidation сериализуются общим
 mutex. Старый worker не может выполнить `resolveOwned`, batch или fenced cleanup
 после замены профиля, cancel или disable. Если другая локальная компонента
@@ -117,11 +128,22 @@ provisioning, primary-calendar, protocol и provider problems автоматич
 reset; Calendar Provider cleanup должен завершиться до публикации пустого
 checkpoint и до нового сетевого запроса.
 
-Экран показывает phase, последний успешный sync и safe problem category. Он
-предоставляет Sync Now, Cancel, Disable и Enable. Cancel увеличивает run token и
-сохраняет последний committed checkpoint. Disable сначала инвалидирует work,
-отменяет schedules, затем очищает только owned calendar; при отозванном
-разрешении cleanup остаётся persisted pending и продолжается после grant.
+Экран показывает phase, последний успешный sync и safe problem category. Для
+сохранённого включённого профиля Sync Now доступен в `IDLE` и `BLOCKED`, пока
+run не активен. Повтор из `BLOCKED` проходит тот же serialized transition,
+очищает только presentation предыдущей попытки и сохраняет committed calendar,
+checkpoint и уже установленный full-reset intent. Пока попытка queued/running,
+кнопка недоступна; повторная постоянная ошибка снова возвращает `BLOCKED` и
+разрешает более позднюю ручную попытку.
+
+Cancel увеличивает run token, сохраняет последний committed checkpoint и не
+удаляет зеркало. Disable сначала инвалидирует work, отменяет schedules, затем
+очищает только owned calendar. При permission/provider failure синхронизация
+остаётся отключённой, а cleanup intent и actionable problem сохраняются в
+DataStore. Экран показывает отдельный retry очистки и не предлагает Enable до
+её успеха. User retry, startup reconciliation и permission recovery используют
+тот же идемпотентный cleanup path без periodic/immediate network scheduling;
+успех оставляет профиль сохранённым и синхронизацию отключённой.
 
 ## Разрешения и уведомления
 

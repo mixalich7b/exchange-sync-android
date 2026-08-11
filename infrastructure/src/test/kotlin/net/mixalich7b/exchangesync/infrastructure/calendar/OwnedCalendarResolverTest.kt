@@ -49,7 +49,10 @@ class OwnedCalendarResolverTest {
     fun `delete all removes only rows returned by complete ownership query`() {
         val store = FakeOwnedCalendarStore(mutableListOf(ownedRow(1), ownedRow(2)))
 
-        assertTrue(OwnedCalendarResolver(store).deleteAllOwned())
+        assertEquals(
+            OwnedCalendarCleanupResult(ownedRowCount = 2, deletedRowCount = 2),
+            OwnedCalendarResolver(store).deleteAllOwned(),
+        )
         assertEquals(listOf(1L, 2L), store.deleted)
         assertTrue(store.rows.isEmpty())
     }

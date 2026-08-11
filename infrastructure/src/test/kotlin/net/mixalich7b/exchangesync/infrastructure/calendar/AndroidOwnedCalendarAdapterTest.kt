@@ -4,6 +4,8 @@ import android.database.Cursor
 import java.time.Instant
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Proxy
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncCalendarItem
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncCalendarException
@@ -17,17 +19,24 @@ import net.mixalich7b.exchangesync.core.calendar.ActiveSyncMeetingStatus
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncRecurrence
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncRecurrenceEnd
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncRecurrenceType
+import net.mixalich7b.exchangesync.core.calendar.ActiveSyncSystemTime
+import net.mixalich7b.exchangesync.core.calendar.ActiveSyncTimeZone
 import net.mixalich7b.exchangesync.core.calendar.ProviderEvent
 import net.mixalich7b.exchangesync.core.calendar.ProviderCalendarException
 import net.mixalich7b.exchangesync.core.connection.ConnectionProfile
 import net.mixalich7b.exchangesync.core.connection.ConnectionProfileRepository
 import net.mixalich7b.exchangesync.core.sync.LocalPageOutcome
+import net.mixalich7b.exchangesync.core.sync.OwnedCalendarCleanupOutcome
 import net.mixalich7b.exchangesync.core.sync.RemoteCalendarPage
 import net.mixalich7b.exchangesync.core.sync.SyncCheckpoints
 import net.mixalich7b.exchangesync.core.sync.SyncFence
 import net.mixalich7b.exchangesync.core.sync.SyncPhase
 import net.mixalich7b.exchangesync.core.sync.SyncProblem
 import net.mixalich7b.exchangesync.core.sync.SyncState
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnosticEvent
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.OwnedCalendarAction
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertThrows
@@ -160,6 +169,151 @@ class AndroidOwnedCalendarAdapterTest {
     }
 
     @Test
+    fun `empty page reports reused ownership and zero mapper planner and batch counts`() = runTest {
+        val events = mutableListOf<DeviceDiagnosticEvent>()
+        val gateway = RecordingCalendarGateway()
+        val adapter =
+            AndroidOwnedCalendarAdapter(
+                profileRepository = ProfileRepository(PROFILE),
+                gateway = gateway,
+                timeZoneResolver = CalendarProviderTimeZoneResolver { "UTC" },
+                diagnostics = DeviceDiagnostics { event -> events += event },
+            )
+
+        val outcome =
+            adapter.applyPage(
+                SyncFence(2, 4),
+                RemoteCalendarPage(emptyList(), SyncCheckpoints.EMPTY, moreAvailable = false),
+            )
+
+        assertEquals(LocalPageOutcome.Applied, outcome)
+        val ownership = events.single { event -> event.stage == DiagnosticStage.OWNERSHIP }
+        assertEquals(OwnedCalendarAction.REUSED, ownership.ownershipAction)
+        val mapping =
+            events.single { event ->
+                event.stage == DiagnosticStage.EVENT_MAP && event.inputCount != null
+            }
+        assertEquals(0, mapping.inputCount)
+        assertEquals(0, mapping.acceptedCount)
+        assertEquals(0, mapping.rejectedCount)
+        assertEquals(0, mapping.plannedOperationCount)
+        val batch = events.single { event -> event.stage == DiagnosticStage.PROVIDER_BATCH }
+        assertEquals(0, batch.attemptedOperationCount)
+        assertEquals(0, batch.appliedOperationCount)
+    }
+
+    @Test
+    fun `mapping failure reports the rejected input and emits no provider batch summary`() = runTest {
+        val events = mutableListOf<DeviceDiagnosticEvent>()
+        val gateway = RecordingCalendarGateway()
+        val adapter =
+            AndroidOwnedCalendarAdapter(
+                profileRepository = ProfileRepository(PROFILE),
+                gateway = gateway,
+                timeZoneResolver = CalendarProviderTimeZoneResolver { "UTC" },
+                diagnostics = DeviceDiagnostics { event -> events += event },
+            )
+        val invalid =
+            addition("invalid").copy(
+                end = ActiveSyncField.Value(Instant.parse("2026-08-09T08:59:59Z")),
+            )
+
+        val outcome =
+            adapter.applyPage(
+                SyncFence(2, 4),
+                RemoteCalendarPage(
+                    listOf(ActiveSyncCalendarMutation.Upsert(invalid, true)),
+                    SyncCheckpoints.EMPTY,
+                    moreAvailable = false,
+                ),
+            )
+
+        assertEquals(LocalPageOutcome.Failed(SyncProblem.PROTOCOL_DATA), outcome)
+        val mapping =
+            events.single { event ->
+                event.stage == DiagnosticStage.EVENT_MAP && event.inputCount != null
+            }
+        assertEquals(1, mapping.inputCount)
+        assertEquals(0, mapping.acceptedCount)
+        assertEquals(1, mapping.rejectedCount)
+        assertFalse(events.any { event -> event.stage == DiagnosticStage.PROVIDER_BATCH })
+        assertTrue(gateway.applied.isEmpty())
+    }
+
+    @Test
+    fun `planning failure separates opaque identity detail from aggregate progress`() = runTest {
+        val events = mutableListOf<DeviceDiagnosticEvent>()
+        val adapter =
+            AndroidOwnedCalendarAdapter(
+                profileRepository = ProfileRepository(PROFILE),
+                gateway = RecordingCalendarGateway(),
+                timeZoneResolver = CalendarProviderTimeZoneResolver { null },
+                diagnostics = DeviceDiagnostics { event -> events += event },
+            )
+        val item =
+            addition("opaque-server-id").copy(
+                timeZone = ActiveSyncField.Value(testTimeZone()),
+            )
+
+        val outcome =
+            adapter.applyPage(
+                SyncFence(2, 4),
+                RemoteCalendarPage(
+                    listOf(ActiveSyncCalendarMutation.Upsert(item, true)),
+                    SyncCheckpoints.EMPTY,
+                    moreAvailable = false,
+                ),
+            )
+
+        assertEquals(LocalPageOutcome.Failed(SyncProblem.PROTOCOL_DATA), outcome)
+        val failures =
+            events.filter { event ->
+                event.stage == DiagnosticStage.PROVIDER_BATCH &&
+                    event.failureCategory == SyncProblem.PROTOCOL_DATA.name
+            }
+        assertEquals(2, failures.size)
+        val detail = failures.single { event -> event.serverId != null }
+        assertEquals("opaque-server-id", detail.serverId)
+        assertEquals(null, detail.inputCount)
+        assertEquals(null, detail.acceptedCount)
+        assertEquals(null, detail.rejectedCount)
+        assertEquals(null, detail.attemptedOperationCount)
+        val progress = failures.single { event -> event.inputCount != null }
+        assertEquals(null, progress.serverId)
+        assertEquals(1, progress.inputCount)
+        assertEquals(0, progress.acceptedCount)
+        assertEquals(1, progress.rejectedCount)
+        assertEquals(null, progress.attemptedOperationCount)
+    }
+
+    @Test
+    fun `provider batch failure reports attempted operations and zero applied operations`() = runTest {
+        val events = mutableListOf<DeviceDiagnosticEvent>()
+        val gateway = RecordingCalendarGateway(applyFailure = CalendarProviderAccessException())
+        val adapter =
+            AndroidOwnedCalendarAdapter(
+                profileRepository = ProfileRepository(PROFILE),
+                gateway = gateway,
+                timeZoneResolver = CalendarProviderTimeZoneResolver { "UTC" },
+                diagnostics = DeviceDiagnostics { event -> events += event },
+            )
+        val page =
+            RemoteCalendarPage(
+                listOf(ActiveSyncCalendarMutation.Upsert(addition("one"), true)),
+                SyncCheckpoints.EMPTY,
+                moreAvailable = false,
+            )
+
+        val outcome = adapter.applyPage(SyncFence(2, 4), page)
+
+        assertEquals(LocalPageOutcome.Failed(SyncProblem.CALENDAR_PROVIDER), outcome)
+        val batch = events.single { event -> event.stage == DiagnosticStage.PROVIDER_BATCH }
+        assertEquals(1, batch.attemptedOperationCount)
+        assertEquals(0, batch.appliedOperationCount)
+        assertEquals(SyncProblem.CALENDAR_PROVIDER.name, batch.failureCategory)
+    }
+
+    @Test
     fun `transaction-too-large and permanent provider failures remain distinguishable`() = runTest {
         val tooLarge = RecordingCalendarGateway(applyFailure = CalendarProviderTransactionTooLargeException())
         val permanent = RecordingCalendarGateway(applyFailure = CalendarProviderAccessException())
@@ -202,6 +356,61 @@ class AndroidOwnedCalendarAdapterTest {
     }
 
     @Test
+    fun `raw provider runtime failures at every page gateway boundary become permanent provider problems`() = runTest {
+        val fixtures =
+            listOf(
+                RecordingCalendarGateway(resolveFailure = IllegalArgumentException("query rejected")) to
+                    DiagnosticStage.OWNERSHIP,
+                RecordingCalendarGateway(queryFailure = IllegalStateException("event query failed")) to
+                    DiagnosticStage.PROVIDER_QUERY,
+                RecordingCalendarGateway(applyFailure = IllegalArgumentException("batch rejected")) to
+                    DiagnosticStage.PROVIDER_BATCH,
+            )
+        val page =
+            RemoteCalendarPage(
+                listOf(ActiveSyncCalendarMutation.Upsert(addition("one"), true)),
+                SyncCheckpoints.EMPTY,
+                false,
+            )
+
+        fixtures.forEach { (gateway, expectedStage) ->
+            val events = mutableListOf<DeviceDiagnosticEvent>()
+            val adapter =
+                AndroidOwnedCalendarAdapter(
+                    profileRepository = ProfileRepository(PROFILE),
+                    gateway = gateway,
+                    timeZoneResolver = CalendarProviderTimeZoneResolver { "UTC" },
+                    diagnostics = DeviceDiagnostics { event -> events += event },
+                )
+
+            val outcome = adapter.applyPage(SyncFence(1, 1), page)
+
+            assertEquals(LocalPageOutcome.Failed(SyncProblem.CALENDAR_PROVIDER), outcome, expectedStage.name)
+            val failure = events.single { event -> event.stage == expectedStage }
+            assertEquals(SyncProblem.CALENDAR_PROVIDER.name, failure.failureCategory, expectedStage.name)
+        }
+    }
+
+    @Test
+    fun `page gateway preserves cooperative cancellation`() {
+        val cancellation = CancellationException("cancel provider call")
+        val adapter = adapter(RecordingCalendarGateway(applyFailure = cancellation))
+        val page =
+            RemoteCalendarPage(
+                listOf(ActiveSyncCalendarMutation.Upsert(addition("one"), true)),
+                SyncCheckpoints.EMPTY,
+                false,
+            )
+
+        val thrown =
+            assertThrows(CancellationException::class.java) {
+                runBlocking { adapter.applyPage(SyncFence(1, 1), page) }
+            }
+
+        assertEquals(cancellation.message, thrown.message)
+    }
+
+    @Test
     fun `permission revoked at the provider write boundary reports calendar permission`() = runTest {
         val gateway = RecordingCalendarGateway(applyFailure = SecurityException("revoked"))
         val adapter =
@@ -233,7 +442,7 @@ class AndroidOwnedCalendarAdapterTest {
         assertEquals(LocalPageOutcome.Failed(SyncProblem.PROTOCOL_DATA), outcome)
         assertTrue(gateway.resolvedEmails.isEmpty())
         assertTrue(gateway.applied.isEmpty())
-        assertTrue(adapter.deleteOwnedCalendar())
+        assertEquals(OwnedCalendarCleanupOutcome.Completed, adapter.deleteOwnedCalendar())
     }
 
     @Test
@@ -256,10 +465,99 @@ class AndroidOwnedCalendarAdapterTest {
                 isCleanupFenceCurrent = { false },
             )
 
-        assertTrue(current.deleteOwnedCalendar(SyncFence(3, 7)))
-        assertFalse(stale.deleteOwnedCalendar(SyncFence(2, 6)))
+        assertEquals(OwnedCalendarCleanupOutcome.Completed, current.deleteOwnedCalendar(SyncFence(3, 7)))
+        assertEquals(OwnedCalendarCleanupOutcome.Obsolete, stale.deleteOwnedCalendar(SyncFence(2, 6)))
         assertEquals(1, currentGateway.deleteCalls)
         assertEquals(0, staleGateway.deleteCalls)
+    }
+
+    @Test
+    fun `successful cleanup reports owned and deleted row counts without row identities`() = runTest {
+        val events = mutableListOf<DeviceDiagnosticEvent>()
+        val adapter =
+            AndroidOwnedCalendarAdapter(
+                profileRepository = ProfileRepository(PROFILE),
+                gateway = RecordingCalendarGateway(),
+                timeZoneResolver = CalendarProviderTimeZoneResolver { "UTC" },
+                diagnostics = DeviceDiagnostics { event -> events += event },
+            )
+
+        assertEquals(
+            OwnedCalendarCleanupOutcome.Completed,
+            adapter.deleteOwnedCalendar(
+                SyncFence(4, 7),
+                net.mixalich7b.exchangesync.core.sync.OwnedCalendarCleanupTrigger.DISABLE,
+            ),
+        )
+
+        val cleanup = events.single { event -> event.stage == DiagnosticStage.CLEANUP }
+        assertEquals(OwnedCalendarAction.DELETED, cleanup.ownershipAction)
+        assertEquals(1, cleanup.inputCount)
+        assertEquals(1, cleanup.attemptedOperationCount)
+        assertEquals(1, cleanup.appliedOperationCount)
+        assertEquals(
+            net.mixalich7b.exchangesync.infrastructure.diagnostics.CleanupTrigger.DISABLE,
+            cleanup.cleanupTrigger,
+        )
+        assertEquals("success", cleanup.outcome)
+    }
+
+    @Test
+    fun `cleanup maps provider runtime access and security failures to actionable diagnostics`() = runTest {
+        val fixtures =
+            listOf(
+                IllegalArgumentException("item URI rejected") to SyncProblem.CALENDAR_PROVIDER,
+                IllegalStateException("provider runtime failure") to SyncProblem.CALENDAR_PROVIDER,
+                CalendarProviderAccessException() to SyncProblem.CALENDAR_PROVIDER,
+                SecurityException("calendar access revoked") to SyncProblem.CALENDAR_PERMISSION,
+            )
+
+        fixtures.forEach { (failure, expectedProblem) ->
+            val events = mutableListOf<DeviceDiagnosticEvent>()
+            val adapter =
+                AndroidOwnedCalendarAdapter(
+                    profileRepository = ProfileRepository(PROFILE),
+                    gateway = RecordingCalendarGateway(deleteFailure = failure),
+                    timeZoneResolver = CalendarProviderTimeZoneResolver { "UTC" },
+                    diagnostics = DeviceDiagnostics { event -> events += event },
+                )
+
+            assertEquals(
+                OwnedCalendarCleanupOutcome.Failed(expectedProblem),
+                adapter.deleteOwnedCalendar(
+                    SyncFence(4, 7),
+                    net.mixalich7b.exchangesync.core.sync.OwnedCalendarCleanupTrigger.USER_RETRY,
+                ),
+                failure.javaClass.name,
+            )
+            val cleanup = events.single { event -> event.stage == DiagnosticStage.CLEANUP }
+            assertEquals(expectedProblem.name, cleanup.failureCategory, failure.javaClass.name)
+            assertEquals(failure.javaClass.simpleName, cleanup.reasonCode, failure.javaClass.name)
+            assertEquals(failure, cleanup.throwable, failure.javaClass.name)
+            assertEquals(
+                net.mixalich7b.exchangesync.infrastructure.diagnostics.CleanupTrigger.USER_RETRY,
+                cleanup.cleanupTrigger,
+                failure.javaClass.name,
+            )
+        }
+    }
+
+    @Test
+    fun `cleanup preserves cooperative cancellation`() {
+        val cancellation = CancellationException("cancel cleanup")
+        val adapter =
+            AndroidOwnedCalendarAdapter(
+                profileRepository = ProfileRepository(PROFILE),
+                gateway = RecordingCalendarGateway(deleteFailure = cancellation),
+                timeZoneResolver = CalendarProviderTimeZoneResolver { "UTC" },
+            )
+
+        val thrown =
+            assertThrows(CancellationException::class.java) {
+                runBlocking { adapter.deleteOwnedCalendar(SyncFence(4, 7)) }
+            }
+
+        assertEquals(cancellation.message, thrown.message)
     }
 
     @Test
@@ -327,6 +625,17 @@ class AndroidOwnedCalendarAdapterTest {
             start = ActiveSyncField.Value(Instant.parse("2026-08-09T09:00:00Z")),
             end = ActiveSyncField.Value(Instant.parse("2026-08-09T10:00:00Z")),
             allDay = ActiveSyncField.Value(false),
+        )
+
+    private fun testTimeZone(): ActiveSyncTimeZone =
+        ActiveSyncTimeZone(
+            biasMinutes = -180,
+            standardName = "Russian Standard Time",
+            standardTransition = ActiveSyncSystemTime(0, 0, 0, 0, 0, 0, 0, 0),
+            standardBiasMinutes = 0,
+            daylightName = "Russian Daylight Time",
+            daylightTransition = ActiveSyncSystemTime(0, 0, 0, 0, 0, 0, 0, 0),
+            daylightBiasMinutes = 0,
         )
 
     private fun readProviderSnapshot(cursor: Cursor): ProviderEvent {
@@ -419,6 +728,8 @@ class AndroidOwnedCalendarAdapterTest {
     private class RecordingCalendarGateway(
         private val applyFailure: RuntimeException? = null,
         private val resolveFailure: RuntimeException? = null,
+        private val queryFailure: RuntimeException? = null,
+        private val deleteFailure: Throwable? = null,
         private val resolution: OwnedCalendarResolution = OwnedCalendarResolution(OWNED_CALENDAR, -13_408_615),
     ) : OwnedCalendarProviderGateway {
         val resolvedEmails = mutableListOf<String>()
@@ -432,12 +743,14 @@ class AndroidOwnedCalendarAdapterTest {
             return resolution
         }
 
-        override fun deleteAllOwned(): Boolean {
+        override fun deleteAllOwned(): OwnedCalendarCleanupResult {
+            deleteFailure?.let { throw it }
             deleteCalls += 1
-            return true
+            return OwnedCalendarCleanupResult(ownedRowCount = 1, deletedRowCount = 1)
         }
 
         override fun queryExisting(calendarId: Long, syncIds: Set<String>): List<ExistingProviderEvent> {
+            queryFailure?.let { throw it }
             queries += calendarId to syncIds
             return emptyList()
         }
@@ -458,7 +771,8 @@ class AndroidOwnedCalendarAdapterTest {
         override fun resolveOwned(profileEmail: String): OwnedCalendarResolution =
             OwnedCalendarResolution(OWNED_CALENDAR, -13_408_615)
 
-        override fun deleteAllOwned(): Boolean = true
+        override fun deleteAllOwned(): OwnedCalendarCleanupResult =
+            OwnedCalendarCleanupResult(ownedRowCount = 0, deletedRowCount = 0)
 
         override fun queryExisting(calendarId: Long, syncIds: Set<String>): List<ExistingProviderEvent> =
             syncIds.filter(eventSyncIds::contains).map { ExistingProviderEvent(71, calendarId, it) }

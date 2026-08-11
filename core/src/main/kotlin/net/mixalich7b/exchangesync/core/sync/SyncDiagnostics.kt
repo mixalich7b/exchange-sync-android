@@ -5,6 +5,7 @@ public enum class SyncDiagnosticKind {
     PHASE,
     REMOTE_FAILURE,
     LOCAL_FAILURE,
+    CHECKPOINT,
     CHECKPOINT_FAILURE,
     RETRY,
     RESET,
@@ -16,6 +17,12 @@ public enum class SyncDiagnosticKind {
     UNEXPECTED_EXCEPTION,
 }
 
+public enum class SyncCheckpointOutcome {
+    COMMITTED,
+    SKIPPED,
+    FAILED,
+}
+
 public data class SyncDiagnosticEvent(
     public val kind: SyncDiagnosticKind,
     public val fence: SyncFence,
@@ -24,6 +31,7 @@ public data class SyncDiagnosticEvent(
     public val attempt: Int? = null,
     public val failureKind: SyncFailureKind? = null,
     public val problem: SyncProblem? = null,
+    public val checkpointOutcome: SyncCheckpointOutcome? = null,
     public val outcome: String? = null,
 )
 

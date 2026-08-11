@@ -9,12 +9,47 @@ import android.provider.CalendarContract.Reminders
 import android.provider.CalendarContract.Events
 import android.net.Uri
 
-internal class AndroidOwnedCalendarStore(
-    private val contentResolver: ContentResolver,
+internal enum class CalendarDeleteTarget {
+    COLLECTION,
+}
+
+internal data class OwnedCalendarDeleteRequest(
+    val target: CalendarDeleteTarget,
+    val callerIsSyncAdapter: Boolean,
+    val accountNameParameter: String,
+    val accountTypeParameter: String,
+    val selection: String,
+    val selectionArguments: List<String>,
+)
+
+internal fun interface OwnedCalendarDeleteOperation {
+    fun execute(request: OwnedCalendarDeleteRequest): Int
+}
+
+internal class AndroidOwnedCalendarStore private constructor(
+    private val resolver: ContentResolver?,
+    private val deleteOperation: OwnedCalendarDeleteOperation,
 ) : OwnedCalendarStore {
+    constructor(contentResolver: ContentResolver) : this(
+        resolver = contentResolver,
+        deleteOperation =
+            OwnedCalendarDeleteOperation { request ->
+                contentResolver.delete(
+                    request.target.contentUri().withSyncAdapterParameters(request),
+                    request.selection,
+                    request.selectionArguments.toTypedArray(),
+                )
+            },
+    )
+
+    internal constructor(deleteOperation: OwnedCalendarDeleteOperation) : this(
+        resolver = null,
+        deleteOperation = deleteOperation,
+    )
+
     override fun queryOwned(): List<OwnedCalendarRow> {
         val cursor =
-            contentResolver.query(
+            requireResolver().query(
                 Calendars.CONTENT_URI,
                 PROJECTION,
                 OWNERSHIP_SELECTION,
@@ -62,16 +97,27 @@ internal class AndroidOwnedCalendarStore(
                         .joinToString(","),
                 )
             }
-        val inserted = contentResolver.insert(syncAdapterUri(Calendars.CONTENT_URI), values)
+        val inserted = requireResolver().insert(syncAdapterUri(Calendars.CONTENT_URI), values)
             ?: throw OwnedCalendarProviderException("Calendar Provider insert failed")
         return ContentUris.parseId(inserted)
     }
 
     override fun deleteOwned(calendarId: Long): Boolean =
-        contentResolver.delete(
-            syncAdapterUri(ContentUris.withAppendedId(Calendars.CONTENT_URI, calendarId)),
-            OWNERSHIP_SELECTION,
-            OWNERSHIP_ARGUMENTS,
+        deleteOperation.execute(
+            OwnedCalendarDeleteRequest(
+                target = CalendarDeleteTarget.COLLECTION,
+                callerIsSyncAdapter = true,
+                accountNameParameter = OwnedCalendarIdentity.ACCOUNT_NAME,
+                accountTypeParameter = OwnedCalendarIdentity.ACCOUNT_TYPE,
+                selection = DELETE_SELECTION,
+                selectionArguments =
+                    listOf(
+                        calendarId.toString(),
+                        OwnedCalendarIdentity.ACCOUNT_NAME,
+                        OwnedCalendarIdentity.ACCOUNT_TYPE,
+                        OwnedCalendarIdentity.INTERNAL_NAME,
+                    ),
+            ),
         ) > 0
 
     private fun syncAdapterUri(uri: Uri): Uri =
@@ -80,6 +126,8 @@ internal class AndroidOwnedCalendarStore(
             .appendQueryParameter(Calendars.ACCOUNT_NAME, OwnedCalendarIdentity.ACCOUNT_NAME)
             .appendQueryParameter(Calendars.ACCOUNT_TYPE, OwnedCalendarIdentity.ACCOUNT_TYPE)
             .build()
+
+    private fun requireResolver(): ContentResolver = checkNotNull(resolver)
 
     private fun Boolean.asInt(): Int = if (this) 1 else 0
 
@@ -96,6 +144,7 @@ internal class AndroidOwnedCalendarStore(
             )
         const val OWNERSHIP_SELECTION =
             "${Calendars.ACCOUNT_NAME}=? AND ${Calendars.ACCOUNT_TYPE}=? AND ${Calendars.NAME}=?"
+        const val DELETE_SELECTION = "${Calendars._ID}=? AND $OWNERSHIP_SELECTION"
         val OWNERSHIP_ARGUMENTS =
             arrayOf(
                 OwnedCalendarIdentity.ACCOUNT_NAME,
@@ -104,3 +153,18 @@ internal class AndroidOwnedCalendarStore(
             )
     }
 }
+
+private fun CalendarDeleteTarget.contentUri(): Uri =
+    when (this) {
+        CalendarDeleteTarget.COLLECTION -> Calendars.CONTENT_URI
+    }
+
+private fun Uri.withSyncAdapterParameters(request: OwnedCalendarDeleteRequest): Uri =
+    buildUpon()
+        .appendQueryParameter(
+            CalendarContract.CALLER_IS_SYNCADAPTER,
+            request.callerIsSyncAdapter.toString(),
+        )
+        .appendQueryParameter(Calendars.ACCOUNT_NAME, request.accountNameParameter)
+        .appendQueryParameter(Calendars.ACCOUNT_TYPE, request.accountTypeParameter)
+        .build()

@@ -1,6 +1,5 @@
 package net.mixalich7b.exchangesync.infrastructure.activesync
 
-import java.security.cert.X509Certificate
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -144,19 +143,30 @@ internal class ActiveSyncConnectionVerifier(
                 continue
             }
 
-            if (!response.used(credential.leafCertificate)) {
-                diagnostics.emit(
-                    DeviceDiagnosticEvent(
-                        DiagnosticSeverity.ERROR,
-                        DiagnosticComponent.TLS,
-                        DiagnosticStage.CLIENT_CERTIFICATE_VERIFICATION,
-                        operation,
-                        host = currentUrl.diagnosticHost(),
-                        path = currentUrl.diagnosticPath(),
-                        chainLength = response.localCertificates.size,
-                        outcome = "selected_leaf_absent",
-                    ),
-                )
+            val identityEvidence = response.clientIdentityParticipation(credential.leafCertificate)
+            diagnostics.emit(
+                DeviceDiagnosticEvent(
+                    severity =
+                        if (identityEvidence == ClientIdentityParticipationEvidence.MISMATCHED) {
+                            DiagnosticSeverity.ERROR
+                        } else {
+                            DiagnosticSeverity.INFO
+                        },
+                    component = DiagnosticComponent.TLS,
+                    stage = DiagnosticStage.CLIENT_CERTIFICATE_VERIFICATION,
+                    operation = operation,
+                    method = "OPTIONS",
+                    host = currentUrl.diagnosticHost(),
+                    path = currentUrl.diagnosticPath(),
+                    chainLength = response.localCertificates.size,
+                    reasonCode = "FIXED_IDENTITY_CONFIGURED",
+                    failureCategory =
+                        ConnectionFailure.CLIENT_CERTIFICATE_REJECTED.name
+                            .takeIf { identityEvidence == ClientIdentityParticipationEvidence.MISMATCHED },
+                    outcome = identityEvidence.diagnosticValue,
+                ),
+            )
+            if (identityEvidence == ClientIdentityParticipationEvidence.MISMATCHED) {
                 return ConnectionCheckResult.Failure(ConnectionFailure.CLIENT_CERTIFICATE_REJECTED)
             }
             val protocolVersions = response.header("MS-ASProtocolVersions")
@@ -270,8 +280,4 @@ internal class ActiveSyncConnectionVerifier(
             else -> "INVALID_CAPABILITY"
         }
 
-    private fun ProbeResponse.used(expected: X509Certificate): Boolean =
-        localCertificates.any { certificate ->
-            certificate is X509Certificate && certificate.encoded.contentEquals(expected.encoded)
-        }
 }

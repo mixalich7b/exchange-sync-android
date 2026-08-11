@@ -14,12 +14,17 @@ import net.mixalich7b.exchangesync.core.sync.SyncPageRequest
 import net.mixalich7b.exchangesync.core.sync.SyncPhase
 import net.mixalich7b.exchangesync.core.sync.SyncProblem
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.ActiveSyncWbxmlTokens.AirSync
+import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.ActiveSyncWbxmlTokens.AirSyncBase
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.ActiveSyncWbxmlTokens.Calendar
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.ActiveSyncWbxmlTokens.FolderHierarchy
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlElement
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlReader
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlTag
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlWriter
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnosticEvent
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.SyncRequestMode
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -109,6 +114,107 @@ class ActiveSyncRemoteCalendarTest {
                 ),
                 outcome.page.nextCheckpoints,
             )
+        }
+
+    @Test
+    fun `priming and multiple unfiltered full pages report bounded command summaries without keys`() =
+        runBlocking {
+            val events = mutableListOf<DeviceDiagnosticEvent>()
+            val diagnostics = DeviceDiagnostics { event -> events += event }
+            var folderCalls = 0
+            var syncCalls = 0
+            val commands =
+                ActiveSyncCommandGateway { _, endpoint, command, _, _, body ->
+                    when (command) {
+                        ActiveSyncCommand.FOLDER_SYNC -> {
+                            folderCalls += 1
+                            ActiveSyncCommandOutcome.Success(
+                                endpoint,
+                                if (folderCalls == 1) {
+                                    folderResponse("folder-secret-1", "primary-calendar")
+                                } else {
+                                    emptyFolderResponse("folder-secret-2")
+                                },
+                            )
+                        }
+                        ActiveSyncCommand.SYNC -> {
+                            syncCalls += 1
+                            val collection = WbxmlReader().read(body).child(AirSync.COLLECTIONS)?.child(AirSync.COLLECTION)
+                            assertFalse(collection?.children.orEmpty().any { child -> child.tag == AirSync.FILTER_TYPE })
+                            ActiveSyncCommandOutcome.Success(
+                                endpoint,
+                                when (syncCalls) {
+                                    1 -> emptyCalendarResponse("primary-calendar", "primed-secret")
+                                    2 -> calendarMutationCountsResponse("primary-calendar", "page-secret", moreAvailable = true)
+                                    else -> emptyCalendarResponse("primary-calendar", "final-secret")
+                                },
+                            )
+                        }
+                    }
+                }
+            val remote =
+                ActiveSyncRemoteCalendar(
+                    capabilities =
+                        ActiveSyncCapabilityGateway {
+                            ActiveSyncCapabilityOutcome.Success(endpoint(), ActiveSyncVersion.V16_1)
+                        },
+                    commands = commands,
+                    diagnostics = diagnostics,
+                )
+
+            val first = remote.fetchPage(request(fullSync = true)) as RemotePageOutcome.Page
+            val second =
+                remote.fetchPage(request(fullSync = true, checkpoints = first.page.nextCheckpoints))
+                    as RemotePageOutcome.Page
+
+            assertEquals(3, first.page.changes.size)
+            assertTrue(first.page.moreAvailable)
+            assertTrue(second.page.changes.isEmpty())
+            assertFalse(second.page.moreAvailable)
+            val responses = events.filter { event -> event.stage == DiagnosticStage.RESPONSE && event.command == "Sync" }
+            assertEquals(
+                listOf(SyncRequestMode.PRIMING, SyncRequestMode.FULL, SyncRequestMode.FULL),
+                responses.map { event -> event.syncMode },
+            )
+            assertEquals(listOf(100, 100, 100), responses.map { event -> event.windowSize })
+            assertEquals(listOf(false, false, false), responses.map { event -> event.responseEmpty })
+            val decoded = events.filter { event -> event.stage == DiagnosticStage.CALENDAR_SYNC }
+            assertEquals(listOf(0, 3, 0), decoded.map { event -> event.commandCount })
+            assertEquals(listOf(0, 1, 0), decoded.map { event -> event.addCount })
+            assertEquals(listOf(0, 1, 0), decoded.map { event -> event.changeCount })
+            assertEquals(listOf(0, 1, 0), decoded.map { event -> event.deleteCount })
+            assertEquals(listOf(false, true, false), decoded.map { event -> event.moreAvailable })
+            assertEquals(listOf(true, true, true), decoded.map { event -> event.keyAdvanced })
+            val records = events.joinToString("\n", transform = ::formatDiagnostic)
+            listOf("folder-secret-1", "folder-secret-2", "primed-secret", "page-secret", "final-secret")
+                .forEach { key -> assertFalse(records.contains(key), key) }
+        }
+
+    @Test
+    fun `valid empty incremental response reports no commands and no key advancement`() =
+        runBlocking {
+            val events = mutableListOf<DeviceDiagnosticEvent>()
+            val remote =
+                ActiveSyncRemoteCalendar(
+                    capabilities = ActiveSyncCapabilityGateway { error("Saved capability must be reused") },
+                    commands = successfulIncrementalCommands(ActiveSyncVersion.V16_1),
+                    sessions = liveSessions(ActiveSyncVersion.V16_1),
+                    diagnostics = DeviceDiagnostics { event -> events += event },
+                )
+
+            val outcome = remote.fetchPage(request(fullSync = false, checkpoints = persistedCheckpoints()))
+
+            assertTrue(outcome is RemotePageOutcome.Page)
+            val response = events.single { event -> event.stage == DiagnosticStage.RESPONSE && event.command == "Sync" }
+            assertEquals(SyncRequestMode.INCREMENTAL, response.syncMode)
+            assertEquals(0, response.responseBytes)
+            assertEquals(true, response.responseEmpty)
+            val decoded = events.single { event -> event.stage == DiagnosticStage.CALENDAR_SYNC }
+            assertEquals(0, decoded.commandCount)
+            assertEquals(false, decoded.moreAvailable)
+            assertEquals(false, decoded.keyAdvanced)
+            assertFalse(formatDiagnostic(response).contains("known-calendar-key"))
+            assertFalse(formatDiagnostic(decoded).contains("known-calendar-key"))
         }
 
     @Test
@@ -511,6 +617,38 @@ class ActiveSyncRemoteCalendarTest {
             )
         }
 
+    @Test
+    fun `malformed Compact InstanceId rejects the page without exposing an advanced checkpoint`() =
+        runBlocking {
+            val remote =
+                ActiveSyncRemoteCalendar(
+                    capabilities = ActiveSyncCapabilityGateway { error("Saved capability must be reused") },
+                    commands =
+                        ActiveSyncCommandGateway { _, endpoint, command, _, _, _ ->
+                            ActiveSyncCommandOutcome.Success(
+                                endpoint,
+                                if (command == ActiveSyncCommand.FOLDER_SYNC) {
+                                    emptyFolderResponse("new-folder-key")
+                                } else {
+                                    calendarResponseWithInstanceId(
+                                        collectionId = "known-primary",
+                                        syncKey = "advanced-calendar-key",
+                                        instanceId = "2026-08-10T09:00:00.000Z",
+                                    )
+                                },
+                            )
+                        },
+                    sessions = liveSessions(ActiveSyncVersion.V16_1),
+                )
+
+            val outcome = remote.fetchPage(request(fullSync = false, checkpoints = persistedCheckpoints()))
+
+            assertEquals(
+                RemotePageOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.PROTOCOL_DATA),
+                outcome,
+            )
+        }
+
     private fun request(
         fullSync: Boolean,
         checkpoints: SyncCheckpoints = SyncCheckpoints.EMPTY,
@@ -624,6 +762,46 @@ class ActiveSyncRemoteCalendarTest {
         )
     }
 
+    private fun calendarMutationCountsResponse(
+        collectionId: String,
+        syncKey: String,
+        moreAvailable: Boolean,
+    ): ByteArray {
+        val collectionChildren =
+            mutableListOf(
+                text(AirSync.SYNC_KEY, syncKey),
+                text(AirSync.COLLECTION_ID, collectionId),
+                text(AirSync.STATUS, "1"),
+                element(
+                    AirSync.COMMANDS,
+                    element(
+                        AirSync.ADD,
+                        text(AirSync.SERVER_ID, "event-add"),
+                        element(
+                            AirSync.APPLICATION_DATA,
+                            text(Calendar.SUBJECT, "Meeting"),
+                            text(Calendar.START_TIME, "20260809T090000Z"),
+                            text(Calendar.END_TIME, "20260809T100000Z"),
+                            text(Calendar.ALL_DAY_EVENT, "0"),
+                        ),
+                    ),
+                    element(
+                        AirSync.CHANGE,
+                        text(AirSync.SERVER_ID, "event-change"),
+                        element(AirSync.APPLICATION_DATA, text(Calendar.SUBJECT, "Changed")),
+                    ),
+                    element(AirSync.DELETE, text(AirSync.SERVER_ID, "event-delete")),
+                ),
+            )
+        if (moreAvailable) collectionChildren += WbxmlElement(AirSync.MORE_AVAILABLE)
+        return wbxml(
+            element(
+                AirSync.SYNC,
+                element(AirSync.COLLECTIONS, WbxmlElement(AirSync.COLLECTION, children = collectionChildren)),
+            ),
+        )
+    }
+
     private fun emptyCalendarResponse(collectionId: String, syncKey: String): ByteArray =
         wbxml(
             element(
@@ -635,6 +813,48 @@ class ActiveSyncRemoteCalendarTest {
                         text(AirSync.SYNC_KEY, syncKey),
                         text(AirSync.COLLECTION_ID, collectionId),
                         text(AirSync.STATUS, "1"),
+                    ),
+                ),
+            ),
+        )
+
+    private fun calendarResponseWithInstanceId(
+        collectionId: String,
+        syncKey: String,
+        instanceId: String,
+    ): ByteArray =
+        wbxml(
+            element(
+                AirSync.SYNC,
+                element(
+                    AirSync.COLLECTIONS,
+                    element(
+                        AirSync.COLLECTION,
+                        text(AirSync.SYNC_KEY, syncKey),
+                        text(AirSync.COLLECTION_ID, collectionId),
+                        text(AirSync.STATUS, "1"),
+                        element(
+                            AirSync.COMMANDS,
+                            element(
+                                AirSync.ADD,
+                                text(AirSync.SERVER_ID, "series-1"),
+                                element(
+                                    AirSync.APPLICATION_DATA,
+                                    text(Calendar.SUBJECT, "Recurring meeting"),
+                                    text(Calendar.START_TIME, "20260809T090000Z"),
+                                    text(Calendar.END_TIME, "20260809T100000Z"),
+                                    text(Calendar.ALL_DAY_EVENT, "0"),
+                                    element(
+                                        Calendar.EXCEPTIONS,
+                                        element(
+                                            Calendar.EXCEPTION,
+                                            text(AirSyncBase.INSTANCE_ID, instanceId),
+                                            text(Calendar.DELETED, "1"),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
                     ),
                 ),
             ),
@@ -670,4 +890,15 @@ class ActiveSyncRemoteCalendarTest {
     private fun element(tag: WbxmlTag, vararg children: WbxmlElement) = WbxmlElement(tag, children = children.toList())
 
     private fun text(tag: WbxmlTag, value: String) = WbxmlElement(tag, text = value)
+
+    private fun formatDiagnostic(event: DeviceDiagnosticEvent): String {
+        val formatterClass =
+            Class.forName("net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnosticFormatter")
+        val instance = formatterClass.getDeclaredField("INSTANCE").apply { isAccessible = true }.get(null)
+        val method =
+            formatterClass.getDeclaredMethod("format", DeviceDiagnosticEvent::class.java).apply {
+                isAccessible = true
+            }
+        return method.invoke(instance, event) as String
+    }
 }

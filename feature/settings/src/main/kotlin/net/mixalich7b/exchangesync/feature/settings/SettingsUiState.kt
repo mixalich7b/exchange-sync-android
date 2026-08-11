@@ -25,6 +25,7 @@ public data class SettingsUiState(
     public val syncProblem: SyncProblem? = null,
     public val lastSuccessfulSyncEpochMillis: Long? = null,
     public val notificationPermissionDenied: Boolean = false,
+    public val calendarCleanupPending: Boolean = false,
     public val syncControlOperation: SyncControlOperation? = null,
 ) {
     public val areFieldsEnabled: Boolean
@@ -54,7 +55,10 @@ public data class SettingsUiState(
         get() = hasSavedProfile && syncEnabled
 
     public val isSyncNowEnabled: Boolean
-        get() = isSyncNowVisible && syncPhase == SyncPhase.IDLE && controlsIdle
+        get() =
+            isSyncNowVisible &&
+                (syncPhase == SyncPhase.IDLE || syncPhase == SyncPhase.BLOCKED) &&
+                controlsIdle
 
     public val isCancelSyncVisible: Boolean
         get() = syncEnabled && syncPhase.isCancellable
@@ -69,10 +73,16 @@ public data class SettingsUiState(
         get() = isDisableSyncVisible && controlsIdle
 
     public val isEnableSyncVisible: Boolean
-        get() = hasSavedProfile && !syncEnabled
+        get() = hasSavedProfile && !syncEnabled && !calendarCleanupPending
 
     public val isEnableSyncEnabled: Boolean
         get() = isEnableSyncVisible && controlsIdle
+
+    public val isCleanupRetryVisible: Boolean
+        get() = hasSavedProfile && !syncEnabled && calendarCleanupPending
+
+    public val isCleanupRetryEnabled: Boolean
+        get() = isCleanupRetryVisible && controlsIdle
 
     public val isCalendarPermissionActionVisible: Boolean
         get() = syncProblem == SyncProblem.CALENDAR_PERMISSION
@@ -99,6 +109,7 @@ public enum class SyncControlOperation {
     CANCEL,
     DISABLE,
     ENABLE,
+    CLEANUP,
 }
 
 public enum class SettingsConnectionError {

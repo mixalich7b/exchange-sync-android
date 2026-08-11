@@ -98,7 +98,7 @@ The connection check SHALL start by sending an HTTP `OPTIONS` request to `https:
 - **THEN** the connection check fails with an actionable redirect error and does not save the profile
 
 ### Requirement: Combined server trust and mandatory mTLS
-The connection check SHALL validate the server hostname and certificate chain against the Android system trust store plus any valid private-CA certificates packaged locally with the application. It SHALL also verify that the selected client certificate was used during the TLS handshake. The application SHALL NOT add private CA certificates to the Android system store or disable normal hostname or chain validation.
+The connection check SHALL validate the server hostname and certificate chain against the Android system trust store plus any valid private-CA certificates packaged locally with the application. It SHALL resolve the selected KeyChain private key and certificate chain and make that fixed identity the only client identity available to the TLS connection. A terminal validated HTTPS response that satisfies the ActiveSync capability check SHALL NOT be rejected solely because the Android TLS session exposes an empty or unavailable local-certificate list. The application SHALL NOT add private CA certificates to the Android system store, disable normal hostname or chain validation, or claim stronger client-certificate evidence than the platform exposes.
 
 #### Scenario: Server uses a system-trusted certificate
 - **WHEN** the server certificate chains to an Android system trust anchor, including a public CA such as Let's Encrypt
@@ -117,8 +117,12 @@ The connection check SHALL validate the server hostname and certificate chain ag
 - **THEN** the connection check fails without offering a trust-all bypass, reports a server-trust or hostname category rather than a local-CA category unless the structured failure identifies a missing trust anchor, and does not save the profile
 
 #### Scenario: Client certificate is not used or is rejected
-- **WHEN** the selected client certificate cannot participate in a successful mTLS handshake
+- **WHEN** the selected KeyChain private key or certificate chain cannot be resolved or configured, or server-requested client authentication cannot complete with that fixed identity
 - **THEN** the connection check fails with a client-certificate or mTLS error and does not save the profile
+
+#### Scenario: Successful TLS session omits local-certificate metadata
+- **WHEN** the selected KeyChain material was resolved and configured as the only client identity, server and hostname validation succeed, and the terminal response satisfies the ActiveSync capability check but Android exposes no local certificates for the completed TLS session
+- **THEN** the connection check succeeds and reports the client identity as configured with participation evidence unavailable instead of reporting that the selected certificate was rejected
 
 ### Requirement: Actionable connection errors
 The application SHALL map connection failures to stable user-facing categories without displaying raw stack traces or exposing certificate private-key material.

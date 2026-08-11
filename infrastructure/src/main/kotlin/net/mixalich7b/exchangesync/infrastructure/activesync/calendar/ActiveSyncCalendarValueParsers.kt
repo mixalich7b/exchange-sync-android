@@ -39,11 +39,6 @@ internal object ActiveSyncCalendarValueParsers {
         DateTimeFormatter
             .ofPattern("uuuuMMdd'T'HHmmss'Z'")
             .withResolverStyle(ResolverStyle.STRICT)
-    private val instanceIdFormatter =
-        DateTimeFormatter
-            .ofPattern("uuuu-MM-dd'T'HH:mm:ss.SSS'Z'")
-            .withResolverStyle(ResolverStyle.STRICT)
-
     fun parseDateTime(value: String): Instant =
         try {
             LocalDateTime.parse(value, dateTimeFormatter).toInstant(ZoneOffset.UTC)
@@ -53,8 +48,8 @@ internal object ActiveSyncCalendarValueParsers {
 
     fun parseInstanceId(value: String): Instant =
         try {
-            LocalDateTime.parse(value, instanceIdFormatter).toInstant(ZoneOffset.UTC)
-        } catch (error: DateTimeParseException) {
+            parseDateTime(value)
+        } catch (error: ActiveSyncCalendarValueException) {
             throw ActiveSyncCalendarValueException("Invalid ActiveSync InstanceId", error)
         }
 

@@ -40,6 +40,29 @@ class ActiveSyncCalendarValueParsersTest {
     }
 
     @Test
+    fun `InstanceId uses the protocol Compact DateTime grammar`() {
+        assertEquals(
+            Instant.parse("2026-08-10T09:00:00Z"),
+            ActiveSyncCalendarValueParsers.parseInstanceId("20260810T090000Z"),
+        )
+
+        listOf(
+            "2026-08-10T09:00:00.000Z",
+            "20260810T090000.000Z",
+            "20260810T090000+0300",
+            "20260230T090000Z",
+            "20260810t090000z",
+            "",
+        ).forEach { value ->
+            assertThrows(
+                ActiveSyncCalendarValueException::class.java,
+                { ActiveSyncCalendarValueParsers.parseInstanceId(value) },
+                value,
+            )
+        }
+    }
+
+    @Test
     fun `all-day boundaries remain exclusive UTC dates and reject non-midnight values`() {
         assertEquals(
             ActiveSyncAllDayRange(

@@ -81,6 +81,14 @@ alias выбранного сертификата.
 7. ViewModel показывает подключённое состояние либо сохраняет введённый draft
    и отображает типизированную ошибку.
 
+TLS transport предоставляет только выбранную fixed client identity. Успешный
+проверенный response не зависит от того, публикует ли Android provider локальную
+цепочку через handshake metadata; опубликованное несовпадение при этом
+отклоняется. Redirects для `OPTIONS` и ActiveSync `POST` выполняет общий
+application-controlled tracker при отключённых automatic redirects OkHttp, так
+что HTTPS-only, cycle/five-hop policy и сохранение method/body едины на обоих
+путях.
+
 Редактирование формы и выбор сертификата сами по себе не запускают сеть и не
 изменяют сохранённый профиль. Повторный Save блокируется до завершения текущей
 проверки.

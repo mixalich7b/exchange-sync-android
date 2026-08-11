@@ -51,9 +51,13 @@ public class SynchronizationLifecycle(
                 } catch (failure: Exception) {
                     throw ProfileActivationPersistenceException(failure)
                 }
-            }
+        }
         return kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
-            configureActivatedGeneration(activated, permissionAlreadyChecked = false)
+            configureActivatedGeneration(
+                activated,
+                permissionAlreadyChecked = false,
+                cleanupTrigger = OwnedCalendarCleanupTrigger.PROFILE_ACTIVATION,
+            )
         }
     }
 
@@ -61,32 +65,17 @@ public class SynchronizationLifecycle(
         val current = stateRepository.load()
         if (current.enabled) return SyncLifecycleOutcome.Ignored
         val activated = startNewGeneration(SyncTrigger.ENABLE)
-        return configureActivatedGeneration(activated, permissionAlreadyChecked = false)
+        return configureActivatedGeneration(
+            activated,
+            permissionAlreadyChecked = false,
+            cleanupTrigger = OwnedCalendarCleanupTrigger.FULL_RESET,
+        )
     }
 
     override suspend fun onCalendarPermissionResult(): SyncLifecycleOutcome {
         val current = stateRepository.load()
         if (!current.enabled && current.calendarCleanupPending) {
-            if (!permissions.hasCalendarAccess()) {
-                markCleanupPending(current, SyncProblem.CALENDAR_PERMISSION)
-                return SyncLifecycleOutcome.PermissionRequired(current.generation)
-            }
-            if (!ownedCalendar.deleteOwnedCalendar(current.fence)) {
-                markCleanupPending(current, SyncProblem.CALENDAR_PROVIDER)
-                return SyncLifecycleOutcome.Blocked(current.generation, SyncProblem.CALENDAR_PROVIDER)
-            }
-            val cleaned =
-                stateRepository.update { latest ->
-                    if (!latest.enabled && latest.generation == current.generation && latest.calendarCleanupPending) {
-                        latest.copy(calendarCleanupPending = false, problem = null)
-                    } else {
-                        latest
-                    }
-                }
-            if (!cleaned.enabled && !cleaned.calendarCleanupPending && cleaned.generation == current.generation) {
-                problems.clear(cleaned.generation)
-            }
-            return SyncLifecycleOutcome.Ignored
+            return retryDisabledCleanup(current, OwnedCalendarCleanupTrigger.PERMISSION_RECOVERY)
         }
         if (!current.enabled) return SyncLifecycleOutcome.Ignored
         recordNotificationPermission(current.generation)
@@ -110,7 +99,17 @@ public class SynchronizationLifecycle(
                 }
             }
         if (!resumed.enabled || resumed.generation != current.generation) return SyncLifecycleOutcome.Ignored
-        return configureActivatedGeneration(resumed, permissionAlreadyChecked = true)
+        return configureActivatedGeneration(
+            resumed,
+            permissionAlreadyChecked = true,
+            cleanupTrigger = OwnedCalendarCleanupTrigger.PERMISSION_RECOVERY,
+        )
+    }
+
+    public suspend fun resumePendingCalendarCleanup(): SyncLifecycleOutcome {
+        val current = stateRepository.load()
+        if (current.enabled || !current.calendarCleanupPending) return SyncLifecycleOutcome.Ignored
+        return retryDisabledCleanup(current, OwnedCalendarCleanupTrigger.STARTUP)
     }
 
     override suspend fun onNotificationPermissionResult() {
@@ -198,9 +197,19 @@ public class SynchronizationLifecycle(
             markCleanupPending(disabled, SyncProblem.CALENDAR_PERMISSION)
             return SyncDisableOutcome.CleanupPending(SyncProblem.CALENDAR_PERMISSION)
         }
-        if (!ownedCalendar.deleteOwnedCalendar(disabled.fence)) {
-            markCleanupPending(disabled, SyncProblem.CALENDAR_PROVIDER)
-            return SyncDisableOutcome.CleanupPending(SyncProblem.CALENDAR_PROVIDER)
+        val cleanupTrigger =
+            if (before.enabled) {
+                OwnedCalendarCleanupTrigger.DISABLE
+            } else {
+                OwnedCalendarCleanupTrigger.USER_RETRY
+            }
+        when (val cleanup = ownedCalendar.deleteOwnedCalendar(disabled.fence, cleanupTrigger)) {
+            OwnedCalendarCleanupOutcome.Completed -> Unit
+            OwnedCalendarCleanupOutcome.Obsolete -> return SyncDisableOutcome.Ignored
+            is OwnedCalendarCleanupOutcome.Failed -> {
+                markCleanupPending(disabled, cleanup.problem)
+                return SyncDisableOutcome.CleanupPending(cleanup.problem)
+            }
         }
         val cleaned =
             stateRepository.update { current ->
@@ -228,6 +237,7 @@ public class SynchronizationLifecycle(
     private suspend fun configureActivatedGeneration(
         activated: SyncState,
         permissionAlreadyChecked: Boolean,
+        cleanupTrigger: OwnedCalendarCleanupTrigger,
     ): SyncLifecycleOutcome =
         try {
             scheduler.cancelAll()
@@ -238,36 +248,16 @@ public class SynchronizationLifecycle(
                 SyncLifecycleOutcome.PermissionRequired(activated.generation)
             } else if (!isGenerationCurrent(activated)) {
                 SyncLifecycleOutcome.Ignored
-            } else if (!ownedCalendar.deleteOwnedCalendar(activated.fence)) {
-                if (isGenerationCurrent(activated)) {
-                    blockGeneration(activated, SyncProblem.CALENDAR_PROVIDER)
-                } else {
-                    SyncLifecycleOutcome.Ignored
-                }
             } else {
-                val cleaned =
-                    stateRepository.update { latest ->
-                        if (
-                            SyncStateTransitions.mayPerformSideEffect(latest, activated.fence) &&
-                            latest.calendarCleanupPending
-                        ) {
-                            latest.copy(calendarCleanupPending = false)
+                when (val cleanup = ownedCalendar.deleteOwnedCalendar(activated.fence, cleanupTrigger)) {
+                    OwnedCalendarCleanupOutcome.Completed -> finishActivatedGeneration(activated)
+                    OwnedCalendarCleanupOutcome.Obsolete -> SyncLifecycleOutcome.Ignored
+                    is OwnedCalendarCleanupOutcome.Failed -> {
+                        if (isGenerationCurrent(activated)) {
+                            blockGeneration(activated, cleanup.problem)
                         } else {
-                            latest
+                            SyncLifecycleOutcome.Ignored
                         }
-                    }
-                if (
-                    !SyncStateTransitions.mayPerformSideEffect(cleaned, activated.fence) ||
-                    cleaned.calendarCleanupPending
-                ) {
-                    SyncLifecycleOutcome.Ignored
-                } else {
-                    scheduler.schedulePeriodic(activated.generation)
-                    if (!isGenerationCurrent(activated)) {
-                        SyncLifecycleOutcome.Ignored
-                    } else {
-                        scheduler.enqueueExecution(activated.generation, activated.runToken)
-                        SyncLifecycleOutcome.Scheduled(activated.generation)
                     }
                 }
             }
@@ -276,6 +266,60 @@ public class SynchronizationLifecycle(
         } catch (_: Exception) {
             blockGeneration(activated, SyncProblem.BACKGROUND_SCHEDULING)
         }
+
+    private suspend fun retryDisabledCleanup(
+        current: SyncState,
+        trigger: OwnedCalendarCleanupTrigger,
+    ): SyncLifecycleOutcome {
+        if (!permissions.hasCalendarAccess()) {
+            markCleanupPending(current, SyncProblem.CALENDAR_PERMISSION)
+            return SyncLifecycleOutcome.PermissionRequired(current.generation)
+        }
+        when (val cleanup = ownedCalendar.deleteOwnedCalendar(current.fence, trigger)) {
+            OwnedCalendarCleanupOutcome.Completed -> Unit
+            OwnedCalendarCleanupOutcome.Obsolete -> return SyncLifecycleOutcome.Ignored
+            is OwnedCalendarCleanupOutcome.Failed -> {
+                markCleanupPending(current, cleanup.problem)
+                return SyncLifecycleOutcome.Blocked(current.generation, cleanup.problem)
+            }
+        }
+        val cleaned =
+            stateRepository.update { latest ->
+                if (!latest.enabled && latest.generation == current.generation && latest.calendarCleanupPending) {
+                    latest.copy(calendarCleanupPending = false, problem = null)
+                } else {
+                    latest
+                }
+            }
+        if (!cleaned.enabled && !cleaned.calendarCleanupPending && cleaned.generation == current.generation) {
+            problems.clear(cleaned.generation)
+        }
+        return SyncLifecycleOutcome.Ignored
+    }
+
+    private suspend fun finishActivatedGeneration(activated: SyncState): SyncLifecycleOutcome {
+        val cleaned =
+            stateRepository.update { latest ->
+                if (
+                    SyncStateTransitions.mayPerformSideEffect(latest, activated.fence) &&
+                    latest.calendarCleanupPending
+                ) {
+                    latest.copy(calendarCleanupPending = false)
+                } else {
+                    latest
+                }
+            }
+        if (
+            !SyncStateTransitions.mayPerformSideEffect(cleaned, activated.fence) ||
+            cleaned.calendarCleanupPending
+        ) {
+            return SyncLifecycleOutcome.Ignored
+        }
+        scheduler.schedulePeriodic(activated.generation)
+        if (!isGenerationCurrent(activated)) return SyncLifecycleOutcome.Ignored
+        scheduler.enqueueExecution(activated.generation, activated.runToken)
+        return SyncLifecycleOutcome.Scheduled(activated.generation)
+    }
 
     private suspend fun recordNotificationPermission(generation: Long) {
         val denied = !permissions.hasNotificationAccess()

@@ -78,6 +78,35 @@ internal enum class DiagnosticOperationKind {
     LOCAL_OPERATION,
 }
 
+internal enum class SyncRequestMode {
+    PRIMING,
+    FULL,
+    INCREMENTAL,
+}
+
+internal enum class OwnedCalendarAction {
+    CREATED,
+    REUSED,
+    REPAIRED,
+    DELETED,
+    UNCHANGED,
+}
+
+internal enum class CleanupTrigger {
+    PROFILE_ACTIVATION,
+    FULL_RESET,
+    DISABLE,
+    STARTUP,
+    PERMISSION_RECOVERY,
+    USER_RETRY,
+}
+
+internal enum class CheckpointOutcome {
+    COMMITTED,
+    SKIPPED,
+    FAILED,
+}
+
 internal data class DiagnosticOperation(
     val id: String,
     val kind: DiagnosticOperationKind,
@@ -109,6 +138,25 @@ internal data class DeviceDiagnosticEvent(
     val chainLength: Int? = null,
     val keyAlgorithm: String? = null,
     val fingerprint: String? = null,
+    val syncMode: SyncRequestMode? = null,
+    val windowSize: Int? = null,
+    val responseBytes: Int? = null,
+    val responseEmpty: Boolean? = null,
+    val commandCount: Int? = null,
+    val addCount: Int? = null,
+    val changeCount: Int? = null,
+    val deleteCount: Int? = null,
+    val moreAvailable: Boolean? = null,
+    val keyAdvanced: Boolean? = null,
+    val ownershipAction: OwnedCalendarAction? = null,
+    val inputCount: Int? = null,
+    val acceptedCount: Int? = null,
+    val rejectedCount: Int? = null,
+    val plannedOperationCount: Int? = null,
+    val attemptedOperationCount: Int? = null,
+    val appliedOperationCount: Int? = null,
+    val cleanupTrigger: CleanupTrigger? = null,
+    val checkpointOutcome: CheckpointOutcome? = null,
     val throwable: Throwable? = null,
 )
 
@@ -165,6 +213,7 @@ internal class AndroidLogcatDiagnosticSink : DeviceDiagnosticSink {
 
 private object DeviceDiagnosticFormatter {
     private const val MAX_RECORD_LENGTH = 3_000
+    private const val MAX_AGGREGATE_COUNT = 1_000_000
 
     fun format(event: DeviceDiagnosticEvent): String {
         val values = mutableListOf<String>()
@@ -195,6 +244,25 @@ private object DeviceDiagnosticFormatter {
         event.chainLength?.let { values += "chain_length=$it" }
         append(values, "key_algorithm", event.keyAlgorithm)
         append(values, "fingerprint", event.fingerprint)
+        event.syncMode?.let { values += "sync_mode=${it.name.lowercase()}" }
+        appendCount(values, "window_size", event.windowSize)
+        appendCount(values, "response_bytes", event.responseBytes)
+        event.responseEmpty?.let { values += "response_empty=$it" }
+        appendCount(values, "command_count", event.commandCount)
+        appendCount(values, "add_count", event.addCount)
+        appendCount(values, "change_count", event.changeCount)
+        appendCount(values, "delete_count", event.deleteCount)
+        event.moreAvailable?.let { values += "more_available=$it" }
+        event.keyAdvanced?.let { values += "key_advanced=$it" }
+        event.ownershipAction?.let { values += "ownership_action=${it.name.lowercase()}" }
+        appendCount(values, "input_count", event.inputCount)
+        appendCount(values, "accepted_count", event.acceptedCount)
+        appendCount(values, "rejected_count", event.rejectedCount)
+        appendCount(values, "planned_operation_count", event.plannedOperationCount)
+        appendCount(values, "attempted_operation_count", event.attemptedOperationCount)
+        appendCount(values, "applied_operation_count", event.appliedOperationCount)
+        event.cleanupTrigger?.let { values += "cleanup_trigger=${it.name.lowercase()}" }
+        event.checkpointOutcome?.let { values += "checkpoint_outcome=${it.name.lowercase()}" }
         event.throwable?.let { throwable ->
             values +=
                 "exceptions=${ThrowableDiagnosticFormatter.format(throwable, event.mayIncludeRootMessage())}"
@@ -218,6 +286,14 @@ private object DeviceDiagnosticFormatter {
         if (source.isNotEmpty()) {
             values += "$name=${source.joinToString(",") { value -> DiagnosticTextSanitizer.sanitize(value) }}"
         }
+    }
+
+    private fun appendCount(
+        values: MutableList<String>,
+        name: String,
+        value: Int?,
+    ) {
+        value?.let { values += "$name=${it.coerceIn(0, MAX_AGGREGATE_COUNT)}" }
     }
 
     private fun DeviceDiagnosticEvent.mayIncludeRootMessage(): Boolean =

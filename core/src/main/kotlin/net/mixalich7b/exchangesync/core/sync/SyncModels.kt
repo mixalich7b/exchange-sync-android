@@ -50,6 +50,15 @@ public enum class SyncTrigger(public val code: String) {
     }
 }
 
+public enum class OwnedCalendarCleanupTrigger {
+    PROFILE_ACTIVATION,
+    FULL_RESET,
+    DISABLE,
+    STARTUP,
+    PERMISSION_RECOVERY,
+    USER_RETRY,
+}
+
 public enum class SyncProblem(public val code: String) {
     CLIENT_CERTIFICATE("client_certificate"),
     TLS("tls"),
@@ -201,6 +210,14 @@ public sealed interface LocalPageOutcome {
     public data object TransactionTooLarge : LocalPageOutcome
 
     public data class Failed(public val problem: SyncProblem = SyncProblem.CALENDAR_PROVIDER) : LocalPageOutcome
+}
+
+public sealed interface OwnedCalendarCleanupOutcome {
+    public data object Completed : OwnedCalendarCleanupOutcome
+
+    public data object Obsolete : OwnedCalendarCleanupOutcome
+
+    public data class Failed(public val problem: SyncProblem) : OwnedCalendarCleanupOutcome
 }
 
 public sealed interface SyncRunRequest {

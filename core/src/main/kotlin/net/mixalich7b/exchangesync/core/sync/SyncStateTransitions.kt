@@ -41,6 +41,7 @@ public object SyncStateTransitions {
                 currentTrigger = trigger,
                 followUpRequested = false,
                 consecutiveTransientAttempts = 0,
+                problem = null,
             ),
         )
     }

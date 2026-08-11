@@ -78,6 +78,7 @@ internal class AppContainer(context: Context) {
         RequestSynchronizationNow(
             stateRepository = synchronizationStateRepository,
             scheduler = syncScheduler,
+            problems = syncProblems,
         )
 
     val requestPeriodicSynchronization =
@@ -92,7 +93,7 @@ internal class AppContainer(context: Context) {
             scheduler = syncScheduler,
             problems = syncProblems,
             resumePendingCalendarCleanup = {
-                synchronizationLifecycle.onCalendarPermissionResult()
+                synchronizationLifecycle.resumePendingCalendarCleanup()
             },
         )
 

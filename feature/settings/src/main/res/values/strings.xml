@@ -64,6 +64,7 @@
     <string name="sync_cancel">Отменить</string>
     <string name="sync_disable">Отключить и очистить календарь</string>
     <string name="sync_enable">Включить синхронизацию</string>
+    <string name="sync_retry_cleanup">Повторить очистку календаря</string>
     <string name="sync_grant_calendar_access">Разрешить доступ к календарю</string>
     <string name="sync_open_notification_settings">Открыть настройки уведомлений</string>
     <string name="sync_grant_notification_access">Разрешить уведомления</string>
