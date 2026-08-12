@@ -13,6 +13,10 @@ Exchange в один принадлежащий приложению кален�
 
 ## ActiveSync flow
 
+Границы remote parsing, Calendar Provider mutations и durable checkpoint
+показаны на
+[схеме обработки одной страницы календаря](diagrams/calendar-page-processing.puml).
+
 После capability discovery выбирается максимальная общая версия от 14.0 до
 16.1. Клиент выполняет `FolderSync`, требует ровно одну папку default Calendar
 типа 8, затем создаёт collection partnership через `SyncKey=0` и получает
@@ -164,6 +168,10 @@ sub-batch атомарен, но вся page не обязана быть ато
 восстановления серверного представления.
 
 ## Фоновые задачи, retry и управление
+
+Общая state machine и взаимодействие с WorkManager вынесены в
+[диаграмму состояний синхронизации](diagrams/sync-state-machine.puml) и
+[sequence-схему жизненного цикла фоновых workers](diagrams/worker-lifecycle-sequence.puml).
 
 WorkManager поддерживает одну network-constrained periodic work с интервалом 15
 минут и одну unique execution chain. Profile Save, Enable и Sync Now создают

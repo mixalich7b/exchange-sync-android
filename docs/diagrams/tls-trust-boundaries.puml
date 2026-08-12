@@ -1,0 +1,66 @@
+@startuml
+title Границы клиентской identity и доверия серверу
+
+left to right direction
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam linetype ortho
+
+rectangle "Android security boundary" as AndroidBoundary #F2F2F2 {
+  component "Android KeyChain" as KeyChain #FFE3E3
+  artifact "Client private key\n(секрет, не экспортируется\nи не сохраняется приложением)" as PrivateKey #FFD1D1
+  artifact "Client X.509 chain\n(публичные сертификаты)" as ClientChain #E8F3FF
+  database "Android system trust store" as SystemTrustStore #E8F3FF
+
+  KeyChain *-- PrivateKey
+  KeyChain *-- ClientChain
+}
+
+rectangle "Exchange Sync application process" as AppBoundary #FAFAFA {
+  component "KeyChainClientCredentialResolver" as Resolver
+  component "FixedAliasKeyManager" as KeyManager
+  component "CertificateAssetLoader" as AssetLoader
+  artifact "assets/tls/*.pem|der\nлокальные public CA anchors\n(untracked build input)" as LocalAssets #E8F3FF
+  component "System X509TrustManager" as SystemTrust
+  component "Local X509TrustManager\n(optional)" as LocalTrust
+  component "CompositeX509TrustManager\nsystem-first, успех любого принимается" as CompositeTrust
+  component "SSLContext" as SslContext
+  component "OkHttpClient\ndefault hostname verification\nautomatic redirects disabled" as OkHttp
+
+  LocalAssets --> AssetLoader : прочитать PEM / DER
+  AssetLoader --> LocalTrust : построить private KeyStore\nтолько внутри процесса
+  SystemTrust --> CompositeTrust : public CA path
+  LocalTrust --> CompositeTrust : private CA path
+  KeyManager --> SslContext : единственная client identity
+  CompositeTrust --> SslContext : server-chain validation
+  SslContext --> OkHttp
+}
+
+cloud "Microsoft Exchange\nHTTPS:443 / ActiveSync" as Exchange
+
+Resolver --> KeyChain : getPrivateKey(alias)\ngetCertificateChain(alias)
+PrivateKey --> Resolver : runtime PrivateKey handle
+ClientChain --> Resolver : certificate chain
+Resolver --> KeyManager : ClientCredential
+SystemTrustStore --> SystemTrust : platform CA certificates
+OkHttp <--> Exchange : TLS handshake + HTTP/1.1
+
+note bottom of PrivateKey
+  DataStore содержит только непрозрачный alias.
+  Private key, certificate bytes и client credential
+  не сериализуются и не логируются.
+end note
+
+note bottom of CompositeTrust
+  Нет trust-all fallback, certificate pinning
+  или собственного hostname verifier.
+  Локальные CA не добавляются в Android trust store.
+end note
+
+legend bottom
+  |= Цвет |= Данные |
+  | <#FFD1D1> | секретный client key material |
+  | <#E8F3FF> | публичные сертификаты и trust anchors |
+endlegend
+
+@enduml

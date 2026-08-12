@@ -1,0 +1,144 @@
+@startuml
+title Обработка одной страницы календаря и commit checkpoint
+
+skinparam shadowing false
+skinparam activity {
+  BackgroundColor #FFF6DA
+  BorderColor #8A6D1D
+  DiamondBackgroundColor #E8F3FF
+  DiamondBorderColor #386A99
+}
+
+start
+
+partition "ExecuteSynchronizationSlice (:core)" {
+  :Загрузить SyncState и профиль;
+  if (enabled и fence\ngeneration/runToken актуален?) then (да)
+    :Проверить READ/WRITE_CALENDAR;
+  else (нет)
+    :Obsolete — без side effects;
+    stop
+  endif
+}
+
+partition "ActiveSync remote adapter (:infrastructure)" {
+  :Подготовить capability и primary folder\n(OPTIONS / FolderSync при необходимости);
+  :POST Sync с текущими SyncKey и window;
+  :Прочитать bounded HTTP body\nдо выделения полного массива;
+  :WbxmlCodec.decode с limits;
+  :ActiveSyncCalendarApplicationParser.parse;
+  :Сформировать RemoteCalendarPage\nchanges + nextCheckpoints + MoreAvailable;
+}
+
+if (RemoteCalendarPage получена?) then (да)
+  :Передать page в core execution slice;
+else (typed failure)
+  if (TRANSIENT?) then (да)
+    :phase = QUEUED, attempts++;
+    :Worker Result.retry()\nс exponential backoff;
+    stop
+  else (нет)
+    if (page-scaled capacity\nи window > 1?) then (да)
+      :Уменьшить window вдвое;
+      :Оставить прежний SyncKey;
+      :Enqueue continuation той же page;
+      stop
+    else (нет)
+      if (invalid key / full reset?) then (да)
+        :Fenced cleanup owned calendar;
+        :Сбросить checkpoints;
+        :Enqueue continuation полного sync;
+        stop
+      else (critical или minimum window)
+        :BLOCKED: safe problem;
+        :Checkpoint не продвигается;
+        stop
+      endif
+    endif
+  endif
+endif
+
+partition "Owned calendar adapter (:infrastructure)" {
+  :phase = APPLYING;
+  :Взять общий SynchronizationMutationLock\nна всю page;
+
+  if (fence всё ещё актуален?) then (да)
+    :resolveOwned(profile.email);
+    :queryExisting только по ServerId\nв owned calendar;
+    :CalendarPagePlanner + CalendarEventMapper;
+    :CalendarProviderBatchPlanner\nсоздаёт canonical ordered plan;
+  else (нет)
+    :Obsolete — provider не вызывается;
+    stop
+  endif
+
+  if (нужен full reset из-за\ndirty/missing mirror?) then (да)
+    :LocalPageOutcome.FullResetRequired;
+    :Checkpoint не продвигается;
+    :Fenced cleanup + continuation;
+    stop
+  else (нет)
+    :Продолжить применение provider plan;
+  endif
+
+  while (Есть следующий sub-batch\nне более 50 операций?) is (да)
+    :Проверить coroutine cancellation;
+    if (fence актуален?) then (да)
+      :ContentResolver.applyBatch\nодна атомарная provider transaction;
+    else (нет)
+      :Obsolete — следующий sub-batch\nне начинается;
+      stop
+    endif
+
+    if (provider call подтверждён?) then (да)
+      :Запомнить insert row IDs;
+      :Переписать cross-batch references\nдля следующего sub-batch;
+    else (нет / ambiguous)
+      note right
+        Подтверждённый префикс page может остаться видимым,
+        но повтор той же page идемпотентен по ServerId.
+      end note
+      if (transaction too large\nи window > 1?) then (да)
+        :Уменьшить window и enqueue continuation;
+      else (нет)
+        :BLOCKED: CALENDAR_PROVIDER;
+      endif
+      :Checkpoint и новый SyncKey не сохраняются;
+      stop
+    endif
+  endwhile (нет)
+
+  :Освободить mutation lock;
+  :LocalPageOutcome.Applied;
+}
+
+partition "Durable checkpoint commit (:core + DataStore)" {
+  if (fence всё ещё актуален?) then (да)
+    :Одна state update сохраняет\npage.nextCheckpoints, включая новый SyncKey;
+    note right
+      Commit выполняется только после успеха
+      всех provider sub-batches страницы.
+    end note
+  else (нет)
+    :Obsolete — checkpoint пропущен;
+    stop
+  endif
+
+  if (MoreAvailable?) then (да)
+    if (slice limits достигнуты?) then (да)
+      :phase = QUEUED;
+      :Enqueue continuation\nс тем же generation/runToken;
+      stop
+    else (нет)
+      :Эта page завершена; перейти к следующей\nитерации текущего bounded slice;
+      stop
+    endif
+  else (нет)
+    :phase = IDLE\nили QUEUED при followUpRequested;
+    :Сохранить last successful time;
+  endif
+}
+
+stop
+
+@enduml

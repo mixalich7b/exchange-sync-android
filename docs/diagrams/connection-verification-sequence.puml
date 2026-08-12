@@ -1,0 +1,144 @@
+@startuml
+title Проверка и сохранение профиля: validate → probe → commit
+
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+autonumber
+
+actor Пользователь as User
+
+box ":feature:settings" #EEF9E8
+  boundary SettingsScreen as Ui
+  control SettingsViewModel as ViewModel
+end box
+
+box ":core" #FFF6DA
+  control SaveConnection as Save
+  control VerifyConnection as Verify
+  control ConnectionValidator as Validator
+  control SynchronizationLifecycle as Lifecycle
+end box
+
+box ":infrastructure" #F5ECFF
+  control "ActiveSyncConnectionVerifier" as Verifier
+  control "KeyChainClientCredentialResolver" as CredentialResolver
+  control "Secure HTTP transport" as Transport
+  database "DataStore profile repository" as ProfileRepository
+  database "DataStore synchronization state" as SyncStateRepository
+  control "AndroidOwnedCalendarAdapter" as OwnedCalendar
+  control "WorkManagerSyncScheduler" as Scheduler
+end box
+
+collections "Android KeyChain" as KeyChain
+participant "Exchange ActiveSync" as Exchange
+queue "WorkManager" as WorkManager
+
+User -> Ui : редактирует draft
+Ui -> ViewModel : onEmail/Account/Server/CertificateChanged
+note over Ui, ViewModel
+  Редактирование меняет только UI state:
+  без KeyChain, HTTP и DataStore.
+end note
+
+User -> Ui : Save
+Ui -> ViewModel : onSave()
+ViewModel -> Save : execute(draft)
+Save -> Verify : execute(draft)
+Verify -> Validator : validate(draft) + toProfile(draft)
+
+alt draft невалиден
+  Validator --> Verify : ошибки всех полей
+  Verify --> Save : Invalid(errors)
+  Save --> ViewModel : Invalid(errors)
+  ViewModel --> Ui : сохранить draft, показать ошибки
+else draft валиден
+  Validator --> Verify : ConnectionProfile
+  Verify -> Verifier : verify(profile)
+  Verifier -> CredentialResolver : resolve(alias)
+  CredentialResolver -> KeyChain : getPrivateKey(alias)\ngetCertificateChain(alias)
+
+  alt client identity недоступна
+    KeyChain --> CredentialResolver : null / ошибка
+    CredentialResolver --> Verifier : unavailable
+    Verifier --> Verify : Failure(CLIENT_CERTIFICATE_UNAVAILABLE)
+    Verify --> Save : Failed(reason)
+    Save --> ViewModel : Failed(reason)
+  else client identity доступна
+    KeyChain --> CredentialResolver : runtime key handle + X.509 chain
+    CredentialResolver --> Verifier : ClientCredential
+    Verifier -> Transport : создать fixed-identity TLS transport
+    Transport -> Exchange : OPTIONS /Microsoft-Server-ActiveSync\nHTTPS:443 + mTLS
+
+    alt TLS / HTTP / redirect / capability failure
+      Exchange --> Transport : отказ или несовместимый response
+      Transport --> Verifier : типизированная ошибка
+      Verifier --> Verify : Failure(reason)
+      Verify --> Save : Failed(reason)
+      Save --> ViewModel : Failed(reason)
+    else terminal response проверен
+      Exchange --> Transport : HTTP 200 + versions + commands\nserver certificate chain
+      Transport --> Verifier : success + TLS diagnostics
+      Verifier --> Verify : Success
+      Verify --> Save : Verified(profile, diagnostics)
+      Save -> ProfileRepository : load()
+
+      alt профиль не изменился
+        ProfileRepository --> Save : тот же profile
+        Save --> ViewModel : Saved(profile, diagnostics)
+      else новый или изменённый профиль
+        ProfileRepository --> Save : null / предыдущий profile
+        Save -> Lifecycle : activateProfile(profile)
+        Lifecycle -> SyncStateRepository : commitActivatedProfile(profile)
+        note right of SyncStateRepository
+          Одна DataStore-транзакция:
+          profile + новая generation/runToken,
+          QUEUED + сброшенные checkpoints.
+        end note
+        SyncStateRepository --> Lifecycle : activated SyncState
+        Lifecycle -> Scheduler : cancelAll()
+        Scheduler -> WorkManager : cancel unique periodic/execution work
+        Lifecycle -> OwnedCalendar : deleteOwnedCalendar(fence)
+
+        alt permission / cleanup problem
+          OwnedCalendar --> Lifecycle : Failed / permission required
+          Lifecycle -> SyncStateRepository : BLOCKED + safe problem
+          note over Save, Lifecycle
+            Профиль уже durably committed;
+            проблема синхронизации показывается отдельно.
+          end note
+        else cleanup завершён
+          OwnedCalendar --> Lifecycle : Completed
+          alt scheduling failure
+            Lifecycle -> Scheduler : schedule periodic / enqueue immediate
+            Scheduler --> Lifecycle : exception
+            Lifecycle -> SyncStateRepository : BLOCKED(BACKGROUND_SCHEDULING)
+          else durable scheduling готов
+            Lifecycle -> Scheduler : schedulePeriodic(generation)
+            Scheduler -> WorkManager : unique periodic, 15 минут
+            Lifecycle -> Scheduler : enqueueExecution(generation, runToken)
+            Scheduler -> WorkManager : unique immediate execution
+          end
+        end
+
+        Lifecycle --> Save : lifecycle outcome
+        Save --> ViewModel : Saved(profile, diagnostics)
+      end
+    end
+  end
+end
+
+ViewModel --> Ui : terminal UI state
+
+== Повторная проверка сохранённого snapshot ==
+User -> Ui : Recheck
+Ui -> ViewModel : onRecheck()
+ViewModel -> Verify : execute(unchanged saved draft)
+note over ViewModel, Verify
+  Тот же validation + mTLS + OPTIONS probe,
+  но без SaveConnection, commit и lifecycle activation.
+end note
+Verify --> ViewModel : Verified / Invalid / Failed
+ViewModel --> Ui : TLS diagnostics или ошибка
+
+@enduml

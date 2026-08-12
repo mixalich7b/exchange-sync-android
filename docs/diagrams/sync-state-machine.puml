@@ -1,0 +1,79 @@
+@startuml
+title Состояния календарной синхронизации
+
+hide empty description
+skinparam shadowing false
+skinparam state {
+  BackgroundColor #FFF6DA
+  BorderColor #8A6D1D
+  BackgroundColor<<terminal>> #FCE8E8
+  BorderColor<<terminal>> #A33A3A
+}
+
+state DISABLED <<terminal>>
+
+state "enabled = true" as Enabled {
+  [*] --> QUEUED
+
+  state IDLE
+  state QUEUED
+  state DISCOVERING_PROTOCOL
+  state DISCOVERING_FOLDERS
+  state DOWNLOADING
+  state APPLYING
+  state CANCELLING
+  state BLOCKED <<terminal>>
+
+  IDLE --> QUEUED : Sync Now / periodic trigger\nrunToken++, trigger записан
+  BLOCKED --> QUEUED : ручной retry\nили periodic после TRANSIENT_EXHAUSTED
+
+  QUEUED --> DISCOVERING_PROTOCOL : execution worker\nнет live capability
+  QUEUED --> DISCOVERING_FOLDERS : execution worker\ncapability уже в process session
+  DISCOVERING_PROTOCOL --> DISCOVERING_FOLDERS : OPTIONS успешен
+  DISCOVERING_FOLDERS --> DOWNLOADING : FolderSync / primary calendar готовы
+  DOWNLOADING --> APPLYING : получена RemoteCalendarPage
+
+  APPLYING --> DISCOVERING_FOLDERS : MoreAvailable\nследующая page в том же slice
+  APPLYING --> QUEUED : slice limit / window reduction / full reset\nили follow-up → continuation work
+  APPLYING --> IDLE : terminal page успешно применена\nfollowUpRequested = false
+
+  DISCOVERING_PROTOCOL --> QUEUED : transient failure → WorkManager retry
+  DISCOVERING_FOLDERS --> QUEUED : transient/recoverable failure\nили reset → retry/continuation
+  DOWNLOADING --> QUEUED : transient/capacity failure\n→ retry/continuation
+  APPLYING --> QUEUED : provider capacity failure\nwindow > 1 → continuation
+
+  QUEUED --> BLOCKED : permission / scheduling problem
+  DISCOVERING_PROTOCOL --> BLOCKED : persistent connection problem
+  DISCOVERING_FOLDERS --> BLOCKED : persistent folder/protocol problem
+  DOWNLOADING --> BLOCKED : critical protocol problem\nили transient attempts = 5
+  APPLYING --> BLOCKED : provider failure\nили minimum window = 1
+
+  QUEUED --> CANCELLING : Cancel
+  DISCOVERING_PROTOCOL --> CANCELLING : Cancel
+  DISCOVERING_FOLDERS --> CANCELLING : Cancel
+  DOWNLOADING --> CANCELLING : Cancel
+  APPLYING --> CANCELLING : Cancel
+  CANCELLING --> IDLE : cancel unique execution work
+}
+
+[*] --> DISABLED : профиль ещё не активирован
+DISABLED --> Enabled : profile activation / Enable\nnew generation + runToken, initial QUEUED
+Enabled --> DISABLED : Disable\ngeneration++ + runToken++, cancelAll(), cleanup
+
+note right of Enabled
+  Любой side effect разрешён только при совпадении
+  persisted generation/runToken с worker fence.
+  Несовпадение завершает старый worker как Obsolete.
+end note
+
+note left of Enabled
+  Trigger во время QUEUED/running/cancelling
+  не создаёт параллельный run: он выставляет
+  followUpRequested и coalesce-ится.
+
+  После process recreation активная phase
+  нормализуется в QUEUED, а scheduling
+  reconciliation восстанавливает unique work.
+end note
+
+@enduml

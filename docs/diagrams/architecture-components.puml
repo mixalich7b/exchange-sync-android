@@ -1,0 +1,102 @@
+@startuml
+title Ключевые компоненты Exchange Sync
+
+left to right direction
+skinparam componentStyle rectangle
+skinparam packageStyle rectangle
+skinparam shadowing false
+skinparam linetype ortho
+skinparam defaultTextAlignment center
+
+package ":app" as AppPackage #E8F3FF {
+  component ":app module" as AppModule <<Gradle module>>
+  component ExchangeSyncApplication as Application
+  component MainActivity as Activity
+  component AppContainer as Container
+}
+
+package ":feature:settings" as SettingsPackage #EEF9E8 {
+  component ":feature:settings module" as SettingsModule <<Gradle module>>
+  component "SettingsRoute /\nSettingsScreen" as SettingsUi
+  component SettingsViewModel as ViewModel
+}
+
+package ":core" as CorePackage #FFF6DA {
+  component ":core module" as CoreModule <<Gradle module>>
+
+  component "Connection use cases\nVerifyConnection\nSaveConnection" as ConnectionUseCases
+  component "Synchronization use cases\nSynchronizationLifecycle\nRequestSynchronizationNow\nRequestPeriodicSynchronization\nExecuteSynchronizationSlice" as SyncUseCases
+  component "Calendar domain\nActiveSync calendar models\nCalendarEventMapper" as CalendarDomain
+
+  component "Connection ports\nConnectionVerifier\nConnectionProfileRepository" as ConnectionPorts <<ports>>
+  component "Synchronization ports\nRemoteCalendarPort\nOwnedCalendarPort\nSyncStateRepository\nSyncSchedulerPort\nSyncPermissionPort\nSyncProblemReporterPort\nSyncDiagnosticsPort" as SyncPorts <<ports>>
+}
+
+package ":infrastructure" as InfrastructurePackage #F5ECFF {
+  component ":infrastructure module" as InfrastructureModule <<Gradle module>>
+  component "AndroidActiveSyncProcessRuntime\nHTTPS / mTLS / OPTIONS\nFolderSync / Sync / WBXML" as ActiveSync
+  component "DataStore repositories\nprofile + sync state" as Persistence
+  component "AndroidOwnedCalendarAdapter\nCalendar Provider batches" as CalendarProvider
+  component "WorkManagerSyncScheduler\nSync workers + WorkerFactory" as Work
+  component "AndroidSyncPermissionPort\nSyncProblemNotificationReporter" as UserAttention
+  component "AndroidSyncDiagnostics\nLogcat diagnostics" as Diagnostics
+}
+
+cloud "Microsoft Exchange\nActiveSync over HTTPS/mTLS" as Exchange
+database "Preferences DataStore" as DataStore
+database "Android Calendar Provider" as AndroidCalendar
+node "Android OS" as Android {
+  component "KeyChain" as KeyChain
+  component "WorkManager" as AndroidWorkManager
+  component "Permissions / Notifications" as AndroidPermissions
+  component "Logcat" as Logcat
+}
+
+' Gradle dependencies
+AppModule ..> SettingsModule : Gradle dependency
+AppModule ..> InfrastructureModule : Gradle dependency
+SettingsModule ..> CoreModule : Gradle dependency
+InfrastructureModule ..> CoreModule : Gradle dependency
+
+' Runtime composition and calls
+Application --> Container : создаёт один раз на процесс
+Activity --> SettingsUi : размещает Compose UI
+SettingsUi --> ViewModel : события / UI state
+Container --> ViewModel : создаёт с core actions
+ViewModel --> ConnectionUseCases : сохранить / перепроверить
+ViewModel --> SyncUseCases : запустить / отменить / отключить
+ConnectionUseCases --> ConnectionPorts
+SyncUseCases --> SyncPorts
+SyncUseCases --> CalendarDomain
+
+Container --> ActiveSync : process-wide runtime
+Container --> Persistence
+Container --> CalendarProvider
+Container --> Work
+Container --> UserAttention
+Container --> Diagnostics
+
+ActiveSync ..|> ConnectionPorts : реализует verifier
+ActiveSync ..|> SyncPorts : реализует remote calendar
+Persistence ..|> ConnectionPorts : реализует repository
+Persistence ..|> SyncPorts : реализует sync state
+CalendarProvider ..|> SyncPorts : реализует owned calendar
+Work ..|> SyncPorts : реализует scheduler
+UserAttention ..|> SyncPorts : реализует permissions / reporter
+Diagnostics ..|> SyncPorts : реализует diagnostics port
+
+ActiveSync --> KeyChain : client identity
+ActiveSync --> Exchange : OPTIONS / FolderSync / Sync
+Persistence --> DataStore
+CalendarProvider --> AndroidCalendar
+Work --> AndroidWorkManager
+UserAttention --> AndroidPermissions
+Diagnostics --> Logcat
+
+legend bottom
+  <b>Сплошная стрелка</b> — runtime-вызов или ручная композиция
+  <b>Пунктирная стрелка</b> — зависимость Gradle-модуля
+  <b>Пунктирная стрелка с треугольником</b> — adapter реализует core port
+endlegend
+
+@enduml

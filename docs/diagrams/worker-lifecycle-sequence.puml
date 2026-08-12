@@ -1,0 +1,137 @@
+@startuml
+title Запуск, продолжение и остановка background workers
+
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+autonumber
+
+actor Пользователь as User
+boundary SettingsViewModel as ViewModel
+control SynchronizationLifecycle as Lifecycle
+control RequestSynchronizationNow as ManualRequest
+control RequestPeriodicSynchronization as PeriodicRequest
+database "SyncStateRepository" as State
+control WorkManagerSyncScheduler as Scheduler
+queue WorkManager as WorkManager
+control PeriodicSyncTriggerWorker as PeriodicWorker
+control SynchronizationExecutionWorker as ExecutionWorker
+control ExecuteSynchronizationSlice as Slice
+control RemoteCalendarPort as Remote
+control OwnedCalendarPort as Local
+
+group Profile activation / Enable
+  User -> ViewModel : Save profile / Enable
+  ViewModel -> Lifecycle : activateProfile(profile) через SaveConnection\n/ enable()
+  Lifecycle -> State : new generation + runToken\nphase = QUEUED
+  Lifecycle -> Local : deleteOwnedCalendar(fence)\nпосле permission check
+  Local --> Lifecycle : Completed
+  Lifecycle -> Scheduler : schedulePeriodic(generation)
+  Scheduler -> WorkManager : enqueueUniquePeriodicWork(UPDATE)\nnetwork, interval = 15 min
+  Lifecycle -> Scheduler : enqueueExecution(generation, runToken)
+  Scheduler -> WorkManager : enqueueUniqueWork(REPLACE)\nnetwork + exponential backoff
+end
+
+group Manual trigger
+  User -> ViewModel : Sync Now
+  ViewModel -> ManualRequest : execute()
+  ManualRequest -> State : requestRun(MANUAL)
+  alt IDLE / BLOCKED → Queued
+    State --> ManualRequest : runToken++, phase = QUEUED
+    ManualRequest -> Scheduler : enqueueExecution(generation, runToken)
+    Scheduler -> WorkManager : unique execution (REPLACE)
+  else уже QUEUED / running / CANCELLING
+    State --> ManualRequest : Coalesced\nfollowUpRequested = true
+  else DISABLED
+    State --> ManualRequest : Ignored
+  end
+end
+
+group Periodic trigger
+  WorkManager -> PeriodicWorker : doWork(generation)
+  PeriodicWorker -> PeriodicRequest : execute(expectedGeneration)
+  PeriodicRequest -> State : проверить generation и eligibility
+  alt generation актуальна и запуск разрешён
+    State --> PeriodicRequest : Queued
+    PeriodicRequest -> Scheduler : enqueueExecution(generation, runToken)
+    Scheduler -> WorkManager : unique execution (REPLACE)
+  else устаревшая generation или persistent BLOCKED
+    State --> PeriodicRequest : Ignored
+  end
+  PeriodicWorker --> WorkManager : Result.success()
+end
+
+group Unique execution chain
+  WorkManager -> ExecutionWorker : doWork(generation, runToken)
+  ExecutionWorker -> Slice : execute(SyncFence)
+  Slice -> State : проверить enabled + generation/runToken
+
+  alt fence устарел
+    State --> Slice : Obsolete
+    Slice --> ExecutionWorker : Obsolete
+    ExecutionWorker --> WorkManager : Result.success()
+  else fence актуален
+    loop успешные pages: не более 10 и 4 минут
+      Slice -> Remote : fetchPage(...)
+      Remote --> Slice : RemoteCalendarPage
+      Slice -> Local : applyPage(fence, page)
+      Local --> Slice : Applied / failure
+      Slice -> State : commit next checkpoints\nтолько после полного apply
+    end
+
+    alt terminal page и нет follow-up
+      Slice -> State : phase = IDLE, last success
+      Slice --> ExecutionWorker : Completed
+      ExecutionWorker --> WorkManager : Result.success()
+    else MoreAvailable / slice limit / recoverable reset
+      Slice -> State : phase = QUEUED
+      Slice -> Scheduler : enqueueContinuation(generation, runToken)
+      Scheduler -> WorkManager : unique execution (APPEND_OR_REPLACE)
+      Slice --> ExecutionWorker : Continued
+      ExecutionWorker --> WorkManager : Result.success()
+    else transient failure, attempt < 5
+      Slice -> State : phase = QUEUED, attempts++
+      Slice --> ExecutionWorker : Retry
+      ExecutionWorker --> WorkManager : Result.retry()
+      note right of WorkManager
+        Exponential backoff начинается с 30 секунд.
+        Тот же unique work получает тот же fence.
+      end note
+    else persistent problem / attempts = 5
+      Slice -> State : phase = BLOCKED + safe problem
+      Slice --> ExecutionWorker : Blocked
+      ExecutionWorker --> WorkManager : Result.success()
+    end
+  end
+end
+
+group Cooperative Cancel
+  User -> ViewModel : Cancel
+  ViewModel -> Lifecycle : cancel()
+  Lifecycle -> State : под mutation lock:\nrunToken++, phase = CANCELLING
+  Lifecycle -> Scheduler : cancelExecution()
+  Scheduler -> WorkManager : cancelUniqueWork(execution)
+  Lifecycle -> State : phase = IDLE
+  note over State, Local
+    Committed calendar и checkpoints сохраняются.
+    Старый worker теряет fence и не начинает новый side effect.
+  end note
+end
+
+group Disable
+  User -> ViewModel : Disable
+  ViewModel -> Lifecycle : disable()
+  Lifecycle -> State : под mutation lock:\nenabled = false, generation++, runToken++\nphase = DISABLED, checkpoints = EMPTY
+  Lifecycle -> Scheduler : cancelAll()
+  Scheduler -> WorkManager : cancel unique execution + periodic work
+  Lifecycle -> Local : deleteOwnedCalendar(disabled fence)
+  alt cleanup failed / permission missing
+    Local --> Lifecycle : Failed
+    Lifecycle -> State : calendarCleanupPending + problem
+  else cleanup completed
+    Local --> Lifecycle : Completed
+    Lifecycle -> State : calendarCleanupPending = false
+  end
+end
+
+@enduml

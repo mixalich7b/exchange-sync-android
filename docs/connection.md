@@ -66,6 +66,9 @@ layer. Если alias удалён, отозван или недоступен, 
 
 ## Validate-probe-commit и повторная проверка
 
+Полный поток показан на
+[sequence-схеме проверки и сохранения профиля](diagrams/connection-verification-sequence.puml).
+
 Save выполняется в следующем порядке:
 
 1. полная локальная валидация;
@@ -144,6 +147,9 @@ HTTPS response не даёт пригодной X.509-цепочки, прове
 категорию diagnostic error вместо частичного успешного результата.
 
 ## Доверие TLS
+
+Разделение client identity, системного и локального server trust показано на
+[схеме границ mTLS и доверия серверу](diagrams/tls-trust-boundaries.puml).
 
 Server chain проверяется объединением двух независимых источников:
 
