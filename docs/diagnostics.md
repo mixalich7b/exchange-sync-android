@@ -77,7 +77,11 @@ Calendar page при window больше одного означают adaptive 
 malformed server data:
 связанные записи показывают старое и уменьшенное window и неизменённый
 checkpoint. `minimum_window_block` означает terminal `PROTOCOL_DATA` без
-пропуска элемента. `wbxml_depth` и `wbxml_inline_string_bytes` остаются
+пропуска элемента. `wbxml_element_count` возникает только при попытке прочитать
+256 001-й элемент: response не более чем с 256 000 элементов продолжает
+full-tree decode и может дать обычные `CALENDAR_SYNC`, attendee suppression,
+provider batch и checkpoint `committed` records. `wbxml_depth` и
+`wbxml_inline_string_bytes` остаются
 terminal, а настоящий syntax/encoding/token/structure defect сохраняет
 `MALFORMED_WBXML`. `folder_preparation` позволяет отличить cold/new-run refresh,
 reuse в page/retry/continuation и invalidation, не раскрывая содержимое cache.

@@ -20,7 +20,7 @@ class WbxmlReadLimitException(
 data class WbxmlLimits(
     val maxDocumentBytes: Int = 2 * 1024 * 1024,
     val maxDepth: Int = 32,
-    val maxElements: Int = 20_000,
+    val maxElements: Int = 256_000,
     val maxInlineStringBytes: Int = 256 * 1024,
 ) {
     init {

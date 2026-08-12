@@ -1474,12 +1474,7 @@ class ActiveSyncRemoteCalendarTest {
     private fun documentCapacityResponse(): ByteArray = ByteArray(2 * 1024 * 1024 + 1)
 
     private fun elementCapacityResponse(): ByteArray =
-        WbxmlWriter(WbxmlLimits(maxElements = 20_001)).write(
-            WbxmlElement(
-                AirSync.SYNC,
-                children = List(20_000) { WbxmlElement(AirSync.MORE_AVAILABLE) },
-            ),
-        )
+        overDefaultElementCapacityResponse()
 
     private fun depthCapacityResponse(): ByteArray {
         var nested = WbxmlElement(AirSync.MORE_AVAILABLE)

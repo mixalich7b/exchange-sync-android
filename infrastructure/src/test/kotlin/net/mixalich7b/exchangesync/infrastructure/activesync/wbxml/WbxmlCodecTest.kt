@@ -144,31 +144,25 @@ class WbxmlCodecTest {
     }
 
     @Test
-    fun `document and element reader capacity use typed read limits`() {
-        val nestedElements =
-            bytes(
-                0x03,
-                0x01,
-                0x6A,
-                0x00,
-                0x45,
-                0x4F,
-                0x4E,
-                0x03,
-                0x31,
-                0x00,
-                0x01,
-                0x01,
-                0x01,
+    fun `document and element reader capacity accept the exact boundary and reject the next unit`() {
+        val document = bytes(0x03, 0x01, 0x6A, 0x00, 0x05)
+        val twoElements =
+            WbxmlWriter(WbxmlLimits(maxElements = 2)).write(
+                WbxmlElement(
+                    ActiveSyncWbxmlTokens.AirSync.SYNC,
+                    children = listOf(WbxmlElement(ActiveSyncWbxmlTokens.AirSync.MORE_AVAILABLE)),
+                ),
             )
 
+        assertEquals(ActiveSyncWbxmlTokens.AirSync.SYNC, WbxmlReader(WbxmlLimits(maxDocumentBytes = 5)).read(document).tag)
+        assertEquals(1, WbxmlReader(WbxmlLimits(maxElements = 2)).read(twoElements).children.size)
         val documentFailure =
             assertThrows(WbxmlReadLimitException::class.java) {
-                WbxmlReader(WbxmlLimits(maxDocumentBytes = 4)).read(bytes(0x03, 0x01, 0x6A, 0x00, 0x05))
+                WbxmlReader(WbxmlLimits(maxDocumentBytes = 4)).read(document)
             }
         val elementFailure =
             assertThrows(WbxmlReadLimitException::class.java) {
-                WbxmlReader(WbxmlLimits(maxElements = 1)).read(nestedElements)
+                WbxmlReader(WbxmlLimits(maxElements = 1)).read(twoElements)
             }
 
         assertEquals(WbxmlReadLimitKind.DOCUMENT_BYTES, documentFailure.kind)

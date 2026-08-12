@@ -270,6 +270,14 @@ internal object CalendarProviderBatchPlanner {
     ) {
         if (!plan.replaceOrganizer) return
         operations += CalendarProviderBatchOperation.OrganizerDelete(plan.calendarId, eventReference)
+        addOrganizerInsert(plan, eventReference, operations)
+    }
+
+    private fun addOrganizerInsert(
+        plan: CalendarEventPlan.Upsert,
+        eventReference: EventReference,
+        operations: MutableList<CalendarProviderBatchOperation>,
+    ) {
         val email = (plan.event.organizerEmail as? ActiveSyncField.Value)?.value ?: return
         val name = (plan.event.organizerName as? ActiveSyncField.Value)?.value
         operations +=
@@ -375,6 +383,7 @@ internal object CalendarProviderBatchPlanner {
             val exceptionReference = EventReference.Inserted(exceptionIndex)
             val attendees = (exception.attendees as? ActiveSyncField.Value)?.value.orEmpty()
             if (!exception.deleted) {
+                addOrganizerInsert(plan, exceptionReference, operations)
                 attendees.suppressionOrNull(plan.event.organizerEmail is ActiveSyncField.Value)
                     ?.let(attendeeSuppressions::add)
             }

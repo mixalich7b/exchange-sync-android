@@ -14,6 +14,7 @@ import net.mixalich7b.exchangesync.core.calendar.ActiveSyncResponseType
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncSensitivity
 import net.mixalich7b.exchangesync.core.sync.RemoteCalendarPage
 import net.mixalich7b.exchangesync.core.sync.SyncCheckpoints
+import net.mixalich7b.exchangesync.infrastructure.activesync.HighElementCalendarSyncFixture
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
@@ -22,6 +23,58 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class CalendarProviderBatchPlannerTest {
+    @Test
+    fun `high fanout series keeps organizer recurrence and unique exceptions while suppressing guests`() {
+        val mutation = HighElementCalendarSyncFixture.mutation()
+        val pagePlan =
+            CalendarPagePlanner.plan(
+                page(mutation),
+                resolution(),
+                emptyList(),
+            )
+
+        val batch = CalendarProviderBatchPlanner.plan(pagePlan, FixedTimeZoneResolver("UTC"))
+
+        val series = batch.operations.filterIsInstance<CalendarProviderBatchOperation.EventInsert>().single()
+        assertEquals("FREQ=DAILY;INTERVAL=1", series.values[CalendarProviderField.RECURRENCE_RULE])
+        assertEquals(0, batch.nonOrganizerAttendeeInserts().size)
+        assertEquals(
+            HighElementCalendarSyncFixture.CHANGED_EXCEPTION_COUNT + 1,
+            batch.attendeeSuppressions.size,
+        )
+        assertTrue(batch.attendeeSuppressions.all { suppression ->
+            suppression.inputCount == HighElementCalendarSyncFixture.ATTENDEE_COUNT && suppression.organizerRetained
+        })
+
+        val exceptions = batch.operations.filterIsInstance<CalendarProviderBatchOperation.ExceptionInsert>()
+        assertEquals(HighElementCalendarSyncFixture.TOTAL_EXCEPTION_COUNT, exceptions.size)
+        val nonDeletedExceptionReferences =
+            batch.operations.withIndex()
+                .filter { (_, operation) ->
+                    operation is CalendarProviderBatchOperation.ExceptionInsert &&
+                        operation.values[CalendarProviderField.EXCEPTION_DELETED] == 0
+                }.map { (index, _) -> EventReference.Inserted(index) }
+        val organizerInserts = batch.organizerAttendeeInserts()
+        assertEquals(HighElementCalendarSyncFixture.CHANGED_EXCEPTION_COUNT + 1, organizerInserts.size)
+        assertEquals("organizer@example.test", organizerInserts.single { insert ->
+            insert.event == EventReference.Inserted(0)
+        }.values[CalendarProviderField.ATTENDEE_EMAIL])
+        assertTrue(nonDeletedExceptionReferences.all { reference ->
+            organizerInserts.single { insert -> insert.event == reference }
+                .values[CalendarProviderField.ATTENDEE_EMAIL] == "organizer@example.test"
+        })
+        val exceptionIds = exceptions.map { exception -> exception.values.getValue(CalendarProviderField.SYNC_ID) }
+        assertEquals(exceptionIds.size, exceptionIds.distinct().size)
+        assertEquals(
+            HighElementCalendarSyncFixture.DELETED_EXCEPTION_COUNT,
+            exceptions.count { exception -> exception.values[CalendarProviderField.EXCEPTION_DELETED] == 1 },
+        )
+        assertTrue(
+            exceptions.filter { exception -> exception.values[CalendarProviderField.EXCEPTION_DELETED] == 0 }
+                .all { exception -> exception.values[CalendarProviderField.HAS_ATTENDEE_DATA] == 1 },
+        )
+    }
+
     @Test
     fun `addition inserts one stable event plus attendees reminder and linked exceptions`() {
         val exceptionStart = Instant.parse("2026-08-16T09:00:00Z")
@@ -94,8 +147,10 @@ class CalendarProviderBatchPlannerTest {
         assertEquals(1, eventInsert.values[CalendarProviderField.RESPONSE_REQUESTED])
 
         val attendeeInserts = batch.operations.filterIsInstance<CalendarProviderBatchOperation.AttendeeInsert>()
-        assertEquals(3, attendeeInserts.size)
-        assertTrue(attendeeInserts.any { it.values[CalendarProviderField.ATTENDEE_RELATIONSHIP] == ProviderInteger.ORGANIZER_RELATIONSHIP })
+        assertEquals(4, attendeeInserts.size)
+        assertEquals(2, attendeeInserts.count {
+            it.values[CalendarProviderField.ATTENDEE_RELATIONSHIP] == ProviderInteger.ORGANIZER_RELATIONSHIP
+        })
         assertEquals(
             ProviderInteger.TENTATIVE_ATTENDEE,
             attendeeInserts.single { it.values[CalendarProviderField.ATTENDEE_EMAIL] == "guest@example.test" }
@@ -122,6 +177,14 @@ class CalendarProviderBatchPlannerTest {
             attendeeInserts.any { attendee ->
                 attendee.event != EventReference.Inserted(0) &&
                     attendee.values[CalendarProviderField.ATTENDEE_EMAIL] == "exception@example.test"
+            },
+        )
+        assertTrue(
+            attendeeInserts.any { attendee ->
+                attendee.event != EventReference.Inserted(0) &&
+                    attendee.values[CalendarProviderField.ATTENDEE_EMAIL] == "owner@example.test" &&
+                    attendee.values[CalendarProviderField.ATTENDEE_RELATIONSHIP] ==
+                    ProviderInteger.ORGANIZER_RELATIONSHIP
             },
         )
         assertEquals(ProviderInteger.CANCELLED_EVENT, exceptions.last().values[CalendarProviderField.STATUS])

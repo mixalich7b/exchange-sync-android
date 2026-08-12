@@ -957,7 +957,7 @@ class AndroidOwnedCalendarAdapterTest {
     private fun assertReplayConverged(gateway: ReplayCalendarGateway) {
         assertEquals(1, gateway.topLevelEventCount)
         assertEquals(setOf("large-series"), gateway.eventSyncIds)
-        assertEquals(1, gateway.organizerRows)
+        assertEquals(2, gateway.organizerRows)
         assertEquals(200, gateway.attendeeRows)
         assertEquals(2, gateway.reminderRows)
         assertEquals(1, gateway.exceptionRows)

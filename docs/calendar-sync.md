@@ -26,9 +26,12 @@ Exchange в один принадлежащий приложению кален�
 Успешный `Sync` с пустым HTTP body означает отсутствие изменений: текущий
 collection SyncKey сохраняется, а run завершается без protocol-data ошибки.
 
-WBXML декодируется с ограничениями размера документа, глубины, количества
-элементов и размера отдельной inline string; повторяющиеся singleton-поля
-отклоняются как malformed data. Ограничения размера WBXML-документа и числа
+WBXML полностью декодируется в bounded element tree с лимитами 2 MiB на
+документ, 32 на глубину, 256 000 элементов и 256 KiB на отдельную inline
+string; повторяющиеся singleton-поля отклоняются как malformed data. Поэтому
+один document-bounded recurring item с большими attendee lists в series,
+changed и deleted exceptions проходит обычные parsing и provider planning,
+если остаётся в этих границах. Ограничения размера WBXML-документа и числа
 элементов типизированы отдельно от syntax/encoding/token errors и считаются
 page-scaled только для обычной Calendar `Sync` page. Вместе с bounded HTTP body
 и слишком большой provider transaction они сохраняют committed checkpoint,
@@ -121,9 +124,13 @@ zone; неоднозначные или непредставимые данны�
 oversized-событии attendee rows не создаются. Правило применяется независимо к
 series и каждой recurrence exception после наследования её effective attendee
 list; переходы через порог полностью заменяют child collection. ActiveSync
-decoder и domain mapper при этом сохраняют весь входной список: ограничение
-действует только при материализации Calendar Provider и не влияет на
-классификацию приглашения или self-attendee status.
+decoder и domain mapper при этом сохраняют весь входной список, включая списки
+changed и deleted exceptions: ограничение действует только при материализации
+Calendar Provider и не влияет на классификацию приглашения, self-attendee
+status или identity recurrence exception. В частности, high-fanout series,
+укладывающаяся в лимит 256 000 WBXML-элементов, сохраняет organizer и recurrence rows,
+уникальные changed/deleted exception rows и опускает non-organizer attendee
+rows для series и oversized non-deleted exceptions.
 
 Для приглашений authoritative `ResponseType` имеет приоритет; при его
 отсутствии допустим однозначный status attendee, соответствующего email

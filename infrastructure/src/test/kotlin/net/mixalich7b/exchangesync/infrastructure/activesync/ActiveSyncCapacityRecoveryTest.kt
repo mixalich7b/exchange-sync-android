@@ -5,6 +5,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
 import net.mixalich7b.exchangesync.core.connection.ConnectionProfile
 import net.mixalich7b.exchangesync.core.connection.ConnectionProfileRepository
+import net.mixalich7b.exchangesync.core.calendar.ActiveSyncCalendarMutation
+import net.mixalich7b.exchangesync.core.calendar.ActiveSyncField
 import net.mixalich7b.exchangesync.core.sync.ActiveSyncVersion
 import net.mixalich7b.exchangesync.core.sync.ExecuteSynchronizationSlice
 import net.mixalich7b.exchangesync.core.sync.LocalPageOutcome
@@ -37,6 +39,38 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class ActiveSyncCapacityRecoveryTest {
+    @Test
+    fun `high element recurring item at window one reaches local application and commits its key`() =
+        runBlocking {
+            val response = HighElementCalendarSyncFixture.responseBytes()
+            val limits = WbxmlLimits()
+            val fixture = RecoveryFixture(initialWindow = 1) { _, _ -> response }
+
+            assertEquals(HighElementCalendarSyncFixture.NEW_MAX_ELEMENTS, limits.maxElements)
+            assertTrue(HighElementCalendarSyncFixture.elementCount() > 20_000)
+            assertTrue(HighElementCalendarSyncFixture.elementCount() <= limits.maxElements)
+            assertTrue(response.size <= limits.maxDocumentBytes)
+            assertTrue(HighElementCalendarSyncFixture.maximumDepth() <= limits.maxDepth)
+            assertTrue(HighElementCalendarSyncFixture.maximumInlineStringBytes() <= limits.maxInlineStringBytes)
+
+            assertEquals(SyncSliceOutcome.Completed, fixture.execute())
+            assertEquals(listOf(RequestedPage("collection-1", 1)), fixture.requestedPages)
+            assertEquals(HighElementCalendarSyncFixture.RETURNED_SYNC_KEY, fixture.state.current.checkpoints.collectionSyncKey)
+            assertEquals(1, fixture.state.current.checkpoints.windowSize)
+            val mutation = fixture.calendar.appliedPages.single().changes.single() as ActiveSyncCalendarMutation.Upsert
+            assertEquals(
+                HighElementCalendarSyncFixture.ATTENDEE_COUNT,
+                (mutation.item.attendees as ActiveSyncField.Value).value.size,
+            )
+            val exceptions = (mutation.item.exceptions as ActiveSyncField.Value).value
+            assertEquals(HighElementCalendarSyncFixture.TOTAL_EXCEPTION_COUNT, exceptions.size)
+            assertEquals(HighElementCalendarSyncFixture.CHANGED_EXCEPTION_COUNT, exceptions.count { !it.deleted })
+            assertEquals(HighElementCalendarSyncFixture.DELETED_EXCEPTION_COUNT, exceptions.count { it.deleted })
+            assertTrue(exceptions.all { exception ->
+                (exception.attendees as ActiveSyncField.Value).value.size == HighElementCalendarSyncFixture.ATTENDEE_COUNT
+            })
+        }
+
     @Test
     fun `real remote capacity retries the same checkpoint and smaller page resumes pagination`() =
         runBlocking {
@@ -79,12 +113,20 @@ class ActiveSyncCapacityRecoveryTest {
             assertTrue(fixture.calendar.appliedPages.isEmpty())
         }
 
-    private class RecoveryFixture(initialWindow: Int) {
+    private class RecoveryFixture(
+        initialWindow: Int,
+        private val responseFor: (syncKey: String, window: Int) -> ByteArray = { syncKey, window ->
+            when {
+                window > 25 || window == 1 -> elementCapacityResponse()
+                syncKey == "collection-1" -> calendarResponse("collection-2", moreAvailable = true)
+                else -> calendarResponse("collection-3", moreAvailable = false)
+            }
+        },
+    ) {
         val state = StateRepository(runningState(initialWindow))
         val calendar = RecordingCalendar()
         val requestedPages = mutableListOf<RequestedPage>()
         private val fence = SyncFence(3, 9)
-        private val capacityResponse = elementCapacityResponse()
         private val scheduler = RecordingScheduler()
         private val profile = profile()
         private val sessions =
@@ -109,12 +151,7 @@ class ActiveSyncCapacityRecoveryTest {
                                 val syncKey = checkNotNull(collection?.child(AirSync.SYNC_KEY)?.text)
                                 val window = checkNotNull(collection.child(AirSync.WINDOW_SIZE)?.text).toInt()
                                 requestedPages += RequestedPage(syncKey, window)
-                                val response =
-                                    when {
-                                        window > 25 || window == 1 -> capacityResponse
-                                        syncKey == "collection-1" -> calendarResponse("collection-2", moreAvailable = true)
-                                        else -> calendarResponse("collection-3", moreAvailable = false)
-                                    }
+                                val response = responseFor(syncKey, window)
                                 ActiveSyncCommandOutcome.Success(endpoint, response)
                             }
                         }
@@ -232,9 +269,7 @@ class ActiveSyncCapacityRecoveryTest {
         fun endpoint() = "https://exchange.example.test/Microsoft-Server-ActiveSync".toHttpUrl()
 
         fun elementCapacityResponse(): ByteArray =
-            WbxmlWriter(WbxmlLimits(maxElements = 20_001)).write(
-                WbxmlElement(AirSync.SYNC, children = List(20_000) { WbxmlElement(AirSync.MORE_AVAILABLE) }),
-            )
+            overDefaultElementCapacityResponse()
 
         fun emptyFolderResponse(syncKey: String): ByteArray =
             wbxml(
