@@ -159,6 +159,74 @@ class CalendarEventMapperTest {
     }
 
     @Test
+    fun `new exception with absent response inherits accepted series presentation`() {
+        val instance = Instant.parse("2026-08-16T09:00:00Z")
+        val series =
+            receivedMeeting("series-1", ActiveSyncResponseType.ACCEPTED).copy(
+                exceptions =
+                    ActiveSyncField.Value(
+                        listOf(ActiveSyncCalendarException(instanceStart = instance, deleted = false)),
+                    ),
+            )
+
+        val mapped =
+            (CalendarEventMapper.map(ActiveSyncCalendarMutation.Upsert(series, true), CALENDAR_COLOR)
+                as ProviderCalendarMutation.Upsert).event
+        val exception = (mapped.exceptions as ActiveSyncField.Value).value.single()
+
+        assertEquals(ActiveSyncField.Absent, exception.responseTypeOverride)
+        assertEquals(ActiveSyncField.Value(ActiveSyncResponseType.ACCEPTED), exception.responseType)
+        assertEquals(ActiveSyncField.Value(ProviderEventStatus.CONFIRMED), exception.status)
+        assertEquals(ActiveSyncField.Value(ProviderSelfStatus.ACCEPTED), exception.selfStatus)
+        assertEquals(ActiveSyncField.Empty, exception.eventColor)
+    }
+
+    @Test
+    fun `partial exception with absent response preserves its prior explicit override`() {
+        val instance = Instant.parse("2026-08-16T09:00:00Z")
+        val original =
+            receivedMeeting("series-1", ActiveSyncResponseType.ACCEPTED).copy(
+                exceptions =
+                    ActiveSyncField.Value(
+                        listOf(
+                            ActiveSyncCalendarException(
+                                instanceStart = instance,
+                                deleted = false,
+                                responseType = ActiveSyncField.Value(ActiveSyncResponseType.DECLINED),
+                            ),
+                        ),
+                    ),
+            )
+        val previous =
+            (CalendarEventMapper.map(ActiveSyncCalendarMutation.Upsert(original, true), CALENDAR_COLOR)
+                as ProviderCalendarMutation.Upsert).event
+        val partial =
+            ActiveSyncCalendarItem(
+                serverId = "series-1",
+                exceptions =
+                    ActiveSyncField.Value(
+                        listOf(ActiveSyncCalendarException(instanceStart = instance, deleted = false)),
+                    ),
+            )
+
+        val mapped =
+            (CalendarEventMapper.map(
+                ActiveSyncCalendarMutation.Upsert(partial, false),
+                CALENDAR_COLOR,
+                previous,
+            ) as ProviderCalendarMutation.Upsert).event
+        val exception = (mapped.exceptions as ActiveSyncField.Value).value.single()
+
+        assertEquals(
+            ActiveSyncField.Value(ActiveSyncResponseType.DECLINED),
+            exception.responseTypeOverride,
+        )
+        assertEquals(ActiveSyncField.Value(ActiveSyncResponseType.DECLINED), exception.responseType)
+        assertEquals(ActiveSyncField.Value(ProviderEventStatus.CANCELLED), exception.status)
+        assertEquals(ActiveSyncField.Value(ProviderSelfStatus.DECLINED), exception.selfStatus)
+    }
+
+    @Test
     fun `partial change rejects a merged end that no longer follows start`() {
         val previous =
             (CalendarEventMapper.map(
@@ -229,6 +297,16 @@ class CalendarEventMapperTest {
             start = ActiveSyncField.Value(Instant.parse("2026-08-09T09:00:00Z")),
             end = ActiveSyncField.Value(Instant.parse("2026-08-09T10:00:00Z")),
             allDay = ActiveSyncField.Value(false),
+        )
+
+    private fun receivedMeeting(
+        serverId: String,
+        response: ActiveSyncResponseType,
+    ): ActiveSyncCalendarItem =
+        baseItem(serverId).copy(
+            meetingStatus = ActiveSyncField.Value(ActiveSyncMeetingStatus(3, true, true, false)),
+            responseType = ActiveSyncField.Value(response),
+            availability = ActiveSyncField.Value(ActiveSyncAvailability.BUSY),
         )
 
     private fun case(

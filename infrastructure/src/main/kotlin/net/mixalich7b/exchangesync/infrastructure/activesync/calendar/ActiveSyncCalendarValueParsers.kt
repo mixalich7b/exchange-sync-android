@@ -118,14 +118,35 @@ internal object ActiveSyncCalendarValueParsers {
         name: String?,
         status: String?,
         type: String?,
+    ): ActiveSyncAttendee =
+        parseAttendee(email, name, status, type) { raw ->
+            enumByWireValue(raw, "attendee status", ActiveSyncAttendeeStatus.entries) { it.wireValue }
+        }
+
+    fun parseAttendeeWithOptionalStatus(
+        email: String?,
+        name: String?,
+        status: String?,
+        type: String?,
+    ): ActiveSyncAttendee =
+        parseAttendee(email, name, status, type) { raw ->
+            raw.toIntOrNull()?.let { parsed ->
+                ActiveSyncAttendeeStatus.entries.firstOrNull { attendeeStatus -> attendeeStatus.wireValue == parsed }
+            }
+        }
+
+    private fun parseAttendee(
+        email: String?,
+        name: String?,
+        status: String?,
+        type: String?,
+        statusParser: (String) -> ActiveSyncAttendeeStatus?,
     ): ActiveSyncAttendee {
         val parsedEmail = email?.takeIf(String::isNotBlank)
             ?: throw ActiveSyncCalendarValueException("Attendee email is missing")
         val parsedName = name?.takeIf(String::isNotBlank)
             ?: throw ActiveSyncCalendarValueException("Attendee name is missing")
-        val parsedStatus = status?.let { raw ->
-            enumByWireValue(raw, "attendee status", ActiveSyncAttendeeStatus.entries) { it.wireValue }
-        }
+        val parsedStatus = status?.let(statusParser)
         val parsedType = type?.let { raw ->
             enumByWireValue(raw, "attendee type", ActiveSyncAttendeeType.entries) { it.wireValue }
         }
@@ -264,20 +285,30 @@ internal object ActiveSyncRecurrenceParser {
 }
 
 internal object CurrentUserResponseResolver {
-    fun resolve(profileEmail: String, attendees: List<ActiveSyncAttendee>): ActiveSyncResponseType {
+    fun resolveRequired(profileEmail: String, attendees: List<ActiveSyncAttendee>): ActiveSyncResponseType {
         val matching = attendees.filter { attendee -> attendee.email.equals(profileEmail, ignoreCase = true) }
         if (matching.size != 1) {
             throw ActiveSyncCalendarValueException("Current-user attendee response is ambiguous")
         }
-        return when (matching.single().status) {
-            null -> throw ActiveSyncCalendarValueException("Current-user attendee response is missing")
+        return matching.single().status?.toResponseType()
+            ?: throw ActiveSyncCalendarValueException("Current-user attendee response is missing")
+    }
+
+    fun resolveOptional(profileEmail: String, attendees: List<ActiveSyncAttendee>): ActiveSyncResponseType? =
+        attendees
+            .filter { attendee -> attendee.email.equals(profileEmail, ignoreCase = true) }
+            .singleOrNull()
+            ?.status
+            ?.toResponseType()
+
+    private fun ActiveSyncAttendeeStatus.toResponseType(): ActiveSyncResponseType =
+        when (this) {
             ActiveSyncAttendeeStatus.NONE -> ActiveSyncResponseType.NONE
             ActiveSyncAttendeeStatus.TENTATIVE -> ActiveSyncResponseType.TENTATIVE
             ActiveSyncAttendeeStatus.ACCEPTED -> ActiveSyncResponseType.ACCEPTED
             ActiveSyncAttendeeStatus.DECLINED -> ActiveSyncResponseType.DECLINED
             ActiveSyncAttendeeStatus.NOT_RESPONDED -> ActiveSyncResponseType.NOT_RESPONDED
         }
-    }
 }
 
 internal object ActiveSyncTimeZoneParser {

@@ -5,6 +5,10 @@ import net.mixalich7b.exchangesync.core.calendar.ActiveSyncAttendeeStatus
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncCalendarMutation
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncField
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncResponseType
+import net.mixalich7b.exchangesync.core.calendar.CalendarEventMapper
+import net.mixalich7b.exchangesync.core.calendar.ProviderCalendarMutation
+import net.mixalich7b.exchangesync.core.calendar.ProviderEventStatus
+import net.mixalich7b.exchangesync.core.calendar.ProviderSelfStatus
 import net.mixalich7b.exchangesync.core.sync.ActiveSyncVersion
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.ActiveSyncWbxmlTokens.AirSync
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.ActiveSyncWbxmlTokens.AirSyncBase
@@ -145,6 +149,11 @@ class ActiveSyncCalendarApplicationParserTest {
                 text(Calendar.MEETING_STATUS, "3"),
                 text(Calendar.RESPONSE_TYPE, "3"),
                 element(
+                    Calendar.RECURRENCE,
+                    text(Calendar.TYPE, "0"),
+                    text(Calendar.INTERVAL, "1"),
+                ),
+                element(
                     Calendar.EXCEPTIONS,
                     element(
                         Calendar.EXCEPTION,
@@ -171,6 +180,201 @@ class ActiveSyncCalendarApplicationParserTest {
 
         val exception = (mutation.item.exceptions as ActiveSyncField.Value).value.single()
         assertEquals(ActiveSyncField.Value(ActiveSyncResponseType.TENTATIVE), exception.responseType)
+    }
+
+    @Test
+    fun `16_1 exception with omitted current-user status inherits accepted series presentation`() {
+        val data =
+            element(
+                AirSync.APPLICATION_DATA,
+                *ordinaryChildren(subject = "Accepted series").toTypedArray(),
+                text(Calendar.MEETING_STATUS, "3"),
+                text(Calendar.RESPONSE_TYPE, "3"),
+                element(
+                    Calendar.RECURRENCE,
+                    text(Calendar.TYPE, "0"),
+                    text(Calendar.INTERVAL, "1"),
+                ),
+                element(
+                    Calendar.EXCEPTIONS,
+                    element(
+                        Calendar.EXCEPTION,
+                        text(AirSyncBase.INSTANCE_ID, "20260810T090000Z"),
+                        element(
+                            Calendar.ATTENDEES,
+                            element(
+                                Calendar.ATTENDEE,
+                                text(Calendar.EMAIL, PROFILE_EMAIL),
+                                text(Calendar.NAME, "Current User"),
+                                text(Calendar.ATTENDEE_TYPE, "1"),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+
+        val mutation =
+            ActiveSyncCalendarApplicationParser.parse(
+                RawCalendarCommand(RawCalendarCommandKind.ADD, "series-missing-exception-status", data),
+                PROFILE_EMAIL,
+                ActiveSyncVersion.V16_1,
+            ) as ActiveSyncCalendarMutation.Upsert
+        val parsedException = (mutation.item.exceptions as ActiveSyncField.Value).value.single()
+        val mapped =
+            (CalendarEventMapper.map(mutation, CALENDAR_COLOR) as ProviderCalendarMutation.Upsert)
+                .event
+        val mappedException = (mapped.exceptions as ActiveSyncField.Value).value.single()
+
+        assertEquals(ActiveSyncField.Absent, parsedException.responseType)
+        assertEquals(ActiveSyncField.Absent, mappedException.responseTypeOverride)
+        assertEquals(ActiveSyncField.Value(ActiveSyncResponseType.ACCEPTED), mappedException.responseType)
+        assertEquals(ActiveSyncField.Value(ProviderEventStatus.CONFIRMED), mappedException.status)
+        assertEquals(ActiveSyncField.Value(ProviderSelfStatus.ACCEPTED), mappedException.selfStatus)
+        assertEquals(ActiveSyncField.Empty, mappedException.eventColor)
+    }
+
+    @Test
+    fun `explicit exception ResponseType remains authoritative over attendee status`() {
+        val data =
+            element(
+                AirSync.APPLICATION_DATA,
+                *ordinaryChildren(subject = "Accepted series").toTypedArray(),
+                text(Calendar.MEETING_STATUS, "3"),
+                text(Calendar.RESPONSE_TYPE, "3"),
+                element(
+                    Calendar.EXCEPTIONS,
+                    element(
+                        Calendar.EXCEPTION,
+                        text(Calendar.EXCEPTION_START_TIME, "20260810T090000Z"),
+                        text(Calendar.RESPONSE_TYPE, "4"),
+                        element(
+                            Calendar.ATTENDEES,
+                            element(
+                                Calendar.ATTENDEE,
+                                text(Calendar.EMAIL, PROFILE_EMAIL),
+                                text(Calendar.NAME, "Current User"),
+                                text(Calendar.ATTENDEE_STATUS, "2"),
+                                text(Calendar.ATTENDEE_TYPE, "1"),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+
+        val mutation =
+            ActiveSyncCalendarApplicationParser.parse(
+                RawCalendarCommand(RawCalendarCommandKind.ADD, "explicit-exception-response", data),
+                PROFILE_EMAIL,
+            ) as ActiveSyncCalendarMutation.Upsert
+
+        val exception = (mutation.item.exceptions as ActiveSyncField.Value).value.single()
+        assertEquals(ActiveSyncField.Value(ActiveSyncResponseType.DECLINED), exception.responseType)
+    }
+
+    @Test
+    fun `exception without ResponseType keeps no override for missing or ambiguous current-user status`() {
+        val attendeeFixtures =
+            listOf(
+                listOf(
+                    element(
+                        Calendar.ATTENDEE,
+                        text(Calendar.EMAIL, PROFILE_EMAIL),
+                        text(Calendar.NAME, "Current User"),
+                    ),
+                ),
+                listOf(
+                    element(
+                        Calendar.ATTENDEE,
+                        text(Calendar.EMAIL, PROFILE_EMAIL),
+                        text(Calendar.NAME, "Current User"),
+                        text(Calendar.ATTENDEE_STATUS, "3"),
+                    ),
+                    element(
+                        Calendar.ATTENDEE,
+                        text(Calendar.EMAIL, "CALENDAR@example.test"),
+                        text(Calendar.NAME, "Duplicate Current User"),
+                        text(Calendar.ATTENDEE_STATUS, "4"),
+                    ),
+                ),
+            )
+
+        attendeeFixtures.forEachIndexed { index, attendees ->
+            val data =
+                element(
+                    AirSync.APPLICATION_DATA,
+                    *ordinaryChildren(subject = "Accepted series").toTypedArray(),
+                    text(Calendar.MEETING_STATUS, "3"),
+                    text(Calendar.RESPONSE_TYPE, "3"),
+                    element(
+                        Calendar.EXCEPTIONS,
+                        element(
+                            Calendar.EXCEPTION,
+                            text(Calendar.EXCEPTION_START_TIME, "20260810T090000Z"),
+                            element(Calendar.ATTENDEES, *attendees.toTypedArray()),
+                        ),
+                    ),
+                )
+
+            val mutation =
+                ActiveSyncCalendarApplicationParser.parse(
+                    RawCalendarCommand(RawCalendarCommandKind.ADD, "optional-exception-response-$index", data),
+                    PROFILE_EMAIL,
+                ) as ActiveSyncCalendarMutation.Upsert
+
+            val exception = (mutation.item.exceptions as ActiveSyncField.Value).value.single()
+            assertEquals(ActiveSyncField.Absent, exception.responseType, "fixture $index")
+        }
+    }
+
+    @Test
+    fun `exception current-user attendee with unsupported status keeps no response override`() {
+        val data =
+            element(
+                AirSync.APPLICATION_DATA,
+                *ordinaryChildren(subject = "Accepted series").toTypedArray(),
+                text(Calendar.MEETING_STATUS, "3"),
+                text(Calendar.RESPONSE_TYPE, "3"),
+                element(
+                    Calendar.EXCEPTIONS,
+                    element(
+                        Calendar.EXCEPTION,
+                        text(Calendar.EXCEPTION_START_TIME, "20260810T090000Z"),
+                        element(
+                            Calendar.ATTENDEES,
+                            element(
+                                Calendar.ATTENDEE,
+                                text(Calendar.EMAIL, PROFILE_EMAIL),
+                                text(Calendar.NAME, "Current User"),
+                                text(Calendar.ATTENDEE_STATUS, "99"),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+
+        val mutation =
+            ActiveSyncCalendarApplicationParser.parse(
+                RawCalendarCommand(RawCalendarCommandKind.ADD, "unsupported-exception-response", data),
+                PROFILE_EMAIL,
+            ) as ActiveSyncCalendarMutation.Upsert
+
+        val exception = (mutation.item.exceptions as ActiveSyncField.Value).value.single()
+        assertNull((exception.attendees as ActiveSyncField.Value).value.single().status)
+        assertEquals(ActiveSyncField.Absent, exception.responseType)
+    }
+
+    @Test
+    fun `received series keeps unsupported current-user attendee status strict`() {
+        assertThrows(ActiveSyncProtocolDataException::class.java) {
+            ActiveSyncCalendarApplicationParser.parse(
+                RawCalendarCommand(
+                    RawCalendarCommandKind.ADD,
+                    "unsupported-series-response",
+                    meetingData(meetingStatus = "3", responseType = null, attendeeStatus = "99"),
+                ),
+                PROFILE_EMAIL,
+            )
+        }
     }
 
     @Test
@@ -569,5 +773,6 @@ class ActiveSyncCalendarApplicationParserTest {
 
     private companion object {
         const val PROFILE_EMAIL = "calendar@example.test"
+        const val CALENDAR_COLOR = -13_408_615
     }
 }

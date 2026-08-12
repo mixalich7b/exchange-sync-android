@@ -655,6 +655,33 @@ class ActiveSyncRemoteCalendarTest {
         }
 
     @Test
+    fun `classifiable series with statusless exception returns the page checkpoints`() =
+        runBlocking {
+            val remote = recurringMeetingRemote(seriesResponseType = "3")
+
+            val outcome =
+                remote.fetchPage(request(fullSync = false, checkpoints = persistedCheckpoints()))
+                    as RemotePageOutcome.Page
+
+            assertEquals("new-folder-key", outcome.page.nextCheckpoints.folderSyncKey)
+            assertEquals("advanced-calendar-key", outcome.page.nextCheckpoints.collectionSyncKey)
+            val mutation = outcome.page.changes.single() as ActiveSyncCalendarMutation.Upsert
+            val exception = (mutation.item.exceptions as ActiveSyncField.Value).value.single()
+            assertEquals(ActiveSyncField.Absent, exception.responseType)
+        }
+
+    @Test
+    fun `unclassifiable received series fails critically without a next checkpoint`() =
+        runBlocking {
+            val remote = recurringMeetingRemote(seriesResponseType = null)
+
+            assertEquals(
+                RemotePageOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.PROTOCOL_DATA),
+                remote.fetchPage(request(fullSync = false, checkpoints = persistedCheckpoints())),
+            )
+        }
+
+    @Test
     fun `page-scaled WBXML capacity maps Calendar Sync to window too large`() =
         runBlocking {
             val events = mutableListOf<DeviceDiagnosticEvent>()
@@ -1347,6 +1374,87 @@ class ActiveSyncRemoteCalendarTest {
                 ),
             ),
         )
+
+    private fun recurringMeetingRemote(seriesResponseType: String?): ActiveSyncRemoteCalendar =
+        ActiveSyncRemoteCalendar(
+            capabilities = ActiveSyncCapabilityGateway { error("Saved capability must be reused") },
+            commands =
+                ActiveSyncCommandGateway { _, endpoint, command, _, _, _ ->
+                    ActiveSyncCommandOutcome.Success(
+                        endpoint,
+                        if (command == ActiveSyncCommand.FOLDER_SYNC) {
+                            emptyFolderResponse("new-folder-key")
+                        } else {
+                            recurringMeetingResponse(
+                                collectionId = "known-primary",
+                                syncKey = "advanced-calendar-key",
+                                seriesResponseType = seriesResponseType,
+                            )
+                        },
+                    )
+                },
+            sessions = liveSessions(ActiveSyncVersion.V16_1),
+        )
+
+    private fun recurringMeetingResponse(
+        collectionId: String,
+        syncKey: String,
+        seriesResponseType: String?,
+    ): ByteArray {
+        val applicationDataChildren =
+            mutableListOf(
+                text(Calendar.SUBJECT, "Recurring meeting"),
+                text(Calendar.START_TIME, "20260809T090000Z"),
+                text(Calendar.END_TIME, "20260809T100000Z"),
+                text(Calendar.ALL_DAY_EVENT, "0"),
+                text(Calendar.MEETING_STATUS, "3"),
+                element(
+                    Calendar.RECURRENCE,
+                    text(Calendar.TYPE, "0"),
+                    text(Calendar.INTERVAL, "1"),
+                ),
+            )
+        seriesResponseType?.let { response -> applicationDataChildren += text(Calendar.RESPONSE_TYPE, response) }
+        applicationDataChildren +=
+            element(
+                Calendar.EXCEPTIONS,
+                element(
+                    Calendar.EXCEPTION,
+                    text(AirSyncBase.INSTANCE_ID, "20260810T090000Z"),
+                    element(
+                        Calendar.ATTENDEES,
+                        element(
+                            Calendar.ATTENDEE,
+                            text(Calendar.EMAIL, "calendar@example.test"),
+                            text(Calendar.NAME, "Current User"),
+                            text(Calendar.ATTENDEE_TYPE, "1"),
+                        ),
+                    ),
+                ),
+            )
+        return wbxml(
+            element(
+                AirSync.SYNC,
+                element(
+                    AirSync.COLLECTIONS,
+                    element(
+                        AirSync.COLLECTION,
+                        text(AirSync.SYNC_KEY, syncKey),
+                        text(AirSync.COLLECTION_ID, collectionId),
+                        text(AirSync.STATUS, "1"),
+                        element(
+                            AirSync.COMMANDS,
+                            element(
+                                AirSync.ADD,
+                                text(AirSync.SERVER_ID, "series-statusless-exception"),
+                                WbxmlElement(AirSync.APPLICATION_DATA, children = applicationDataChildren),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+    }
 
     private fun calendarStatusResponse(collectionId: String, status: String): ByteArray =
         wbxml(

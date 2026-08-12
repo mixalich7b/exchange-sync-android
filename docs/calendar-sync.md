@@ -136,6 +136,16 @@ cancelled состояния отображаются как cancelled. Эти �
 к attendee-only partial changes с ghosted meeting fields и к recurrence
 exceptions с наследованием отсутствующих series fields.
 
+У recurrence exception собственный `ResponseType` является authoritative
+override. Если он отсутствует, override выводится только из ровно одного
+attendee с email текущего профиля и поддерживаемым `AttendeeStatus`.
+Отсутствующий status, отсутствие совпадения или несколько совпадений оставляют
+exception response как `Absent`: новое occurrence наследует presentation
+series, а partial change сохраняет ранее синхронизированный explicit override.
+Эта optional inference действует только для exception. Полученная series без
+собственного `ResponseType` и без однозначного current-user attendee response
+по-прежнему отклоняет всю страницу как `PROTOCOL_DATA`, не продвигая checkpoint.
+
 ## Изоляция Calendar Provider
 
 Ownership определяется постоянными account name/type и внутренним именем, а не

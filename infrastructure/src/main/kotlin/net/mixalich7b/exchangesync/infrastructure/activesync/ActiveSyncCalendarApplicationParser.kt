@@ -139,7 +139,12 @@ internal object ActiveSyncCalendarApplicationParser {
                         return this
                     }
                 }
-                copy(responseType = ActiveSyncField.Value(CurrentUserResponseResolver.resolve(profileEmail, attendeeValues)))
+                copy(
+                    responseType =
+                        ActiveSyncField.Value(
+                            CurrentUserResponseResolver.resolveRequired(profileEmail, attendeeValues),
+                        ),
+                )
             }
         }
     }
@@ -148,7 +153,12 @@ internal object ActiveSyncCalendarApplicationParser {
         if (responseType != ActiveSyncField.Absent) return this
         val attendeeValues = (attendees as? ActiveSyncField.Value)?.value ?: return this
         if (attendeeValues.none { attendee -> attendee.email.equals(profileEmail, ignoreCase = true) }) return this
-        return copy(responseType = ActiveSyncField.Value(CurrentUserResponseResolver.resolve(profileEmail, attendeeValues)))
+        return copy(
+            responseType =
+                ActiveSyncField.Value(
+                    CurrentUserResponseResolver.resolveRequired(profileEmail, attendeeValues),
+                ),
+        )
     }
 }
 
@@ -173,18 +183,23 @@ private fun WbxmlElement.bodyField(): ActiveSyncField<String> {
     return textField(Calendar.BODY)
 }
 
-private fun WbxmlElement.attendeesField(): ActiveSyncField<List<ActiveSyncAttendee>> {
+private fun WbxmlElement.attendeesField(
+    optionalStatus: Boolean = false,
+): ActiveSyncField<List<ActiveSyncAttendee>> {
     val container = child(Calendar.ATTENDEES) ?: return ActiveSyncField.Absent
     val elements = container.children(Calendar.ATTENDEE)
     if (elements.isEmpty()) return ActiveSyncField.Empty
     return ActiveSyncField.Value(
         elements.map { attendee ->
-            ActiveSyncCalendarValueParsers.parseAttendee(
-                email = attendee.child(Calendar.EMAIL)?.text,
-                name = attendee.child(Calendar.NAME)?.text,
-                status = attendee.child(Calendar.ATTENDEE_STATUS)?.text,
-                type = attendee.child(Calendar.ATTENDEE_TYPE)?.text,
-            )
+            val email = attendee.child(Calendar.EMAIL)?.text
+            val name = attendee.child(Calendar.NAME)?.text
+            val status = attendee.child(Calendar.ATTENDEE_STATUS)?.text
+            val type = attendee.child(Calendar.ATTENDEE_TYPE)?.text
+            if (optionalStatus) {
+                ActiveSyncCalendarValueParsers.parseAttendeeWithOptionalStatus(email, name, status, type)
+            } else {
+                ActiveSyncCalendarValueParsers.parseAttendee(email, name, status, type)
+            }
         },
     )
 }
@@ -271,7 +286,7 @@ private fun WbxmlElement.parseCalendarException(
         end = valueField(Calendar.END_TIME, ActiveSyncCalendarValueParsers::parseDateTime),
         allDay = valueField(Calendar.ALL_DAY_EVENT, ::parseProtocolBoolean),
         reminderMinutes = valueField(Calendar.REMINDER, ActiveSyncCalendarValueParsers::parseReminder),
-        attendees = attendeesField(),
+        attendees = attendeesField(optionalStatus = true),
         meetingStatus = valueField(Calendar.MEETING_STATUS, ActiveSyncCalendarValueParsers::parseMeetingStatus),
         responseType = valueField(Calendar.RESPONSE_TYPE, ActiveSyncCalendarValueParsers::parseResponseType),
         responseRequested = valueField(Calendar.RESPONSE_REQUESTED, ActiveSyncCalendarValueParsers::parseResponseRequested),
@@ -284,8 +299,8 @@ private fun ActiveSyncCalendarException.withAttendeeOnlyResponse(
 ): ActiveSyncCalendarException {
     if (responseType != ActiveSyncField.Absent) return this
     val attendeeValues = (attendees as? ActiveSyncField.Value)?.value ?: return this
-    if (attendeeValues.none { attendee -> attendee.email.equals(profileEmail, ignoreCase = true) }) return this
-    return copy(responseType = ActiveSyncField.Value(CurrentUserResponseResolver.resolve(profileEmail, attendeeValues)))
+    val inferred = CurrentUserResponseResolver.resolveOptional(profileEmail, attendeeValues) ?: return this
+    return copy(responseType = ActiveSyncField.Value(inferred))
 }
 
 private fun parseProtocolBoolean(value: String): Boolean =

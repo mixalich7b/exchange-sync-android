@@ -229,14 +229,27 @@ class ActiveSyncCalendarValueParsersTest {
         assertEquals(ActiveSyncAttendeeType.OPTIONAL, attendees.last().type)
         assertEquals(
             ActiveSyncResponseType.TENTATIVE,
-            CurrentUserResponseResolver.resolve("calendar@example.test", attendees),
+            CurrentUserResponseResolver.resolveRequired("calendar@example.test", attendees),
         )
 
         assertThrows(ActiveSyncCalendarValueException::class.java) {
-            CurrentUserResponseResolver.resolve("missing@example.test", attendees)
+            CurrentUserResponseResolver.resolveRequired("missing@example.test", attendees)
         }
         assertThrows(ActiveSyncCalendarValueException::class.java) {
-            CurrentUserResponseResolver.resolve(
+            CurrentUserResponseResolver.resolveRequired(
+                "calendar@example.test",
+                listOf(
+                    ActiveSyncAttendee(
+                        email = "calendar@example.test",
+                        name = "Current User",
+                        status = null,
+                        type = ActiveSyncAttendeeType.REQUIRED,
+                    ),
+                ),
+            )
+        }
+        assertThrows(ActiveSyncCalendarValueException::class.java) {
+            CurrentUserResponseResolver.resolveRequired(
                 "calendar@example.test",
                 attendees +
                     ActiveSyncAttendee(
