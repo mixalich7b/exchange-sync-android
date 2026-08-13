@@ -1,3 +1,16 @@
+## ADDED Requirements
+
+### Requirement: Calendar Provider required-field encoding
+The application SHALL encode explicit ActiveSync property clears according to the target Calendar Provider column rather than converting every `ActiveSyncField.Empty` to SQL `NULL`. For a required non-null provider column with a defined Android default or none value that preserves the clear or non-inheritance semantics, the application SHALL write that non-null value. It SHALL continue to use SQL `NULL` to clear nullable provider columns. If a required provider value cannot be represented without changing the server meaning, the application SHALL reject the page before calling Calendar Provider, SHALL preserve the committed synchronization key, and SHALL report the applicable protocol-data problem.
+
+#### Scenario: Recurrence exception clears a required provider-backed property
+- **WHEN** a valid recurring item contains an exception with an empty supported property that means the exception does not inherit the series value and the corresponding Calendar Provider column is required but has a representable Android default
+- **THEN** the application writes the field-specific non-null default, preserves the other exception and series data, applies the page, and makes the returned synchronization key eligible for commit
+
+#### Scenario: Required provider value has no faithful representation
+- **WHEN** a required Calendar Provider value cannot be derived from a valid mapped event or exception without changing its server meaning
+- **THEN** the application detects the unrepresentable value before provider application, writes no sub-batch for that page, preserves the committed synchronization key, and reports a protocol-data problem rather than allowing a provider constraint failure
+
 ## MODIFIED Requirements
 
 ### Requirement: Adaptive calendar page sizing

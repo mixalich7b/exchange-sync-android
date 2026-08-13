@@ -6,6 +6,8 @@ ActiveSync response bodies and decoded WBXML documents are both bounded at 2 MiB
 
 The complete attendee list is currently required by calendar parsing and meeting-response classification. Calendar Provider planning already omits all non-organizer attendee rows when an event or effective exception list contains more than 100 entries, but that policy runs only after WBXML decoding and domain mapping succeed.
 
+The first device retry with the enlarged decoder limit decoded the response and planned 323 Calendar Provider operations. Five 50-operation sub-batches were confirmed before the sixth failed with `SQLiteConstraintException`, so the collection key remained uncommitted. Static tracing found that the provider planner's generic field writer maps every `ActiveSyncField.Empty` to SQL `NULL`, including exception fields that target required non-null provider columns. ActiveSync uses an empty exception child to remove that property from the exception rather than inherit the series value, so this shape requires a field-specific provider representation rather than a blanket nullable encoding.
+
 The Exchange response is untrusted protocol input and can contain private event and attendee data. Existing byte, depth, string, protocol-validation, and privacy-safe diagnostic boundaries therefore remain part of the design even though the target Android 16 device has ample memory and a short CPU/allocation spike is acceptable.
 
 ## Goals / Non-Goals
@@ -15,13 +17,15 @@ The Exchange response is untrusted protocol input and can contain private event 
 - Admit a complete Calendar `Sync` response containing up to 256,000 WBXML elements while keeping decoding deterministic and finite on every device.
 - Preserve the current full-tree parser, complete attendee validation, current-user response resolution, exception inheritance, and downstream attendee suppression.
 - Preserve adaptive recovery above window one and the existing terminal behavior when a single item exceeds the new budget.
-- Cover both the newly accepted high-element shape and the retained over-capacity path with local unit tests.
+- Preserve valid explicit exception clears without submitting SQL `NULL` for required Calendar Provider values.
+- Cover the newly accepted high-element shape, required-field clear encoding, and the retained over-capacity path with local unit tests.
 
 **Non-Goals:**
 
 - Making capacity depend on runtime RAM, Android heap class, server identity, or synchronization trigger.
 - Adding a streaming parser, a selective attendee representation, payload persistence, raw-WBXML diagnostics, or a fallback that skips the item.
 - Expanding any limit other than WBXML element count or changing Calendar Provider materialization policy.
+- Changing self-attendee child-row lifecycle, adding device-vendor-specific organizer handling, or changing diagnostic payload policy.
 
 ## Decisions
 
@@ -57,11 +61,26 @@ Existing capacity fixtures that relied on 20,001 elements will be moved above th
 
 No production diagnostic field changes are required. A successful item already emits response size, decoded command counts, provider planning/suppression summaries, and checkpoint commit; a true element-capacity failure already emits `wbxml_element_count` with window reduction or minimum-window block.
 
+### Encode explicit clears according to provider column semantics
+
+The provider planner will stop using one blanket `ActiveSyncField.Empty -> null` rule for every output field. Nullable text and optional provider columns will retain SQL `NULL` as their clear representation. Required scalar columns will use an explicit field policy: a defined Android default or none value will represent a valid ActiveSync clear when it does not inherit the series value, while a required field without a faithful representation will fail planning before any provider sub-batch is called.
+
+The first regression will exercise a recurrence exception because ActiveSync explicitly uses empty exception children to cancel inheritance and the observed failure occurred while applying a high-fanout exception plan. Focused planning and Android request-translation tests will assert both the resulting non-null provider value and the absence of null values for every required column carried by that request. The existing all-or-nothing planning boundary will classify an unrepresentable required field as protocol data before local mutation.
+
+This decision changes only scalar value encoding. It does not redesign self-attendee row synchronization, infer OEM-specific uniqueness constraints, change organizer materialization, or expose new exception text in diagnostics.
+
+Alternatives considered:
+
+- Keeping the generic null writer and relying on Calendar Provider defaults was rejected because an explicit SQL `NULL` is still submitted and violates required-column constraints before a default can apply.
+- Replacing every empty field with one universal zero was rejected because zero has field-specific meaning and is not a valid clear representation for all nullable or required columns.
+- Treating every empty exception property as malformed was rejected because empty exception children are a valid ActiveSync mechanism for removing inherited properties.
+
 ## Risks / Trade-offs
 
 - **Higher transient heap use and allocation churn for element-dense responses** → Keep the 2 MiB document, 256,000-element, depth, and inline-string limits; verify the generated regression and, when the server item is available, manually confirm synchronization on the target Android 16 device.
 - **More CPU can be spent before malformed high-element structure is rejected** → Preserve the finite element ceiling and all existing structural validation; do not retry a structurally malformed response as a capacity recovery.
 - **The larger generated default-capacity fixture can slow unit tests** → Use compact generated values, keep exact low-limit boundary tests small, and reserve the production-sized fixture for the remote capacity paths that depend on the default.
+- **A field default can accidentally change server meaning** → Keep an explicit allow-list of required provider columns and their documented default/none values, preserve `NULL` for nullable columns, and reject any required value without a faithful mapping before provider application.
 - **A future valid item can still exceed 256,000 elements** → Preserve checkpoint safety and the current user-actionable capacity problem; reconsider streaming or semantic compaction only with new evidence rather than silently raising all protocol bounds.
 
 ## Migration Plan

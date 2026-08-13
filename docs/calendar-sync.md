@@ -132,6 +132,18 @@ status или identity recurrence exception. В частности, high-fanout 
 уникальные changed/deleted exception rows и опускает non-organizer attendee
 rows для series и oversized non-deleted exceptions.
 
+Explicit empty ActiveSync property кодируется с учётом nullability целевой
+колонки, а не общим правилом `Empty -> NULL`. Nullable descriptive и optional
+поля по-прежнему очищаются SQL `NULL`. Для обязательных scalar-полей
+Calendar Provider используются их representable Android default/none values:
+`ALL_DAY=0`, `AVAILABILITY=BUSY`, `SELF_ATTENDEE_STATUS=NONE` и
+`ACCESS_LEVEL=DEFAULT`. Это позволяет recurrence exception отменить
+наследование соответствующего series property, не нарушая provider `NOT NULL`
+constraint. Полный page plan дополнительно отклоняет `NULL` в известной
+обязательной колонке до первого provider sub-batch; если faithful значение
+получить нельзя, страница завершается как `PROTOCOL_DATA` без продвижения
+checkpoint и без частичной локальной записи.
+
 Для приглашений authoritative `ResponseType` имеет приоритет; при его
 отсутствии допустим однозначный status attendee, соответствующего email
 профиля. Непринятое или tentative приглашение записывается с tentative

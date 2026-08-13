@@ -112,6 +112,7 @@ internal object ProviderInteger {
     const val OPTIONAL_ATTENDEE = 2
     const val RESOURCE_ATTENDEE = 3
     const val ALERT_REMINDER = 1
+    const val DEFAULT_ACCESS = 0
     const val CONFIDENTIAL_ACCESS = 1
     const val PRIVATE_ACCESS = 2
     const val PUBLIC_ACCESS = 3
@@ -206,6 +207,9 @@ internal class CalendarProviderBatchPlan private constructor(
         ): CalendarProviderBatchPlan {
             if (calendarId < 0 || operations.any { it.calendarId != calendarId }) {
                 throw CalendarPlanningException("Calendar Provider batch escaped the owned calendar")
+            }
+            if (operations.any(CalendarProviderBatchOperation::hasNullRequiredProviderValue)) {
+                throw CalendarPlanningException("Calendar Provider required field cannot be null")
             }
             return CalendarProviderBatchPlan(calendarId, operations, attendeeSuppressions)
         }
@@ -443,7 +447,7 @@ internal object CalendarProviderBatchPlanner {
         values.putField(CalendarProviderField.LOCATION, location)
         values.putField(CalendarProviderField.START, start, Instant::toEpochMilli)
         values.putField(CalendarProviderField.END, end, Instant::toEpochMilli)
-        values.putField(CalendarProviderField.ALL_DAY, allDay, Boolean::asInt)
+        values.putRequiredField(CalendarProviderField.ALL_DAY, allDay, 0, Boolean::asInt)
         val providerTimeZone = resolveTimeZone(timeZone, recurrenceRule, allDay, timeZoneResolver)
         if (providerTimeZone.present) {
             values[CalendarProviderField.EVENT_TIME_ZONE] = providerTimeZone.value
@@ -461,10 +465,25 @@ internal object CalendarProviderBatchPlanner {
         }
         values.putField(CalendarProviderField.ORGANIZER_EMAIL, organizerEmail)
         values.putField(CalendarProviderField.STATUS, status, ProviderEventStatus::toProviderInteger)
-        values.putField(CalendarProviderField.AVAILABILITY, availability, ProviderAvailability::toProviderInteger)
-        values.putField(CalendarProviderField.SELF_ATTENDEE_STATUS, selfStatus, ProviderSelfStatus::toProviderInteger)
+        values.putRequiredField(
+            CalendarProviderField.AVAILABILITY,
+            availability,
+            ProviderInteger.BUSY,
+            ProviderAvailability::toProviderInteger,
+        )
+        values.putRequiredField(
+            CalendarProviderField.SELF_ATTENDEE_STATUS,
+            selfStatus,
+            ProviderInteger.NONE_ATTENDEE,
+            ProviderSelfStatus::toProviderInteger,
+        )
         values.putField(CalendarProviderField.EVENT_COLOR, eventColor)
-        values.putField(CalendarProviderField.ACCESS_LEVEL, accessLevel, ProviderAccessLevel::toProviderInteger)
+        values.putRequiredField(
+            CalendarProviderField.ACCESS_LEVEL,
+            accessLevel,
+            ProviderInteger.DEFAULT_ACCESS,
+            ProviderAccessLevel::toProviderInteger,
+        )
         values.putField(CalendarProviderField.RESPONSE_TYPE, responseType) { it.wireValue }
         values.putField(CalendarProviderField.MEETING_STATUS, meetingStatus) { it.rawValue }
         values.putField(CalendarProviderField.RESPONSE_REQUESTED, responseRequested, Boolean::asInt)
@@ -502,7 +521,7 @@ internal object CalendarProviderBatchPlanner {
         val effectiveAllDay =
             when (val field = allDay) {
                 ActiveSyncField.Absent -> originalAllDay
-                ActiveSyncField.Empty -> throw CalendarPlanningException("Calendar exception all-day value is empty")
+                ActiveSyncField.Empty -> false
                 is ActiveSyncField.Value -> field.value
             }
         values[CalendarProviderField.ORIGINAL_ALL_DAY] = originalAllDay.asInt()
@@ -529,16 +548,18 @@ internal object CalendarProviderBatchPlanner {
             if (deleted) ProviderInteger.CANCELLED_EVENT else status.valueOrNull()?.toProviderInteger()
                 ?: series.status.valueOrNull()?.toProviderInteger()
                 ?: ProviderInteger.CONFIRMED_EVENT
-        values.putInheritedField(
+        values.putInheritedRequiredField(
             CalendarProviderField.AVAILABILITY,
             availability,
             series.availability,
+            ProviderInteger.BUSY,
             ProviderAvailability::toProviderInteger,
         )
-        values.putInheritedField(
+        values.putInheritedRequiredField(
             CalendarProviderField.SELF_ATTENDEE_STATUS,
             selfStatus,
             series.selfStatus,
+            ProviderInteger.NONE_ATTENDEE,
             ProviderSelfStatus::toProviderInteger,
         )
         values.putInheritedField(CalendarProviderField.EVENT_COLOR, eventColor, series.eventColor)
@@ -556,10 +577,11 @@ internal object CalendarProviderBatchPlanner {
             serverAvailability,
             series.serverAvailability,
         ) { it.wireValue }
-        values.putInheritedField(
+        values.putInheritedRequiredField(
             CalendarProviderField.ACCESS_LEVEL,
             accessLevel,
             series.accessLevel,
+            ProviderInteger.DEFAULT_ACCESS,
             ProviderAccessLevel::toProviderInteger,
         )
         values[CalendarProviderField.HAS_ATTENDEE_DATA] =
@@ -589,16 +611,18 @@ internal object CalendarProviderBatchPlanner {
                         ?: series.status.valueOrNull()?.toProviderInteger()
                         ?: ProviderInteger.CONFIRMED_EVENT
                 }
-            putInheritedField(
+            putInheritedRequiredField(
                 CalendarProviderField.AVAILABILITY,
                 availability,
                 series.availability,
+                ProviderInteger.BUSY,
                 ProviderAvailability::toProviderInteger,
             )
-            putInheritedField(
+            putInheritedRequiredField(
                 CalendarProviderField.SELF_ATTENDEE_STATUS,
                 selfStatus,
                 series.selfStatus,
+                ProviderInteger.NONE_ATTENDEE,
                 ProviderSelfStatus::toProviderInteger,
             )
             putInheritedField(CalendarProviderField.EVENT_COLOR, eventColor, series.eventColor)
@@ -720,6 +744,21 @@ private fun <T> MutableMap<String, Any?>.putField(
     }
 }
 
+private fun <T> MutableMap<String, Any?>.putRequiredField(
+    key: String,
+    field: ActiveSyncField<T>,
+    emptyValue: Any,
+    transform: (T) -> Any? = { it },
+) {
+    when (field) {
+        ActiveSyncField.Absent -> Unit
+        ActiveSyncField.Empty -> this[key] = emptyValue
+        is ActiveSyncField.Value ->
+            this[key] = transform(field.value)
+                ?: throw CalendarPlanningException("Calendar Provider required field cannot be null")
+    }
+}
+
 private fun <T> MutableMap<String, Any?>.putInheritedField(
     key: String,
     exception: ActiveSyncField<T>,
@@ -728,5 +767,54 @@ private fun <T> MutableMap<String, Any?>.putInheritedField(
 ) {
     putField(key, if (exception == ActiveSyncField.Absent) series else exception, transform)
 }
+
+private fun <T> MutableMap<String, Any?>.putInheritedRequiredField(
+    key: String,
+    exception: ActiveSyncField<T>,
+    series: ActiveSyncField<T>,
+    emptyValue: Any,
+    transform: (T) -> Any? = { it },
+) {
+    putRequiredField(
+        key = key,
+        field = if (exception == ActiveSyncField.Absent) series else exception,
+        emptyValue = emptyValue,
+        transform = transform,
+    )
+}
+
+private fun CalendarProviderBatchOperation.hasNullRequiredProviderValue(): Boolean {
+    val requiredValues =
+        when (this) {
+            is CalendarProviderBatchOperation.EventInsert -> values.requiredEventValues()
+            is CalendarProviderBatchOperation.EventUpdate -> values.requiredEventValues()
+            is CalendarProviderBatchOperation.ExceptionInsert -> values.requiredEventValues()
+            is CalendarProviderBatchOperation.ExceptionResponseUpdate -> values.requiredEventValues()
+            is CalendarProviderBatchOperation.ReminderInsert -> values.filterKeys { key ->
+                key == CalendarProviderField.REMINDER_METHOD
+            }
+            is CalendarProviderBatchOperation.EventDelete,
+            is CalendarProviderBatchOperation.AttendeesDelete,
+            is CalendarProviderBatchOperation.OrganizerDelete,
+            is CalendarProviderBatchOperation.AttendeeInsert,
+            is CalendarProviderBatchOperation.RemindersDelete,
+            is CalendarProviderBatchOperation.ExceptionsDelete,
+            -> emptyMap()
+        }
+    return requiredValues.values.any { value -> value == null }
+}
+
+private fun Map<String, Any?>.requiredEventValues(): Map<String, Any?> =
+    filterKeys { key -> key in REQUIRED_EVENT_PROVIDER_FIELDS }
+
+private val REQUIRED_EVENT_PROVIDER_FIELDS =
+    setOf(
+        CalendarProviderField.ALL_DAY,
+        CalendarProviderField.ACCESS_LEVEL,
+        CalendarProviderField.AVAILABILITY,
+        CalendarProviderField.SELF_ATTENDEE_STATUS,
+        CalendarProviderField.HAS_ALARM,
+        CalendarProviderField.HAS_ATTENDEE_DATA,
+    )
 
 private fun <T> ActiveSyncField<T>.valueOrNull(): T? = (this as? ActiveSyncField.Value)?.value

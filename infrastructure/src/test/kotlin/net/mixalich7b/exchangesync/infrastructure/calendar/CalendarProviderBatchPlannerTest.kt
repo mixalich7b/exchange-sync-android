@@ -24,6 +24,84 @@ import org.junit.jupiter.api.Test
 
 class CalendarProviderBatchPlannerTest {
     @Test
+    fun `exception explicit clears use required provider defaults and nullable nulls`() {
+        val exceptionStart = Instant.parse("2026-08-16T09:00:00Z")
+        val item =
+            baseItem().copy(
+                subject = ActiveSyncField.Value("Series title"),
+                availability = ActiveSyncField.Value(ActiveSyncAvailability.OUT_OF_OFFICE),
+                sensitivity = ActiveSyncField.Value(ActiveSyncSensitivity.CONFIDENTIAL),
+                recurrence = ActiveSyncField.Value(dailyRecurrence()),
+                exceptions =
+                    ActiveSyncField.Value(
+                        listOf(
+                            ActiveSyncCalendarException(
+                                instanceStart = exceptionStart,
+                                deleted = false,
+                                subject = ActiveSyncField.Empty,
+                                availability = ActiveSyncField.Empty,
+                                sensitivity = ActiveSyncField.Empty,
+                            ),
+                        ),
+                    ),
+            )
+        val batch =
+            CalendarProviderBatchPlanner.plan(
+                plan(ActiveSyncCalendarMutation.Upsert(item, isAddition = true)),
+                FixedTimeZoneResolver("UTC"),
+            )
+        lateinit var request: AndroidCalendarProviderBatchRequest
+        val gateway =
+            AndroidCalendarProviderSubBatchGateway { candidate ->
+                request = candidate
+                candidate.operations.mapIndexed { index, operation ->
+                    AndroidCalendarProviderOperationResult(
+                        uri =
+                            "content://com.android.calendar/events/${700 + index}"
+                                .takeIf {
+                                    operation.target == AndroidCalendarProviderTarget.EVENTS &&
+                                        operation.action == AndroidCalendarProviderAction.INSERT
+                                },
+                        count = 1,
+                    )
+                }
+            }
+
+        gateway.apply(CalendarProviderSubBatchCursor(batch).next()!!)
+
+        val exceptionValues =
+            request.operations.single { operation ->
+                operation.target == AndroidCalendarProviderTarget.EVENTS &&
+                    operation.values[CalendarProviderField.ORIGINAL_SYNC_ID] == "server-1"
+            }.values
+        assertTrue(exceptionValues.containsKey(CalendarProviderField.TITLE))
+        assertNull(exceptionValues[CalendarProviderField.TITLE])
+        assertEquals(ProviderInteger.BUSY, exceptionValues[CalendarProviderField.AVAILABILITY])
+        assertEquals(0, exceptionValues[CalendarProviderField.ACCESS_LEVEL])
+        assertTrue(
+            exceptionValues
+                .filterKeys { key -> key in REQUIRED_EVENT_PROVIDER_FIELDS }
+                .values
+                .none { value -> value == null },
+        )
+    }
+
+    @Test
+    fun `batch planning rejects null for a required event provider field`() {
+        assertThrows(CalendarPlanningException::class.java) {
+            CalendarProviderBatchPlan.create(
+                OWNED_CALENDAR,
+                listOf(
+                    CalendarProviderBatchOperation.EventInsert(
+                        OWNED_CALENDAR,
+                        mapOf(CalendarProviderField.ALL_DAY to null),
+                    ),
+                ),
+            )
+        }
+    }
+
+    @Test
     fun `high fanout series keeps organizer recurrence and unique exceptions while suppressing guests`() {
         val mutation = HighElementCalendarSyncFixture.mutation()
         val pagePlan =
@@ -657,6 +735,15 @@ class CalendarProviderBatchPlannerTest {
     }
 
     private companion object {
+        val REQUIRED_EVENT_PROVIDER_FIELDS =
+            setOf(
+                CalendarProviderField.ALL_DAY,
+                CalendarProviderField.ACCESS_LEVEL,
+                CalendarProviderField.AVAILABILITY,
+                CalendarProviderField.SELF_ATTENDEE_STATUS,
+                CalendarProviderField.HAS_ALARM,
+                CalendarProviderField.HAS_ATTENDEE_DATA,
+            )
         const val OWNED_CALENDAR = 12L
         const val OTHER_CALENDAR = 88L
         const val EVENT_ID = 31L
