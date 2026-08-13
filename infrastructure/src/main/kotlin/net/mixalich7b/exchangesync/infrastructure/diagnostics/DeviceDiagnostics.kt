@@ -6,6 +6,7 @@ import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.concurrent.atomic.AtomicLong
 import okhttp3.HttpUrl
+import kotlin.collections.plusAssign
 
 internal const val DIAGNOSTIC_LOG_TAG: String = "ExchangeSync"
 
@@ -308,6 +309,7 @@ private object DeviceDiagnosticFormatter {
             event.folderPreparationOutcome?.let { values += "folder_preparation=${it.name.lowercase()}" }
             appendCount(values, "window_size", event.windowSize)
             appendCount(values, "reduced_window_size", event.reducedWindowSize)
+            values.appendThrowable(event)
             return values.joinToString(" ").take(MAX_RECORD_LENGTH)
         }
         if (event.hasLargeEntityOrProviderSubBatchFields()) {
@@ -332,6 +334,7 @@ private object DeviceDiagnosticFormatter {
             event.providerFailureCause?.let { cause ->
                 values += "provider_failure_cause=${cause.name.lowercase()}"
             }
+            values.appendThrowable(event)
             return values.joinToString(" ").take(MAX_RECORD_LENGTH)
         }
         append(values, "trigger", event.trigger)
@@ -373,11 +376,15 @@ private object DeviceDiagnosticFormatter {
         appendCount(values, "applied_operation_count", event.appliedOperationCount)
         event.cleanupTrigger?.let { values += "cleanup_trigger=${it.name.lowercase()}" }
         event.checkpointOutcome?.let { values += "checkpoint_outcome=${it.name.lowercase()}" }
+        values.appendThrowable(event)
+        return values.joinToString(" ").take(MAX_RECORD_LENGTH)
+    }
+
+    private fun MutableList<String>.appendThrowable(event: DeviceDiagnosticEvent) {
         event.throwable?.let { throwable ->
-            values +=
+            this +=
                 "exceptions=${ThrowableDiagnosticFormatter.format(throwable, event.mayIncludeRootMessage())}"
         }
-        return values.joinToString(" ").take(MAX_RECORD_LENGTH)
     }
 
     private fun append(
