@@ -166,8 +166,11 @@ Process-local cookie/capability sessions и структурированные d
 upload. Корреляция сетевых, protocol, provider и worker boundaries выполняется
 process-local operation ID и, для sync, generation/run token. Безопасные поля и
 ADB-команды описаны в [диагностике](diagnostics.md). Отдельные узкие records
-показывают только агрегаты attendee suppression и provider sub-batch progress;
-event identity, provider row IDs, SyncKey и payload туда не попадают.
+успешных attendee suppression и provider sub-batch progress показывают только
+агрегаты. Только failure-only snapshots отклонённого события или failed provider
+operation могут включать разрешённые protocol/provider identifiers,
+row/back-reference identity, location, time, timezone и recurrence; subject/body,
+attendee/organizer values, SyncKey и payload туда не попадают.
 
 ## Проверка реализации
 
