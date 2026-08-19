@@ -157,9 +157,10 @@ aggregate records без значений. Политика snapshot являе�
   передаются из boundary projector в event model или throwable graph.
 
 Каждое разрешённое строковое значение всё равно проходит общий sanitizer:
-email/account/header редактируется, любой абсолютный URI с корректным `scheme:`
-заменяется целиком, query component удаляется,
-control characters очищаются, а длина ограничивается до chunking.
+email/account/header редактируется, абсолютный URI с корректным `scheme:`
+заменяется целиком, query component удаляется, control characters очищаются, а
+длина ограничивается до chunking. Канонический fixed-offset provider timezone
+вида `GMT±HH:MM` сохраняется как разрешённое timezone value и не считается URI.
 
 Diagnostics не должны содержать:
 

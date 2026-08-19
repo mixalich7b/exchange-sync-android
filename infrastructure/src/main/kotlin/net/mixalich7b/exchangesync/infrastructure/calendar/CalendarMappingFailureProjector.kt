@@ -42,7 +42,7 @@ internal object CalendarMappingFailureProjector {
         fields.addResponseSeries(DiagnosticCalendarFieldSource.RESPONSE, response)
         fields.addProviderSeries(DiagnosticCalendarFieldSource.PRIOR, previous)
         fields.addEffectiveSeries(response, previous)
-        fields.addSelectedException(response, failure.path)
+        fields.addSelectedException(response, previous, failure.path)
         val effectiveStart = effective(response.start, previous?.start)
         val effectiveEnd = effective(response.end, previous?.end)
         val failedRange = response.failedRange(failure.path, effectiveStart, effectiveEnd)
@@ -75,7 +75,12 @@ internal object CalendarMappingFailureProjector {
         val fields = mutableListOf<DiagnosticCalendarFieldEntry>()
         fields.addProviderSeries(DiagnosticCalendarFieldSource.EFFECTIVE, plan.event)
         fields.addSelectedProviderException(plan.event, failure.calendarPath)
-        val duration = durationMillis(plan.event.start, plan.event.end)
+        val selectedException = plan.event.selectedException(failure.calendarPath)
+        val duration =
+            when (failure.calendarPath) {
+                DiagnosticCalendarPath.Event -> durationMillis(plan.event.start, plan.event.end)
+                is DiagnosticCalendarPath.Exception -> selectedException?.durationMillis(plan.event)
+            }
         fields +=
             DiagnosticCalendarFieldEntry(
                 DiagnosticCalendarFieldSource.DERIVED,
@@ -97,9 +102,15 @@ internal object CalendarMappingFailureProjector {
                 DiagnosticCalendarFieldSource.DERIVED,
                 DiagnosticCalendarField.HAS_ALARM,
                 DiagnosticFieldState.PRESENT,
-                DiagnosticFieldValue.BooleanValue(plan.event.reminderMinutes is ActiveSyncField.Value),
+                DiagnosticFieldValue.BooleanValue(
+                    plan.event.failedReminder(failure.calendarPath, selectedException) is ActiveSyncField.Value,
+                ),
             )
-        val attendeeCount = (plan.event.attendees as? ActiveSyncField.Value)?.value?.size ?: 0
+        val attendeeCount =
+            (plan.event.failedAttendees(failure.calendarPath, selectedException) as? ActiveSyncField.Value)
+                ?.value
+                ?.size
+                ?: 0
         fields +=
             DiagnosticCalendarFieldEntry(
                 DiagnosticCalendarFieldSource.DERIVED,
@@ -324,12 +335,27 @@ internal object CalendarMappingFailureProjector {
     }
 
     private fun MutableList<DiagnosticCalendarFieldEntry>.addSelectedException(
-        item: ActiveSyncCalendarItem,
+        response: ActiveSyncCalendarItem,
+        previous: ProviderEvent?,
         path: CalendarMappingPath,
     ) {
         val index = (path as? CalendarMappingPath.Exception)?.index ?: return
-        val exception = (item.exceptions as? ActiveSyncField.Value)?.value?.getOrNull(index) ?: return
-        addException(DiagnosticCalendarFieldSource.EXCEPTION, exception)
+        val responseException =
+            (response.exceptions as? ActiveSyncField.Value)
+                ?.value
+                ?.getOrNull(index)
+        if (responseException != null) {
+            addException(DiagnosticCalendarFieldSource.EXCEPTION, responseException)
+            return
+        }
+        if (response.exceptions != ActiveSyncField.Absent) return
+        val priorSeries = previous ?: return
+        val priorException =
+            (priorSeries.exceptions as? ActiveSyncField.Value)
+                ?.value
+                ?.getOrNull(index)
+                ?: return
+        addProviderException(priorSeries, priorException)
     }
 
     private fun MutableList<DiagnosticCalendarFieldEntry>.addSelectedProviderException(
@@ -340,6 +366,40 @@ internal object CalendarMappingFailureProjector {
         val exception = (event.exceptions as? ActiveSyncField.Value)?.value?.getOrNull(index) ?: return
         addProviderException(event, exception)
     }
+
+    private fun ProviderEvent.selectedException(path: DiagnosticCalendarPath): ProviderCalendarException? {
+        val index = (path as? DiagnosticCalendarPath.Exception)?.index ?: return null
+        return (exceptions as? ActiveSyncField.Value)?.value?.getOrNull(index)
+    }
+
+    private fun ProviderCalendarException.durationMillis(series: ProviderEvent): Long? {
+        val startValue = (start as? ActiveSyncField.Value)?.value ?: originalInstance
+        val endValue =
+            (end as? ActiveSyncField.Value)?.value
+                ?: durationMillis(series.start, series.end)?.let(startValue::plusMillis)
+                ?: return null
+        return endValue.toEpochMilli() - startValue.toEpochMilli()
+    }
+
+    private fun ProviderEvent.failedReminder(
+        path: DiagnosticCalendarPath,
+        exception: ProviderCalendarException?,
+    ): ActiveSyncField<Int> =
+        when (path) {
+            DiagnosticCalendarPath.Event -> reminderMinutes
+            is DiagnosticCalendarPath.Exception ->
+                exception?.let { effective(it.reminderMinutes, reminderMinutes) } ?: ActiveSyncField.Absent
+        }
+
+    private fun ProviderEvent.failedAttendees(
+        path: DiagnosticCalendarPath,
+        exception: ProviderCalendarException?,
+    ) =
+        when (path) {
+            DiagnosticCalendarPath.Event -> attendees
+            is DiagnosticCalendarPath.Exception ->
+                exception?.let { effective(it.attendees, attendees) } ?: ActiveSyncField.Absent
+        }
 
     private fun MutableList<DiagnosticCalendarFieldEntry>.addProviderException(
         series: ProviderEvent,

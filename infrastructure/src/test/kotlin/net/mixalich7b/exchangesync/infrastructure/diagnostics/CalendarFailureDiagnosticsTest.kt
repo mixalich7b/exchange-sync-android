@@ -344,6 +344,36 @@ class CalendarFailureDiagnosticsTest {
     }
 
     @Test
+    fun `provider snapshot preserves a fixed-offset timezone`() {
+        val snapshot =
+            DiagnosticProviderOperationSnapshot(
+                globalOperationIndex = 0,
+                subBatchOperationIndex = 0,
+                operationKind = DiagnosticProviderOperationKind.EVENT_INSERT,
+                target = DiagnosticProviderTarget.EVENT,
+                calendarId = 73,
+                columns =
+                    listOf(
+                        providerColumn(DiagnosticProviderColumn.EVENT_TIME_ZONE, "GMT+03:00"),
+                        providerColumn(DiagnosticProviderColumn.EVENT_END_TIME_ZONE, "GMT-18:00"),
+                    ),
+            )
+
+        val formatted =
+            formatRecords(
+                DeviceDiagnosticEvent(
+                    severity = DiagnosticSeverity.ERROR,
+                    component = DiagnosticComponent.CALENDAR,
+                    stage = DiagnosticStage.PROVIDER_BATCH,
+                    providerOperationSnapshot = snapshot,
+                ),
+            ).single()
+
+        assertTrue(formatted.contains("column.eventTimezone.value=GMT+03:00"), formatted)
+        assertTrue(formatted.contains("column.eventEndTimezone.value=GMT-18:00"), formatted)
+    }
+
+    @Test
     fun `provider snapshot exposes allowed event values but only structure for excluded columns`() {
         val snapshot =
             DiagnosticProviderOperationSnapshot(

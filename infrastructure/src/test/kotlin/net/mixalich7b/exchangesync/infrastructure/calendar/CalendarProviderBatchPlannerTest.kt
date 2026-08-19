@@ -671,6 +671,7 @@ class CalendarProviderBatchPlannerTest {
                                 end = ActiveSyncField.Value(exceptionStart.plusSeconds(3_600)),
                                 allDay = ActiveSyncField.Value(false),
                                 reminderMinutes = ActiveSyncField.Value(8),
+                                attendees = ActiveSyncField.Value(attendees(1)),
                             ),
                         ),
                     ),
@@ -695,6 +696,18 @@ class CalendarProviderBatchPlannerTest {
         assertEquals(
             DiagnosticFieldValue.IntegerValue(8),
             snapshot.field(DiagnosticCalendarFieldSource.EXCEPTION, DiagnosticCalendarField.REMINDER_MINUTES).value,
+        )
+        assertEquals(
+            DiagnosticFieldValue.IntegerValue(3_600_000),
+            snapshot.field(DiagnosticCalendarFieldSource.DERIVED, DiagnosticCalendarField.DURATION_MILLIS).value,
+        )
+        assertEquals(
+            DiagnosticFieldValue.BooleanValue(true),
+            snapshot.field(DiagnosticCalendarFieldSource.DERIVED, DiagnosticCalendarField.HAS_ALARM).value,
+        )
+        assertEquals(
+            DiagnosticFieldValue.BooleanValue(true),
+            snapshot.field(DiagnosticCalendarFieldSource.DERIVED, DiagnosticCalendarField.HAS_ATTENDEE_DATA).value,
         )
     }
 

@@ -34,3 +34,4 @@
 - [x] 5.3 Run `./gradlew test lintDebug :app:assembleDebug verifyBootstrap` and confirm compilation warnings, local tests, Android Lint, and the debug build all pass.
 - [x] 5.4 Inspect the tracked diff and repository status for unrelated edits, generated files, raw payloads, event content, credentials, private endpoints, or local trust anchors; leave the untracked `logs` evidence outside the change.
 - [x] 5.5 Validate the completed implementation with `$openspec-verify-change`, run Codex `/review`, and resolve all findings before specification sync and archival.
+- [x] 5.6 Add a RED regression for an inherited-exception mapping failure, project the selected prior exception context, and rerun focused and full verification.

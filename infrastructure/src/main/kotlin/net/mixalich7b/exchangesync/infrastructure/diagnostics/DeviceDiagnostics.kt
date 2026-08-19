@@ -710,6 +710,7 @@ private object ThrowableDiagnosticFormatter {
 internal object DiagnosticTextSanitizer {
     private const val MAX_VALUE_LENGTH = 256
     private val uriPattern = Regex("(?i)\\b[a-z][a-z0-9+.-]*:[^\\s]+")
+    private val fixedOffsetTimeZonePattern = Regex("(?i)^GMT[+-](?:(?:0\\d|1[0-7]):[0-5]\\d|18:00)$")
     private val queryPattern = Regex("\\?[^\\s]+")
     private val headerPattern =
         Regex("(?i)\\b(?:cookie|set-cookie|authorization)\\s*[:=]\\s*[^\\r\\n]*")
@@ -724,7 +725,10 @@ internal object DiagnosticTextSanitizer {
         value = value.replace(Regex("[\\p{Cntrl}&&[^\\t]]"), " ")
         value = emailPattern.replace(value, "<email>")
         value = accountPattern.replace(value, "<account>")
-        value = uriPattern.replace(value, "<redacted-uri>")
+        value =
+            uriPattern.replace(value) { match ->
+                if (match.value.matches(fixedOffsetTimeZonePattern)) match.value else "<redacted-uri>"
+            }
         value = queryPattern.replace(value, "?<redacted-query>")
         return value.replace(' ', '_').take(MAX_VALUE_LENGTH)
     }

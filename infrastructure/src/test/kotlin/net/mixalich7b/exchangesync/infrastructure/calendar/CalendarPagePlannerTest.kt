@@ -349,6 +349,70 @@ class CalendarPagePlannerTest {
     }
 
     @Test
+    fun `inherited exception mapping failure retains selected prior exception context`() {
+        val firstInstance = Instant.parse("2026-08-10T09:00:00Z")
+        val failedInstance = Instant.parse("2026-08-16T09:00:00Z")
+        val previous =
+            providerEvent(
+                baseItem("series-1").copy(
+                    meetingStatus = ActiveSyncField.Value(ActiveSyncMeetingStatus(0, false, false, false)),
+                    responseType = ActiveSyncField.Value(ActiveSyncResponseType.ACCEPTED),
+                    exceptions =
+                        ActiveSyncField.Value(
+                            listOf(
+                                ActiveSyncCalendarException(
+                                    instanceStart = firstInstance,
+                                    deleted = false,
+                                ),
+                                ActiveSyncCalendarException(
+                                    instanceStart = failedInstance,
+                                    deleted = false,
+                                    location = ActiveSyncField.Value("Prior exception room"),
+                                    meetingStatus =
+                                        ActiveSyncField.Value(
+                                            ActiveSyncMeetingStatus(3, true, true, false),
+                                        ),
+                                ),
+                            ),
+                        ),
+                ),
+            )
+        val partial =
+            ActiveSyncCalendarItem(
+                serverId = "series-1",
+                responseType = ActiveSyncField.Empty,
+            )
+
+        val failure =
+            assertThrows(CalendarPlanningException::class.java) {
+                CalendarPagePlanner.plan(
+                    page(ActiveSyncCalendarMutation.Upsert(partial, false)),
+                    resolution(),
+                    listOf(ExistingProviderEvent(31, OWNED_CALENDAR, "series-1", previous)),
+                )
+            }
+        val snapshot = checkNotNull(failure.calendarFailureSnapshot)
+
+        assertEquals(DiagnosticCalendarRule.RECEIVED_MEETING_RESPONSE_EMPTY, snapshot.rule)
+        assertEquals(DiagnosticCalendarPath.Exception(1), snapshot.path)
+        assertEquals(
+            DiagnosticFieldValue.Timestamp(failedInstance),
+            snapshot.field(DiagnosticCalendarFieldSource.EXCEPTION, DiagnosticCalendarField.EXCEPTION_INSTANCE).value,
+        )
+        assertEquals(
+            DiagnosticFieldValue.Text("Prior_exception_room"),
+            snapshot.field(DiagnosticCalendarFieldSource.EXCEPTION, DiagnosticCalendarField.LOCATION).value,
+        )
+        assertEquals(
+            DiagnosticFieldValue.IntegerValue(3),
+            snapshot.field(DiagnosticCalendarFieldSource.EXCEPTION, DiagnosticCalendarField.MEETING_STATUS_RAW).value,
+        )
+        assertFalse(
+            snapshot.fields.any { field -> field.value == DiagnosticFieldValue.Timestamp(firstInstance) },
+        )
+    }
+
+    @Test
     fun `series response Change refreshes inherited exceptions while preserving explicit overrides`() {
         val inheritedInstance = Instant.parse("2026-08-16T09:00:00Z")
         val overriddenInstance = Instant.parse("2026-08-23T09:00:00Z")
