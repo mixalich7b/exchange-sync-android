@@ -24,6 +24,11 @@ import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlTag
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlWriter
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnosticEvent
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DeviceDiagnostics
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarCommandKind
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarField
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarFieldSource
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarRule
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticFieldValue
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCapacityKind
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCapacityOutcome
@@ -682,6 +687,51 @@ class ActiveSyncRemoteCalendarTest {
         }
 
     @Test
+    fun `malformed Change emits typed safe failure detail with synchronization correlation`() =
+        runBlocking {
+            val events = mutableListOf<DeviceDiagnosticEvent>()
+            val remote =
+                ActiveSyncRemoteCalendar(
+                    capabilities = ActiveSyncCapabilityGateway { error("Saved capability must be reused") },
+                    commands =
+                        ActiveSyncCommandGateway { _, endpoint, command, _, _, _ ->
+                            ActiveSyncCommandOutcome.Success(
+                                endpoint,
+                                if (command == ActiveSyncCommand.FOLDER_SYNC) {
+                                    emptyFolderResponse("new-folder-key")
+                                } else {
+                                    malformedChangeResponse("known-primary", "advanced-calendar-key")
+                                },
+                            )
+                        },
+                    sessions = liveSessions(ActiveSyncVersion.V16_1),
+                    diagnostics = DeviceDiagnostics { event -> events += event },
+                )
+
+            assertEquals(
+                RemotePageOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.PROTOCOL_DATA),
+                remote.fetchPage(request(fullSync = false, checkpoints = persistedCheckpoints())),
+            )
+
+            val failure = events.single { event -> event.stage == DiagnosticStage.EVENT_PARSE }
+            val snapshot = checkNotNull(failure.calendarFailureSnapshot)
+            assertEquals(3, failure.operation?.generation)
+            assertEquals(9, failure.operation?.runToken)
+            assertEquals("INVALID_ALL_DAY", failure.reasonCode)
+            assertEquals("malformed-change", failure.serverId)
+            assertEquals(DiagnosticCalendarCommandKind.CHANGE, snapshot.commandKind)
+            assertEquals(DiagnosticCalendarRule.INVALID_ALL_DAY, snapshot.rule)
+            assertEquals(DiagnosticCalendarField.ALL_DAY, snapshot.failedField)
+            assertEquals(
+                DiagnosticFieldValue.Text("invalid-bool-marker"),
+                snapshot.fields.single { entry ->
+                    entry.source == DiagnosticCalendarFieldSource.RESPONSE &&
+                        entry.field == DiagnosticCalendarField.ALL_DAY
+                }.value,
+            )
+        }
+
+    @Test
     fun `page-scaled WBXML capacity maps Calendar Sync to window too large`() =
         runBlocking {
             val events = mutableListOf<DeviceDiagnosticEvent>()
@@ -1316,6 +1366,36 @@ class ActiveSyncRemoteCalendarTest {
             ),
         )
     }
+
+    private fun malformedChangeResponse(
+        collectionId: String,
+        syncKey: String,
+    ): ByteArray =
+        wbxml(
+            element(
+                AirSync.SYNC,
+                element(
+                    AirSync.COLLECTIONS,
+                    element(
+                        AirSync.COLLECTION,
+                        text(AirSync.SYNC_KEY, syncKey),
+                        text(AirSync.COLLECTION_ID, collectionId),
+                        text(AirSync.STATUS, "1"),
+                        element(
+                            AirSync.COMMANDS,
+                            element(
+                                AirSync.CHANGE,
+                                text(AirSync.SERVER_ID, "malformed-change"),
+                                element(
+                                    AirSync.APPLICATION_DATA,
+                                    text(Calendar.ALL_DAY_EVENT, "invalid-bool-marker"),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
 
     private fun emptyCalendarResponse(collectionId: String, syncKey: String): ByteArray =
         wbxml(

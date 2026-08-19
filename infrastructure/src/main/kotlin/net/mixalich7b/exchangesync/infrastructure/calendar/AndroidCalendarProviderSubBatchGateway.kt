@@ -55,6 +55,36 @@ internal fun interface AndroidCalendarProviderBatchExecutor {
     fun execute(request: AndroidCalendarProviderBatchRequest): List<AndroidCalendarProviderOperationResult>
 }
 
+internal fun <T> beforeCalendarProviderDispatch(block: () -> T): T =
+    try {
+        block()
+    } catch (failure: CalendarProviderAccessException) {
+        if (failure.dispatchState == CalendarProviderDispatchState.NOT_DISPATCHED) throw failure
+        throw CalendarProviderAccessException(
+            cause = failure,
+            failureCause = failure.failureCause,
+            dispatchState = CalendarProviderDispatchState.NOT_DISPATCHED,
+        )
+    } catch (failure: SecurityException) {
+        throw CalendarProviderAccessException(
+            cause = failure,
+            failureCause = CalendarProviderFailureCause.SECURITY,
+            dispatchState = CalendarProviderDispatchState.NOT_DISPATCHED,
+        )
+    } catch (failure: IllegalArgumentException) {
+        throw CalendarProviderAccessException(
+            cause = failure,
+            failureCause = CalendarProviderFailureCause.INVALID_ARGUMENT,
+            dispatchState = CalendarProviderDispatchState.NOT_DISPATCHED,
+        )
+    } catch (failure: RuntimeException) {
+        throw CalendarProviderAccessException(
+            cause = failure,
+            failureCause = CalendarProviderFailureCause.UNEXPECTED,
+            dispatchState = CalendarProviderDispatchState.NOT_DISPATCHED,
+        )
+    }
+
 internal class AndroidCalendarProviderSubBatchGateway(
     private val executor: AndroidCalendarProviderBatchExecutor,
 ) {
@@ -63,7 +93,10 @@ internal class AndroidCalendarProviderSubBatchGateway(
             subBatch.operations.size > MAX_PROVIDER_OPERATIONS_PER_SUB_BATCH ||
             subBatch.operations.any { operation -> operation.calendarId != subBatch.calendarId }
         ) {
-            throw CalendarProviderAccessException(failureCause = CalendarProviderFailureCause.INVALID_REQUEST)
+            throw CalendarProviderAccessException(
+                failureCause = CalendarProviderFailureCause.INVALID_REQUEST,
+                dispatchState = CalendarProviderDispatchState.NOT_DISPATCHED,
+            )
         }
         val request =
             AndroidCalendarProviderBatchRequest(
@@ -225,7 +258,10 @@ internal class AndroidCalendarProviderSubBatchGateway(
         when (reference) {
             is EventReference.Existing -> {
                 if (reference.eventId <= 0L) {
-                    throw CalendarProviderAccessException(failureCause = CalendarProviderFailureCause.INVALID_REFERENCE)
+                    throw CalendarProviderAccessException(
+                        failureCause = CalendarProviderFailureCause.INVALID_REFERENCE,
+                        dispatchState = CalendarProviderDispatchState.NOT_DISPATCHED,
+                    )
                 }
                 copy(values = values + (column to reference.eventId))
             }
@@ -244,7 +280,10 @@ internal class AndroidCalendarProviderSubBatchGateway(
         when (reference) {
             is EventReference.Existing -> {
                 if (reference.eventId <= 0L) {
-                    throw CalendarProviderAccessException(failureCause = CalendarProviderFailureCause.INVALID_REFERENCE)
+                    throw CalendarProviderAccessException(
+                        failureCause = CalendarProviderFailureCause.INVALID_REFERENCE,
+                        dispatchState = CalendarProviderDispatchState.NOT_DISPATCHED,
+                    )
                 }
                 copy(
                     selection = selection,
@@ -263,7 +302,10 @@ internal class AndroidCalendarProviderSubBatchGateway(
 
     private fun EventReference.Inserted.requireLocalBackwardReference(localOperationIndex: Int) {
         if (operationIndex !in 0 until localOperationIndex) {
-            throw CalendarProviderAccessException(failureCause = CalendarProviderFailureCause.INVALID_REFERENCE)
+            throw CalendarProviderAccessException(
+                failureCause = CalendarProviderFailureCause.INVALID_REFERENCE,
+                dispatchState = CalendarProviderDispatchState.NOT_DISPATCHED,
+            )
         }
     }
 }
@@ -272,8 +314,12 @@ internal class AndroidContentResolverBatchExecutor(
     private val contentResolver: ContentResolver,
 ) : AndroidCalendarProviderBatchExecutor {
     override fun execute(request: AndroidCalendarProviderBatchRequest): List<AndroidCalendarProviderOperationResult> {
-        val operations = ArrayList<ContentProviderOperation>(request.operations.size)
-        request.operations.forEach { operation -> operations += operation.toContentProviderOperation() }
+        val operations =
+            beforeCalendarProviderDispatch {
+                ArrayList<ContentProviderOperation>(request.operations.size).apply {
+                    request.operations.forEach { operation -> add(operation.toContentProviderOperation()) }
+                }
+            }
         return contentResolver.applyBatch(request.authority, operations).map { result ->
             AndroidCalendarProviderOperationResult(result.uri?.toString(), result.count)
         }
@@ -324,6 +370,7 @@ internal class AndroidContentResolverBatchExecutor(
                     else ->
                         throw CalendarProviderAccessException(
                             failureCause = CalendarProviderFailureCause.UNSUPPORTED_VALUE,
+                            dispatchState = CalendarProviderDispatchState.NOT_DISPATCHED,
                         )
                 }
             }

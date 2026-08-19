@@ -30,7 +30,10 @@ internal class CalendarProviderSubBatchCursor(
 
     fun next(): CalendarProviderSubBatch? {
         if (awaitingResult != null) {
-            throw CalendarPlanningException("Calendar Provider sub-batch result is missing")
+            throw CalendarPlanningException(
+                CalendarPlanningRule.SUB_BATCH_RESULT_MISSING,
+                "Calendar Provider sub-batch result is missing",
+            )
         }
         if (nextOperationIndex == plan.operations.size) return null
         val endOperationIndex =
@@ -59,9 +62,15 @@ internal class CalendarProviderSubBatchCursor(
 
     fun record(result: CalendarProviderSubBatchResult) {
         val subBatch = awaitingResult
-            ?: throw CalendarPlanningException("Calendar Provider sub-batch has no pending result")
+            ?: throw CalendarPlanningException(
+                CalendarPlanningRule.SUB_BATCH_NOT_PENDING,
+                "Calendar Provider sub-batch has no pending result",
+            )
         if (result.appliedOperationCount != subBatch.operations.size) {
-            throw CalendarPlanningException("Calendar Provider sub-batch result count is invalid")
+            throw CalendarPlanningException(
+                CalendarPlanningRule.SUB_BATCH_RESULT_COUNT_INVALID,
+                "Calendar Provider sub-batch result count is invalid",
+            )
         }
         val expectedInsertIndexes =
             plan.operations.indices
@@ -77,7 +86,10 @@ internal class CalendarProviderSubBatchCursor(
             actualInsertIndexes.toSet() != expectedInsertIndexes ||
             result.insertResults.any { insert -> insert.providerRowId <= 0L }
         ) {
-            throw CalendarPlanningException("Calendar Provider insert results are invalid")
+            throw CalendarPlanningException(
+                CalendarPlanningRule.INSERT_RESULTS_INVALID,
+                "Calendar Provider insert results are invalid",
+            )
         }
         result.insertResults.forEach { insert ->
             resolvedInsertIds[insert.operationIndex] = insert.providerRowId
@@ -118,24 +130,36 @@ internal class CalendarProviderSubBatchCursor(
         when (reference) {
             is EventReference.Existing -> {
                 if (reference.eventId <= 0L) {
-                    throw CalendarPlanningException("Calendar Provider row reference is invalid")
+                    throw CalendarPlanningException(
+                        CalendarPlanningRule.ROW_REFERENCE_INVALID,
+                        "Calendar Provider row reference is invalid",
+                    )
                 }
                 reference
             }
             is EventReference.Inserted -> {
                 val referencedIndex = reference.operationIndex
                 if (referencedIndex !in 0 until globalOperationIndex) {
-                    throw CalendarPlanningException("Calendar Provider insert reference is not backward")
+                    throw CalendarPlanningException(
+                        CalendarPlanningRule.FORWARD_INSERT_REFERENCE,
+                        "Calendar Provider insert reference is not backward",
+                    )
                 }
                 if (!plan.operations[referencedIndex].returnsProviderRowId()) {
-                    throw CalendarPlanningException("Calendar Provider insert reference targets a non-insert")
+                    throw CalendarPlanningException(
+                        CalendarPlanningRule.NON_INSERT_REFERENCE,
+                        "Calendar Provider insert reference targets a non-insert",
+                    )
                 }
                 if (referencedIndex >= subBatchStartIndex) {
                     EventReference.Inserted(referencedIndex - subBatchStartIndex)
                 } else {
                     EventReference.Existing(
                         resolvedInsertIds[referencedIndex]
-                            ?: throw CalendarPlanningException("Calendar Provider insert result is missing"),
+                            ?: throw CalendarPlanningException(
+                                CalendarPlanningRule.INSERT_RESULT_MISSING,
+                                "Calendar Provider insert result is missing",
+                            ),
                     )
                 }
             }

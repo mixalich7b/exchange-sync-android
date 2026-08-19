@@ -206,10 +206,16 @@ internal class CalendarProviderBatchPlan private constructor(
             attendeeSuppressions: List<CalendarAttendeeSuppression> = emptyList(),
         ): CalendarProviderBatchPlan {
             if (calendarId < 0 || operations.any { it.calendarId != calendarId }) {
-                throw CalendarPlanningException("Calendar Provider batch escaped the owned calendar")
+                throw CalendarPlanningException(
+                    CalendarPlanningRule.PROVIDER_BATCH_SCOPE,
+                    "Calendar Provider batch escaped the owned calendar",
+                )
             }
             if (operations.any(CalendarProviderBatchOperation::hasNullRequiredProviderValue)) {
-                throw CalendarPlanningException("Calendar Provider required field cannot be null")
+                throw CalendarPlanningException(
+                    CalendarPlanningRule.PROVIDER_REQUIRED_VALUE_NULL,
+                    "Calendar Provider required field cannot be null",
+                )
             }
             return CalendarProviderBatchPlan(calendarId, operations, attendeeSuppressions)
         }
@@ -237,7 +243,16 @@ internal object CalendarProviderBatchPlanner {
                         addUpsert(eventPlan, operations, attendeeSuppressions, timeZoneResolver)
                 }
             } catch (failure: CalendarPlanningException) {
-                throw failure.withServerId(serverId)
+                val snapshot =
+                    (eventPlan as? CalendarEventPlan.Upsert)?.let { upsert ->
+                        runCatching { CalendarMappingFailureProjector.project(upsert, failure) }.getOrNull()
+                    }
+                throw failure
+                    .withServerId(serverId)
+                    .withCalendarContext(
+                        failure.calendarPath,
+                        snapshot,
+                    )
             }
         }
         return CalendarProviderBatchPlan.create(page.calendarId, operations, attendeeSuppressions)
@@ -355,17 +370,33 @@ internal object CalendarProviderBatchPlanner {
         timeZoneResolver: CalendarProviderTimeZoneResolver,
     ) {
         if (plan.refreshExceptionResponses) {
-            val seriesId = plan.eventId ?: throw CalendarPlanningException("Cannot refresh exceptions for a new series")
+            val seriesId =
+                plan.eventId ?: throw CalendarPlanningException(
+                    CalendarPlanningRule.REFRESH_EXCEPTIONS_NEW_SERIES,
+                    "Cannot refresh exceptions for a new series",
+                )
             val exceptions = (plan.event.exceptions as? ActiveSyncField.Value)?.value.orEmpty()
             exceptions
-                .filter { exception -> exception.responseTypeOverride == ActiveSyncField.Absent }
-                .forEach { exception ->
+                .withIndex()
+                .filter { indexed -> indexed.value.responseTypeOverride == ActiveSyncField.Absent }
+                .forEach { indexed ->
+                    val values =
+                        try {
+                            indexed.value.toResponseProviderValues(plan.event)
+                        } catch (failure: CalendarPlanningException) {
+                            throw failure.withCalendarContext(
+                                net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarPath.Exception(
+                                    indexed.index,
+                                ),
+                                null,
+                            )
+                        }
                     operations +=
                         CalendarProviderBatchOperation.ExceptionResponseUpdate(
                             calendarId = plan.calendarId,
                             seriesId = seriesId,
-                            originalInstance = exception.originalInstance,
-                            values = exception.toResponseProviderValues(plan.event),
+                            originalInstance = indexed.value.originalInstance,
+                            values = values,
                         )
                 }
             return
@@ -376,13 +407,22 @@ internal object CalendarProviderBatchPlanner {
             operations += CalendarProviderBatchOperation.ExceptionsDelete(plan.calendarId, existingId)
         }
         val exceptions = (plan.event.exceptions as? ActiveSyncField.Value)?.value.orEmpty()
-        exceptions.forEach { exception ->
+        exceptions.forEachIndexed { index, exception ->
             val exceptionIndex = operations.size
+            val values =
+                try {
+                    exception.toProviderValues(plan.event, timeZoneResolver, plan.providerTimeZone)
+                } catch (failure: CalendarPlanningException) {
+                    throw failure.withCalendarContext(
+                        net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarPath.Exception(index),
+                        null,
+                    )
+                }
             operations +=
                 CalendarProviderBatchOperation.ExceptionInsert(
                     calendarId = plan.calendarId,
                     series = eventReference,
-                    values = exception.toProviderValues(plan.event, timeZoneResolver, plan.providerTimeZone),
+                    values = values,
                 )
             val exceptionReference = EventReference.Inserted(exceptionIndex)
             val attendees = (exception.attendees as? ActiveSyncField.Value)?.value.orEmpty()
@@ -409,7 +449,7 @@ internal object CalendarProviderBatchPlanner {
                         ),
                     )
             }
-            if (exception.deleted) return@forEach
+            if (exception.deleted) return@forEachIndexed
             when (val reminder = exception.reminderMinutes) {
                 ActiveSyncField.Absent -> Unit
                 ActiveSyncField.Empty ->
@@ -496,10 +536,16 @@ internal object CalendarProviderBatchPlanner {
         }
         if (isInsert) {
             if (start !is ActiveSyncField.Value || end !is ActiveSyncField.Value) {
-                throw CalendarPlanningException("Calendar addition has no representable time range")
+                throw CalendarPlanningException(
+                    CalendarPlanningRule.ADDITION_TIME_RANGE_MISSING,
+                    "Calendar addition has no representable time range",
+                )
             }
             if (recurrenceRule is ActiveSyncField.Value && CalendarProviderField.DURATION !in values) {
-                throw CalendarPlanningException("Recurring calendar addition has no duration")
+                throw CalendarPlanningException(
+                    CalendarPlanningRule.RECURRING_DURATION_MISSING,
+                    "Recurring calendar addition has no duration",
+                )
             }
             values.putIfAbsent(CalendarProviderField.ALL_DAY, 0)
             values.putIfAbsent(CalendarProviderField.EVENT_TIME_ZONE, "UTC")
@@ -642,9 +688,17 @@ internal object CalendarProviderBatchPlanner {
             is ActiveSyncField.Value -> {
                 val resolved = resolver.resolve(timeZone.value)
                 if (resolved == null && recurrence is ActiveSyncField.Value) {
-                    throw CalendarPlanningException("Recurring event time zone cannot be represented")
+                    throw CalendarPlanningException(
+                        CalendarPlanningRule.RECURRING_TIME_ZONE_UNREPRESENTABLE,
+                        "Recurring event time zone cannot be represented",
+                    )
                 }
-                if (resolved == null) throw CalendarPlanningException("Event time zone cannot be represented")
+                if (resolved == null) {
+                    throw CalendarPlanningException(
+                        CalendarPlanningRule.TIME_ZONE_UNREPRESENTABLE,
+                        "Event time zone cannot be represented",
+                    )
+                }
                 ResolvedField(true, resolved)
             }
         }
@@ -755,7 +809,10 @@ private fun <T> MutableMap<String, Any?>.putRequiredField(
         ActiveSyncField.Empty -> this[key] = emptyValue
         is ActiveSyncField.Value ->
             this[key] = transform(field.value)
-                ?: throw CalendarPlanningException("Calendar Provider required field cannot be null")
+                ?: throw CalendarPlanningException(
+                    CalendarPlanningRule.PROVIDER_REQUIRED_VALUE_NULL,
+                    "Calendar Provider required field cannot be null",
+                )
     }
 }
 

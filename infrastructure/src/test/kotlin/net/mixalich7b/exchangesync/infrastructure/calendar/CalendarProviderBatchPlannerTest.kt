@@ -15,6 +15,12 @@ import net.mixalich7b.exchangesync.core.calendar.ActiveSyncSensitivity
 import net.mixalich7b.exchangesync.core.sync.RemoteCalendarPage
 import net.mixalich7b.exchangesync.core.sync.SyncCheckpoints
 import net.mixalich7b.exchangesync.infrastructure.activesync.HighElementCalendarSyncFixture
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarField
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarFieldSource
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarPath
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarRule
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticFieldState
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticFieldValue
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
@@ -88,17 +94,20 @@ class CalendarProviderBatchPlannerTest {
 
     @Test
     fun `batch planning rejects null for a required event provider field`() {
-        assertThrows(CalendarPlanningException::class.java) {
-            CalendarProviderBatchPlan.create(
-                OWNED_CALENDAR,
-                listOf(
-                    CalendarProviderBatchOperation.EventInsert(
-                        OWNED_CALENDAR,
-                        mapOf(CalendarProviderField.ALL_DAY to null),
+        val failure =
+            assertThrows(CalendarPlanningException::class.java) {
+                CalendarProviderBatchPlan.create(
+                    OWNED_CALENDAR,
+                    listOf(
+                        CalendarProviderBatchOperation.EventInsert(
+                            OWNED_CALENDAR,
+                            mapOf(CalendarProviderField.ALL_DAY to null),
+                        ),
                     ),
-                ),
-            )
-        }
+                )
+            }
+
+        assertEquals(CalendarPlanningRule.PROVIDER_REQUIRED_VALUE_NULL, failure.planningRule)
     }
 
     @Test
@@ -606,12 +615,87 @@ class CalendarProviderBatchPlannerTest {
 
     @Test
     fun `unrepresentable recurring Windows time zone rejects the whole page`() {
-        val item = baseItem().copy(recurrence = ActiveSyncField.Value(dailyRecurrence()))
+        val item =
+            baseItem().copy(
+                uid = ActiveSyncField.Value("safe-uid"),
+                location = ActiveSyncField.Value("Room 17"),
+                reminderMinutes = ActiveSyncField.Value(12),
+                recurrence = ActiveSyncField.Value(dailyRecurrence()),
+            )
         val pagePlan = plan(ActiveSyncCalendarMutation.Upsert(item, isAddition = true))
 
-        assertThrows(CalendarPlanningException::class.java) {
-            CalendarProviderBatchPlanner.plan(pagePlan, FixedTimeZoneResolver(null))
-        }
+        val failure =
+            assertThrows(CalendarPlanningException::class.java) {
+                CalendarProviderBatchPlanner.plan(pagePlan, FixedTimeZoneResolver(null))
+            }
+        val snapshot = checkNotNull(failure.calendarFailureSnapshot)
+
+        assertEquals(CalendarPlanningRule.RECURRING_TIME_ZONE_UNREPRESENTABLE, failure.planningRule)
+        assertEquals(DiagnosticCalendarRule.RECURRING_TIME_ZONE_UNREPRESENTABLE, snapshot.rule)
+        assertEquals(
+            DiagnosticFieldValue.IntegerValue(-180),
+            snapshot.field(DiagnosticCalendarFieldSource.EFFECTIVE, DiagnosticCalendarField.TIME_ZONE_BIAS_MINUTES).value,
+        )
+        assertEquals(
+            DiagnosticFieldValue.Text("FREQ=DAILY;INTERVAL=1"),
+            snapshot.field(DiagnosticCalendarFieldSource.EFFECTIVE, DiagnosticCalendarField.RECURRENCE_RULE).value,
+        )
+        assertEquals(
+            DiagnosticFieldValue.IntegerValue(3_600_000),
+            snapshot.field(DiagnosticCalendarFieldSource.DERIVED, DiagnosticCalendarField.DURATION_MILLIS).value,
+        )
+        assertEquals(
+            DiagnosticFieldState.EMPTY,
+            snapshot.field(DiagnosticCalendarFieldSource.DERIVED, DiagnosticCalendarField.PROVIDER_TIME_ZONE).state,
+        )
+    }
+
+    @Test
+    fun `unrepresentable exception retains its path and selected provider exception metadata`() {
+        val originalInstance = Instant.parse("2026-08-16T00:00:00Z")
+        val exceptionStart = Instant.parse("2026-08-16T09:00:00Z")
+        val item =
+            baseItem().copy(
+                start = ActiveSyncField.Value(Instant.parse("2026-08-09T00:00:00Z")),
+                end = ActiveSyncField.Value(Instant.parse("2026-08-10T00:00:00Z")),
+                allDay = ActiveSyncField.Value(true),
+                recurrence = ActiveSyncField.Value(dailyRecurrence()),
+                exceptions =
+                    ActiveSyncField.Value(
+                        listOf(
+                            ActiveSyncCalendarException(
+                                instanceStart = originalInstance,
+                                deleted = false,
+                                location = ActiveSyncField.Value("Exception room"),
+                                start = ActiveSyncField.Value(exceptionStart),
+                                end = ActiveSyncField.Value(exceptionStart.plusSeconds(3_600)),
+                                allDay = ActiveSyncField.Value(false),
+                                reminderMinutes = ActiveSyncField.Value(8),
+                            ),
+                        ),
+                    ),
+            )
+        val pagePlan = plan(ActiveSyncCalendarMutation.Upsert(item, isAddition = true))
+
+        val failure =
+            assertThrows(CalendarPlanningException::class.java) {
+                CalendarProviderBatchPlanner.plan(pagePlan, FixedTimeZoneResolver(null))
+            }
+        val snapshot = checkNotNull(failure.calendarFailureSnapshot)
+
+        assertEquals(DiagnosticCalendarPath.Exception(0), snapshot.path)
+        assertEquals(
+            DiagnosticFieldValue.Timestamp(originalInstance),
+            snapshot.field(DiagnosticCalendarFieldSource.EXCEPTION, DiagnosticCalendarField.EXCEPTION_INSTANCE).value,
+        )
+        assertEquals(
+            DiagnosticFieldValue.Text("Exception_room"),
+            snapshot.field(DiagnosticCalendarFieldSource.EXCEPTION, DiagnosticCalendarField.LOCATION).value,
+        )
+        assertEquals(
+            DiagnosticFieldValue.IntegerValue(8),
+            snapshot.field(DiagnosticCalendarFieldSource.EXCEPTION, DiagnosticCalendarField.REMINDER_MINUTES).value,
+        )
     }
 
     @Test
@@ -694,6 +778,11 @@ class CalendarProviderBatchPlannerTest {
         reference: EventReference,
     ): List<CalendarProviderBatchOperation.AttendeeInsert> =
         nonOrganizerAttendeeInserts().filter { operation -> operation.event == reference }
+
+    private fun net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarFailureSnapshot.field(
+        source: DiagnosticCalendarFieldSource,
+        field: DiagnosticCalendarField,
+    ) = fields.single { entry -> entry.source == source && entry.field == field }
 
     private fun page(vararg mutations: ActiveSyncCalendarMutation): RemoteCalendarPage =
         RemoteCalendarPage(mutations.toList(), SyncCheckpoints.EMPTY, moreAvailable = false)

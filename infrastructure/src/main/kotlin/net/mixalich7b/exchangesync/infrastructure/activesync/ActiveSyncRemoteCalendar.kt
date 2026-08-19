@@ -19,6 +19,7 @@ import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticActiveSy
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCapacityKind
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCapacityOutcome
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCapacityProblem
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarFailureSnapshot
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperation
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperationKind
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticSeverity
@@ -134,6 +135,7 @@ internal class ActiveSyncRemoteCalendar(
                 command = failure.commandKind,
                 serverId = failure.serverId,
                 throwable = failure,
+                calendarFailureSnapshot = failure.calendarFailureSnapshot,
             )
             RemotePageOutcome.Failure(SyncFailureKind.CRITICAL, SyncProblem.PROTOCOL_DATA)
         } catch (failure: IllegalArgumentException) {
@@ -558,6 +560,7 @@ internal class ActiveSyncRemoteCalendar(
         command: String? = null,
         serverId: String? = null,
         throwable: Throwable? = null,
+        calendarFailureSnapshot: DiagnosticCalendarFailureSnapshot? = null,
     ) {
         diagnostics.emit(
             DeviceDiagnosticEvent(
@@ -569,6 +572,7 @@ internal class ActiveSyncRemoteCalendar(
                 reasonCode = reason,
                 failureCategory = failureCategory,
                 serverId = serverId,
+                calendarFailureSnapshot = calendarFailureSnapshot,
                 throwable = throwable,
             ),
         )

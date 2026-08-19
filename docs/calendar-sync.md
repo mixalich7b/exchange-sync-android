@@ -75,6 +75,14 @@ plan сохраняет канонический порядок операций
 подтверждённый префикс может быть видим локально, но SyncKey не меняется. Повтор
 той же страницы идемпотентно upsert-ит ServerId и полностью заменяет только явно
 присутствующие child collections, поэтому сходится без дубликатов.
+Диагностика такого вызова сначала сохраняет aggregate failure, затем описывает
+каждую attempted операцию retained sub-batch. Эти записи показывают структуру и
+разрешённые значения плана, но сохраняют outcome всего Binder call как unknown
+и не выбирают предполагаемую causal operation; `applied_operation_count` для
+неоднозначного вызова отсутствует, а подтверждённый префикс остаётся в
+`confirmed_operation_count`. Ошибка локального построения request до
+`applyBatch` описывает безопасный план как `unsubmitted_operation` без Binder
+outcome.
 
 Capability discovery и все календарные команды точного сохранённого профиля
 используют один process-local HTTP-сеанс. Подходящие cookie, установленные
@@ -262,7 +270,12 @@ sync phases/retries/resets/terminal outcomes и границы WorkManager св�
 в Logcat по generation, run token и process-local operation ID. Безопасные
 агрегаты отдельно показывают suppression oversized attendee list и прогресс
 provider sub-batches, включая неоднозначный outcome активного вызова. Записи не
-содержат event content, WBXML, provider values или profile identity. Полный
+содержат WBXML/raw event payload, profile identity, subject/body, attendee или
+organizer values. Только для соответствующей ошибки safe snapshots могут
+содержать очищенные identifiers, location, time/timezone/recurrence,
+non-narrative exception state, typed failing field, безопасные attendee
+presence/counts и разрешённые provider values; успешные records остаются
+агрегатными. Полный
 перечень безопасных полей и команды сбора приведены в
 [руководстве по диагностике](diagnostics.md).
 

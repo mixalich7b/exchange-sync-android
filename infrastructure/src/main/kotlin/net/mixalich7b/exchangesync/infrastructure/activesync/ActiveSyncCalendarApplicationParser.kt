@@ -20,6 +20,7 @@ import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.ActiveSyncWbx
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.ActiveSyncWbxmlTokens.Calendar
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlElement
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlTag
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarField
 
 internal object ActiveSyncCalendarApplicationParser {
     fun parse(
@@ -36,24 +37,43 @@ internal object ActiveSyncCalendarApplicationParser {
                 -> parseUpsert(command, profileEmail, version)
             }
         } catch (error: ActiveSyncProtocolDataException) {
-            throw error.withContext(command.kind.name, command.serverId)
+            throw error.withCalendarContext(command, profileEmail)
         } catch (error: ActiveSyncCalendarValueException) {
             throw ActiveSyncProtocolDataException(
                 message = "Calendar application data is malformed",
-                reason = ActiveSyncValidationReason.INVALID_VALUE,
-                commandKind = command.kind.name,
-                serverId = command.serverId,
+                reason = error.reason,
+                failedField = error.field,
+                attendeeIndex = error.attendeeIndex,
+                currentUserAttendeeCount = error.currentUserAttendeeCount,
                 cause = error,
-            )
+            ).withCalendarContext(command, profileEmail)
         } catch (error: IllegalArgumentException) {
             throw ActiveSyncProtocolDataException(
                 message = "Calendar application data is malformed",
                 reason = ActiveSyncValidationReason.INVALID_APPLICATION_DATA,
-                commandKind = command.kind.name,
-                serverId = command.serverId,
                 cause = error,
-            )
+            ).withCalendarContext(command, profileEmail)
         }
+
+    private fun ActiveSyncProtocolDataException.withCalendarContext(
+        command: RawCalendarCommand,
+        profileEmail: String,
+    ): ActiveSyncProtocolDataException {
+        val contextual = withContext(command.kind.name, command.serverId)
+        val snapshot =
+            runCatching {
+                ActiveSyncCalendarFailureProjector.project(
+                    command = command,
+                    reason = contextual.reason,
+                    exceptionIndex = contextual.exceptionIndex,
+                    failedField = contextual.failedField,
+                    attendeeIndex = contextual.attendeeIndex,
+                    currentUserAttendeeCount = contextual.currentUserAttendeeCount,
+                    profileEmail = profileEmail,
+                )
+            }.getOrNull()
+        return if (snapshot == null) contextual else contextual.withCalendarFailureSnapshot(snapshot)
+    }
 
     private fun parseUpsert(
         command: RawCalendarCommand,
@@ -171,7 +191,18 @@ private fun <T> WbxmlElement.valueField(
 ): ActiveSyncField<T> {
     val element = child(tag) ?: return ActiveSyncField.Absent
     val text = element.text
-    return if (text.isNullOrEmpty()) ActiveSyncField.Empty else ActiveSyncField.Value(parser(text))
+    return if (text.isNullOrEmpty()) {
+        ActiveSyncField.Empty
+    } else {
+        try {
+            ActiveSyncField.Value(parser(text))
+        } catch (error: ActiveSyncCalendarValueException) {
+            throw error.withContext(
+                reason = tag.toValidationReason(error.reason),
+                field = error.field ?: tag.toDiagnosticCalendarField(),
+            )
+        }
+    }
 }
 
 private fun WbxmlElement.bodyField(): ActiveSyncField<String> {
@@ -190,15 +221,22 @@ private fun WbxmlElement.attendeesField(
     val elements = container.children(Calendar.ATTENDEE)
     if (elements.isEmpty()) return ActiveSyncField.Empty
     return ActiveSyncField.Value(
-        elements.map { attendee ->
+        elements.mapIndexed { index, attendee ->
             val email = attendee.child(Calendar.EMAIL)?.text
             val name = attendee.child(Calendar.NAME)?.text
             val status = attendee.child(Calendar.ATTENDEE_STATUS)?.text
             val type = attendee.child(Calendar.ATTENDEE_TYPE)?.text
-            if (optionalStatus) {
-                ActiveSyncCalendarValueParsers.parseAttendeeWithOptionalStatus(email, name, status, type)
-            } else {
-                ActiveSyncCalendarValueParsers.parseAttendee(email, name, status, type)
+            try {
+                if (optionalStatus) {
+                    ActiveSyncCalendarValueParsers.parseAttendeeWithOptionalStatus(email, name, status, type)
+                } else {
+                    ActiveSyncCalendarValueParsers.parseAttendee(email, name, status, type)
+                }
+            } catch (error: ActiveSyncCalendarValueException) {
+                throw error.withContext(
+                    reason = ActiveSyncValidationReason.INVALID_ATTENDEE,
+                    attendeeIndex = index,
+                )
             }
         },
     )
@@ -248,7 +286,30 @@ private fun WbxmlElement.exceptionsField(
     val elements = exceptions.children(Calendar.EXCEPTION)
     if (elements.isEmpty()) return ActiveSyncField.Empty
     return ActiveSyncField.Value(
-        elements.map { exception -> exception.parseCalendarException(version, profileEmail) },
+        elements.mapIndexed { index, exception ->
+            try {
+                exception.parseCalendarException(version, profileEmail)
+            } catch (error: ActiveSyncProtocolDataException) {
+                throw error.withExceptionIndex(index)
+            } catch (error: ActiveSyncCalendarValueException) {
+                throw ActiveSyncProtocolDataException(
+                    message = "Calendar exception application data is malformed",
+                    reason = error.reason,
+                    exceptionIndex = index,
+                    failedField = error.field,
+                    attendeeIndex = error.attendeeIndex,
+                    currentUserAttendeeCount = error.currentUserAttendeeCount,
+                    cause = error,
+                )
+            } catch (error: IllegalArgumentException) {
+                throw ActiveSyncProtocolDataException(
+                    message = "Calendar exception application data is malformed",
+                    reason = ActiveSyncValidationReason.INVALID_APPLICATION_DATA,
+                    exceptionIndex = index,
+                    cause = error,
+                )
+            }
+        },
     )
 }
 
@@ -257,28 +318,8 @@ private fun WbxmlElement.parseCalendarException(
     profileEmail: String,
 ): ActiveSyncCalendarException =
     ActiveSyncCalendarException(
-        instanceStart =
-            child(
-                when (version) {
-                    ActiveSyncVersion.V14_0,
-                    ActiveSyncVersion.V14_1,
-                    -> Calendar.EXCEPTION_START_TIME
-                    ActiveSyncVersion.V16_0,
-                    ActiveSyncVersion.V16_1,
-                    -> AirSyncBase.INSTANCE_ID
-                },
-            )?.text?.let { value ->
-                when (version) {
-                    ActiveSyncVersion.V14_0,
-                    ActiveSyncVersion.V14_1,
-                    -> ActiveSyncCalendarValueParsers.parseDateTime(value)
-                    ActiveSyncVersion.V16_0,
-                    ActiveSyncVersion.V16_1,
-                    -> ActiveSyncCalendarValueParsers.parseInstanceId(value)
-                }
-            }
-                ?: throw ActiveSyncProtocolDataException("Calendar exception identity is missing"),
-        deleted = child(Calendar.DELETED)?.text?.let(::parseProtocolBoolean) ?: false,
+        instanceStart = parseExceptionInstance(version),
+        deleted = parseExceptionDeleted(),
         subject = textField(Calendar.SUBJECT),
         body = bodyField(),
         location = locationField(version),
@@ -294,6 +335,46 @@ private fun WbxmlElement.parseCalendarException(
         sensitivity = valueField(Calendar.SENSITIVITY, ActiveSyncCalendarValueParsers::parseSensitivity),
     ).withAttendeeOnlyResponse(profileEmail)
 
+private fun WbxmlElement.parseExceptionInstance(version: ActiveSyncVersion): java.time.Instant {
+    val identityTag =
+        when (version) {
+            ActiveSyncVersion.V14_0,
+            ActiveSyncVersion.V14_1,
+            -> Calendar.EXCEPTION_START_TIME
+            ActiveSyncVersion.V16_0,
+            ActiveSyncVersion.V16_1,
+            -> AirSyncBase.INSTANCE_ID
+        }
+    val value =
+        child(identityTag)?.text
+            ?: throw ActiveSyncProtocolDataException(
+                message = "Calendar exception identity is missing",
+                reason = ActiveSyncValidationReason.MISSING_REQUIRED_VALUE,
+                failedField = DiagnosticCalendarField.EXCEPTION_INSTANCE,
+            )
+    return try {
+        when (version) {
+            ActiveSyncVersion.V14_0,
+            ActiveSyncVersion.V14_1,
+            -> ActiveSyncCalendarValueParsers.parseDateTime(value)
+            ActiveSyncVersion.V16_0,
+            ActiveSyncVersion.V16_1,
+            -> ActiveSyncCalendarValueParsers.parseInstanceId(value)
+        }
+    } catch (error: ActiveSyncCalendarValueException) {
+        throw error.withContext(field = DiagnosticCalendarField.EXCEPTION_INSTANCE)
+    }
+}
+
+private fun WbxmlElement.parseExceptionDeleted(): Boolean {
+    val value = child(Calendar.DELETED)?.text ?: return false
+    return try {
+        parseProtocolBoolean(value)
+    } catch (error: ActiveSyncCalendarValueException) {
+        throw error.withContext(field = DiagnosticCalendarField.EXCEPTION_DELETED)
+    }
+}
+
 private fun ActiveSyncCalendarException.withAttendeeOnlyResponse(
     profileEmail: String,
 ): ActiveSyncCalendarException {
@@ -308,4 +389,44 @@ private fun parseProtocolBoolean(value: String): Boolean =
         "0" -> false
         "1" -> true
         else -> throw ActiveSyncCalendarValueException("Invalid ActiveSync Boolean")
+    }
+
+private fun WbxmlTag.toDiagnosticCalendarField(): DiagnosticCalendarField? =
+    when (this) {
+        Calendar.UID -> DiagnosticCalendarField.UID
+        Calendar.SUBJECT -> DiagnosticCalendarField.SUBJECT
+        Calendar.BODY,
+        AirSyncBase.DATA,
+        -> DiagnosticCalendarField.BODY
+        Calendar.LOCATION,
+        AirSyncBase.DISPLAY_NAME,
+        -> DiagnosticCalendarField.LOCATION
+        Calendar.START_TIME -> DiagnosticCalendarField.START
+        Calendar.END_TIME -> DiagnosticCalendarField.END
+        Calendar.ALL_DAY_EVENT -> DiagnosticCalendarField.ALL_DAY
+        Calendar.TIMEZONE -> DiagnosticCalendarField.TIME_ZONE_RAW
+        Calendar.ORGANIZER_EMAIL -> DiagnosticCalendarField.ORGANIZER_EMAIL
+        Calendar.ORGANIZER_NAME -> DiagnosticCalendarField.ORGANIZER_NAME
+        Calendar.MEETING_STATUS -> DiagnosticCalendarField.MEETING_STATUS_RAW
+        Calendar.RESPONSE_TYPE -> DiagnosticCalendarField.RESPONSE_TYPE
+        Calendar.RESPONSE_REQUESTED -> DiagnosticCalendarField.RESPONSE_REQUESTED
+        Calendar.BUSY_STATUS -> DiagnosticCalendarField.AVAILABILITY
+        Calendar.SENSITIVITY -> DiagnosticCalendarField.SENSITIVITY
+        Calendar.REMINDER -> DiagnosticCalendarField.REMINDER_MINUTES
+        Calendar.EXCEPTION_START_TIME,
+        AirSyncBase.INSTANCE_ID,
+        -> DiagnosticCalendarField.EXCEPTION_INSTANCE
+        Calendar.DELETED -> DiagnosticCalendarField.EXCEPTION_DELETED
+        else -> null
+    }
+
+private fun WbxmlTag.toValidationReason(fallback: ActiveSyncValidationReason): ActiveSyncValidationReason =
+    when (this) {
+        Calendar.ALL_DAY_EVENT -> ActiveSyncValidationReason.INVALID_ALL_DAY
+        Calendar.TIMEZONE -> ActiveSyncValidationReason.INVALID_TIME_ZONE
+        Calendar.MEETING_STATUS,
+        Calendar.RESPONSE_TYPE,
+        Calendar.RESPONSE_REQUESTED,
+        -> ActiveSyncValidationReason.INVALID_MEETING_RESPONSE
+        else -> fallback
     }

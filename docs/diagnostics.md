@@ -53,6 +53,19 @@ telemetry или analytics нет. Доступны только records, кот
   `confirmed_operation_count` и `provider_call_outcome` (`confirmed`,
   `unknown`), а для ошибки — типизированный `provider_failure_cause` без текста
   исключения;
+- только при отклонении calendar Add/Change или локального представления —
+  `snapshot=calendar_failure`, command kind, opaque `server_id`, стабильный
+  validation/planning `rule`, `failed_field`, event/exception path, безопасный
+  attendee index и типизированные поля со source `response`, `prior`,
+  `effective`, `exception` или `derived`; attendee subfields сохраняют только
+  presence, а число совпадений с текущим пользователем — только bounded count;
+- только после ошибки активного Calendar Provider call —
+  `snapshot=provider_operation` для каждой attempted операции: global/local
+  index, operation kind, target, существующая row/back-reference/sync identity,
+  состояния известных columns и разрешённые политикой значения;
+- ошибка построения provider request до `applyBatch` использует те же безопасные
+  snapshots как `unsubmitted_operation`, но не выставляет
+  `provider_call_outcome` и не называет операцию attempted;
 - для cleanup — `cleanup_trigger` (`profile_activation`, `full_reset`,
   `disable`, `startup`, `permission_recovery`, `user_retry`), bounded row и
   operation counts, delete outcome и durable failure category;
@@ -61,11 +74,15 @@ telemetry или analytics нет. Доступны только records, кот
 - bounded exception/cause class graph и ограниченные stack frames; сообщения
   допускаются только на границах, где они могут быть безопасно очищены.
 
-Все новые числовые progress-поля formatter ограничивает диапазоном
+Большой failure snapshot разбивается на детерминированные записи с тем же
+`operation`, `generation` и `run_token` и ordinal `chunk=N/M`; каждая разрешённая
+field/column detail сохраняется ровно в одном chunk. Все новые числовые
+progress-поля formatter ограничивает диапазоном
 `0..1_000_000`. Полная запись ограничена 3000 символами, отдельное очищенное
-строковое значение — 256 символами, exception graph — восемью объектами и
-четырьмя stack frames на объект. Цикл помечается как `cycle`, остаток за пределом
-лимита — как `truncated`.
+строковое значение — 256 символами, exception graph — восемью объектами,
+32 попытками обхода/ожидающими объектами и четырьмя stack frames на объект,
+а его итоговое представление — 1024 символами. Цикл помечается как `cycle`,
+остаток за пределом лимита — как `truncated`.
 
 Обычный путь расследования: найти terminal `failure`/`outcome`, затем собрать
 строки с тем же `operation`. Для синхронизации дополнительно сопоставляются
@@ -92,9 +109,16 @@ reuse в page/retry/continuation и invalidation, не раскрывая сод
 превысил лимит материализации; запись сообщает только лимит, входное и
 опущенное количество и итог `organizer_only`/`empty`. `provider_batch` сначала
 фиксирует общий размер plan, затем подтверждённые sub-batches с их порядковым
-номером, размером и cumulative числом применённых операций. Ошибка активного
-Binder-вызова получает `provider_call_outcome=unknown`: ранее подтверждённый
-префикс остаётся посчитанным, а checkpoint страницы не считается committed.
+номером, размером и cumulative числом применённых операций. Успешные вызовы
+остаются aggregate-only. При ошибке сначала пишется прежний aggregate outcome,
+а за ним — detail для каждой операции, переданной в failed call. Ошибка
+активного Binder-вызова получает `provider_call_outcome=unknown`: ранее
+подтверждённый префикс остаётся посчитанным, но detail не утверждает, какая
+операция была причиной и применилась ли какая-либо часть неоднозначного вызова.
+Для такого вызова `applied_operation_count` опускается, а известный префикс
+остаётся только в `confirmed_operation_count`. Ошибка локального построения
+request до Binder сохраняет операции как `unsubmitted_operation` без unknown
+call outcome. В обоих случаях checkpoint страницы не считается committed.
 Concrete cause остаётся ограниченным enum, например `remote`,
 `operation_application`, `invalid_result` или `transaction_too_large`. Для
 capacity failure следующий record с теми же `generation`/`run_token` сообщает
@@ -110,18 +134,43 @@ protocol/HTTP validation, invalid event, recoverable retry/reset и checkpoint
 `failed`. TLS/mTLS, block, критические локальные и неожиданные ошибки, а также
 неуспешный или exception-based cleanup имеют `ERROR`.
 
-## Запрещённые данные
+## Failure-only field policy и запрещённые данные
+
+Подробные calendar/provider values появляются только на соответствующем пути
+ошибки. Для успешных parse/map/planning/provider операций сохраняются прежние
+aggregate records без значений. Политика snapshot является явным allow-list:
+
+- полное очищенное значение разрешено для UID/protocol identifiers, location,
+  времени, duration/relationship, all-day, timezone, recurrence, exception
+  identity и non-narrative metadata, meeting/response state, availability,
+  sensitivity, reminder, provider row/back-reference identity и технических
+  provider columns;
+- только `absent`/`empty`/`present` и bounded count разрешены для subject/title,
+  body/description, attendees и organizer; submitted attendee/organizer values
+  не сохраняются даже в provider-operation snapshot;
+- неизвестный тип provider value обозначается стабильным именем типа без вызова
+  произвольного `toString()`;
+- неизвестная provider column сохраняет анонимную structural presence с ключом
+  `<unknown>`, без исходного имени или значения; отдельная completeness-проверка
+  требует явной policy-классификации каждой новой `CalendarProviderField`;
+- raw WBXML/application tree, event export и другие payload containers не
+  передаются из boundary projector в event model или throwable graph.
+
+Каждое разрешённое строковое значение всё равно проходит общий sanitizer:
+email/account/header редактируется, любой абсолютный URI с корректным `scheme:`
+заменяется целиком, query component удаляется,
+control characters очищаются, а длина ограничивается до chunking.
 
 Diagnostics не должны содержать:
 
 - имена, значения или атрибуты cookie и заголовки `Cookie`/`Set-Cookie`;
 - `Authorization`, email, `domain\login` или KeyChain alias;
 - private keys, PEM/DER и другие raw certificate encodings;
-- полный URL, user-info, query string, request/response body или WBXML;
-- subject, body, location, attendees, organizer, timestamps collection и иной
-  personal event/provider payload;
-- значения FolderSync/collection SyncKey, primary collection ID, Calendar
-  Provider row ID, account identity и любые timestamp-поля в progress summaries;
+- полный URL, user-info, query string, request/response body, WBXML или raw
+  application/event payload;
+- значения subject/title и body/description, значения attendees и organizer;
+- значения FolderSync/collection SyncKey, primary collection ID, account
+  identity и любые calendar/provider values в progress summaries;
 - raw exception output.
 
 Progress summaries дополнительно не используют даже допустимый для точечной
@@ -133,7 +182,7 @@ booleans и enums. `response_bytes` — только ограниченный р
 Provider и core synchronization stages; там остаются только классы и
 ограниченные frames.
 
-Capacity, folder-preparation, attendee-suppression и provider-sub-batch records
+Capacity, folder-preparation и attendee-suppression records
 имеют более узкий formatter path: кроме `component`, `stage`, process-local
 operation ID, `generation`/`run_token` он принимает только соответствующие
 typed enums, bounded counts/window values и allow-listed failure/outcome. Свободные
@@ -147,6 +196,12 @@ Call sites передают только типизированные разре
 обрывает циклы, удаляет control characters, query/user-info, header-like
 credentials и account-like text. Cookie session также не предоставляет свои
 данные diagnostics.
+
+Failure-only formatter paths не расширяют доступ к collection commands:
+FolderSync key, primary collection ID, collection SyncKey и payload команд
+`FolderSync`/`Sync` остаются исключёнными. Calendar application command kind
+ограничен enum `add`/`change`; provider detail использует только перечисленные
+operation kinds и column policies.
 
 ## Сбор через ADB
 

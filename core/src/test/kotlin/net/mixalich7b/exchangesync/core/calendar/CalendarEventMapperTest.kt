@@ -239,13 +239,17 @@ class CalendarEventMapperTest {
                 start = ActiveSyncField.Value(Instant.parse("2026-08-09T11:00:00Z")),
             )
 
-        assertThrows(CalendarMappingException::class.java) {
+        val failure =
+            assertThrows(CalendarMappingException::class.java) {
             CalendarEventMapper.map(
                 ActiveSyncCalendarMutation.Upsert(invalidChange, isAddition = false),
                 CALENDAR_COLOR,
                 previous,
             )
         }
+
+        assertEquals(CalendarMappingRule.EVENT_TIME_RANGE_INVALID, failure.rule)
+        assertEquals(CalendarMappingPath.Event, failure.path)
     }
 
     @Test

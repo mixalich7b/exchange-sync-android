@@ -3,17 +3,77 @@ package net.mixalich7b.exchangesync.infrastructure.calendar
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncCalendarMutation
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncField
 import net.mixalich7b.exchangesync.core.calendar.CalendarEventMapper
+import net.mixalich7b.exchangesync.core.calendar.CalendarMappingException
+import net.mixalich7b.exchangesync.core.calendar.CalendarMappingRule
 import net.mixalich7b.exchangesync.core.calendar.ProviderCalendarMutation
 import net.mixalich7b.exchangesync.core.calendar.ProviderEvent
 import net.mixalich7b.exchangesync.core.sync.RemoteCalendarPage
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarFailureSnapshot
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarPath
+
+internal enum class CalendarPlanningRule {
+    OWNED_CALENDAR_SCOPE,
+    DUPLICATE_SERVER_ID,
+    UNSUPPORTED_CALENDAR_CHANGE,
+    CALENDAR_EVENT_MAPPING,
+    PROVIDER_BATCH_SCOPE,
+    PROVIDER_REQUIRED_VALUE_NULL,
+    REFRESH_EXCEPTIONS_NEW_SERIES,
+    ADDITION_TIME_RANGE_MISSING,
+    RECURRING_DURATION_MISSING,
+    RECURRING_TIME_ZONE_UNREPRESENTABLE,
+    TIME_ZONE_UNREPRESENTABLE,
+    SUB_BATCH_RESULT_MISSING,
+    SUB_BATCH_NOT_PENDING,
+    SUB_BATCH_RESULT_COUNT_INVALID,
+    INSERT_RESULTS_INVALID,
+    ROW_REFERENCE_INVALID,
+    FORWARD_INSERT_REFERENCE,
+    NON_INSERT_REFERENCE,
+    INSERT_RESULT_MISSING,
+}
 
 internal class CalendarPlanningException(
+    val planningRule: CalendarPlanningRule,
     message: String,
     val serverId: String? = null,
     cause: Throwable? = null,
+    val mappingRule: CalendarMappingRule? = null,
+    val calendarFailureSnapshot: DiagnosticCalendarFailureSnapshot? = null,
+    val calendarPath: DiagnosticCalendarPath = DiagnosticCalendarPath.Event,
 ) : IllegalArgumentException(message, cause) {
     fun withServerId(value: String): CalendarPlanningException =
-        if (serverId != null) this else CalendarPlanningException(message.orEmpty(), value, this)
+        if (serverId != null) {
+            this
+        } else {
+            CalendarPlanningException(
+                planningRule = planningRule,
+                message = message.orEmpty(),
+                serverId = value,
+                cause = this,
+                mappingRule = mappingRule,
+                calendarFailureSnapshot = calendarFailureSnapshot,
+                calendarPath = calendarPath,
+            )
+        }
+
+    fun withCalendarContext(
+        path: DiagnosticCalendarPath,
+        snapshot: DiagnosticCalendarFailureSnapshot?,
+    ): CalendarPlanningException =
+        if (calendarFailureSnapshot != null && calendarPath == path) {
+            this
+        } else {
+            CalendarPlanningException(
+                planningRule = planningRule,
+                message = message.orEmpty(),
+                serverId = serverId,
+                cause = this,
+                mappingRule = mappingRule,
+                calendarFailureSnapshot = (snapshot ?: calendarFailureSnapshot)?.copy(path = path),
+                calendarPath = path,
+            )
+        }
 }
 
 internal class CalendarMirrorResetRequiredException(
@@ -62,7 +122,10 @@ internal class CalendarPagePlan private constructor(
     companion object {
         fun create(calendarId: Long, operations: List<CalendarEventPlan>): CalendarPagePlan {
             if (calendarId < 0 || operations.any { operation -> operation.calendarId != calendarId }) {
-                throw CalendarPlanningException("Calendar page plan escaped the owned calendar")
+                throw CalendarPlanningException(
+                    CalendarPlanningRule.OWNED_CALENDAR_SCOPE,
+                    "Calendar page plan escaped the owned calendar",
+                )
             }
             return CalendarPagePlan(calendarId, operations)
         }
@@ -81,16 +144,22 @@ internal object CalendarPagePlanner {
         }
         val bySyncId = existingOwned.groupBy(ExistingProviderEvent::syncId)
         if (bySyncId.values.any { matches -> matches.size > 1 }) {
-            throw CalendarPlanningException("Owned calendar has duplicate ServerId rows")
+            throw CalendarPlanningException(
+                CalendarPlanningRule.DUPLICATE_SERVER_ID,
+                "Owned calendar has duplicate ServerId rows",
+            )
         }
         val existingBySyncId = bySyncId.mapValues { (_, values) -> values.single() }
         val operations =
             page.changes.map { change ->
                 val mutation = change as? ActiveSyncCalendarMutation
-                    ?: throw CalendarPlanningException("Calendar page contains an unsupported change")
+                    ?: throw CalendarPlanningException(
+                        CalendarPlanningRule.UNSUPPORTED_CALENDAR_CHANGE,
+                        "Calendar page contains an unsupported change",
+                    )
                 val serverId = CalendarPlanIdentity.syncId(mutation)
+                val existing = existingBySyncId[serverId]
                 try {
-                    val existing = existingBySyncId[serverId]
                     when (val mapped = CalendarEventMapper.map(mutation, owned.color, existing?.snapshot)) {
                         is ProviderCalendarMutation.Delete ->
                             CalendarEventPlan.Delete(owned.calendarId, mapped.syncId)
@@ -123,8 +192,26 @@ internal object CalendarPagePlanner {
                     throw failure.withServerId(serverId)
                 } catch (failure: CalendarPlanningException) {
                     throw failure.withServerId(serverId)
+                } catch (failure: CalendarMappingException) {
+                    val snapshot =
+                        runCatching {
+                            CalendarMappingFailureProjector.project(mutation, existing?.snapshot, failure)
+                        }.getOrNull()
+                    throw CalendarPlanningException(
+                        planningRule = CalendarPlanningRule.CALENDAR_EVENT_MAPPING,
+                        message = "Calendar event cannot be mapped",
+                        serverId = serverId,
+                        cause = failure,
+                        mappingRule = failure.rule,
+                        calendarFailureSnapshot = snapshot,
+                    )
                 } catch (failure: IllegalArgumentException) {
-                    throw CalendarPlanningException("Calendar event cannot be mapped", serverId, failure)
+                    throw CalendarPlanningException(
+                        CalendarPlanningRule.CALENDAR_EVENT_MAPPING,
+                        "Calendar event cannot be mapped",
+                        serverId,
+                        failure,
+                    )
                 }
             }
         return CalendarPagePlan.create(owned.calendarId, operations)

@@ -52,6 +52,7 @@ import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticAttendee
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperationKind
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticProviderCallOutcome
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticProviderFailureCause
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticProviderOperationSnapshot
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticSeverity
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticStage
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.OwnedCalendarAction
@@ -63,6 +64,7 @@ internal enum class CalendarProviderFailureCause {
     REMOTE,
     OPERATION_APPLICATION,
     OPERATION_CANCELLED,
+    SECURITY,
     INVALID_ARGUMENT,
     INVALID_REQUEST,
     INVALID_RESULT,
@@ -71,9 +73,15 @@ internal enum class CalendarProviderFailureCause {
     UNEXPECTED,
 }
 
+internal enum class CalendarProviderDispatchState {
+    NOT_DISPATCHED,
+    UNKNOWN,
+}
+
 internal class CalendarProviderAccessException(
     cause: Throwable? = null,
     val failureCause: CalendarProviderFailureCause = CalendarProviderFailureCause.ACCESS,
+    val dispatchState: CalendarProviderDispatchState = CalendarProviderDispatchState.UNKNOWN,
 ) : RuntimeException(cause)
 
 internal interface OwnedCalendarProviderGateway {
@@ -107,6 +115,9 @@ public class AndroidOwnedCalendarAdapter internal constructor(
     private val hasCalendarAccess: () -> Boolean = { true },
     private val mutationLock: SynchronizationMutationLock = SynchronizationMutationLock(),
     private val diagnostics: DeviceDiagnostics = DeviceDiagnostics(),
+    private val providerFailureProjector:
+        (CalendarProviderSubBatch) -> List<DiagnosticProviderOperationSnapshot> =
+        CalendarProviderFailureProjector::project,
 ) : OwnedCalendarPort {
     public constructor(
         context: Context,
@@ -392,6 +403,9 @@ public class AndroidOwnedCalendarAdapter internal constructor(
                     acceptedCount = failedIndex?.coerceAtLeast(0),
                     rejectedCount = 1,
                     attemptedOperationCount = attemptedOperations,
+                    appliedOperationCount = confirmedOperations,
+                    activeSubBatch = activeSubBatch,
+                    confirmedOperationCount = confirmedOperations,
                 )
             } else {
                 emitProviderFailure(
@@ -400,6 +414,10 @@ public class AndroidOwnedCalendarAdapter internal constructor(
                     SyncProblem.PROTOCOL_DATA,
                     failure,
                     serverId = failure.serverId,
+                    calendarFailureSnapshot = failure.calendarFailureSnapshot,
+                    appliedOperationCount = confirmedOperations,
+                    activeSubBatch = activeSubBatch,
+                    confirmedOperationCount = confirmedOperations,
                 )
                 emitProgressFailure(
                     operation = operation,
@@ -419,6 +437,9 @@ public class AndroidOwnedCalendarAdapter internal constructor(
                 SyncProblem.CALENDAR_PROVIDER,
                 failure,
                 attemptedOperationCount = attemptedOperations,
+                appliedOperationCount = confirmedOperations,
+                activeSubBatch = activeSubBatch,
+                confirmedOperationCount = confirmedOperations,
             )
             LocalPageOutcome.Failed(SyncProblem.CALENDAR_PROVIDER)
         } catch (failure: CalendarProviderAccessException) {
@@ -463,7 +484,35 @@ public class AndroidOwnedCalendarAdapter internal constructor(
         activeSubBatch: CalendarProviderSubBatch? = null,
         confirmedOperationCount: Int? = null,
         cleanupTrigger: CleanupTrigger? = null,
+        calendarFailureSnapshot:
+            net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarFailureSnapshot? = null,
     ) {
+        val dispatchState = activeSubBatch?.let { throwable.providerDispatchState() }
+        val providerCallOutcome =
+            DiagnosticProviderCallOutcome.UNKNOWN.takeIf { dispatchState == CalendarProviderDispatchState.UNKNOWN }
+        val activeOperationCount =
+            when (dispatchState) {
+                CalendarProviderDispatchState.NOT_DISPATCHED -> 0
+                CalendarProviderDispatchState.UNKNOWN -> activeSubBatch.operations.size
+                null -> attemptedOperationCount
+            }
+        val reportedAppliedOperationCount =
+            if (providerCallOutcome == DiagnosticProviderCallOutcome.UNKNOWN) {
+                null
+            } else {
+                appliedOperationCount ?: attemptedOperationCount?.let { 0 }
+            }
+        val providerFailureCause =
+            activeSubBatch?.let {
+                when (throwable) {
+                    is CalendarProviderTransactionTooLargeException ->
+                        DiagnosticProviderFailureCause.TRANSACTION_TOO_LARGE
+                    is CalendarProviderAccessException ->
+                        DiagnosticProviderFailureCause.valueOf(throwable.failureCause.name)
+                    is SecurityException -> DiagnosticProviderFailureCause.SECURITY
+                    else -> DiagnosticProviderFailureCause.ACCESS
+                }
+            }
         diagnostics.emit(
             DeviceDiagnosticEvent(
                 DiagnosticSeverity.ERROR,
@@ -476,31 +525,63 @@ public class AndroidOwnedCalendarAdapter internal constructor(
                 inputCount = inputCount,
                 acceptedCount = acceptedCount,
                 rejectedCount = rejectedCount,
-                attemptedOperationCount = activeSubBatch?.operations?.size ?: attemptedOperationCount,
-                appliedOperationCount = appliedOperationCount ?: attemptedOperationCount?.let { 0 },
+                attemptedOperationCount = activeOperationCount,
+                appliedOperationCount = reportedAppliedOperationCount,
                 providerOperationCount = activeSubBatch?.totalOperationCount,
                 subBatchCount = activeSubBatch?.totalSubBatchCount,
                 subBatchOrdinal = activeSubBatch?.ordinal,
                 subBatchOperationCount = activeSubBatch?.operations?.size,
                 confirmedOperationCount = confirmedOperationCount,
-                providerCallOutcome = activeSubBatch?.let { DiagnosticProviderCallOutcome.UNKNOWN },
-                providerFailureCause =
-                    activeSubBatch?.let {
-                        when (throwable) {
-                            is CalendarProviderTransactionTooLargeException ->
-                                DiagnosticProviderFailureCause.TRANSACTION_TOO_LARGE
-                            is CalendarProviderAccessException ->
-                                DiagnosticProviderFailureCause.valueOf(throwable.failureCause.name)
-                            is SecurityException -> DiagnosticProviderFailureCause.SECURITY
-                            else -> DiagnosticProviderFailureCause.ACCESS
-                        }
-                    },
+                providerCallOutcome = providerCallOutcome,
+                providerFailureCause = providerFailureCause,
                 cleanupTrigger = cleanupTrigger,
+                calendarFailureSnapshot = calendarFailureSnapshot,
                 outcome = "failure",
                 throwable = throwable,
             ),
         )
+        val snapshots =
+            try {
+                activeSubBatch?.let(providerFailureProjector).orEmpty()
+            } catch (_: Throwable) {
+                emptyList()
+            }
+        snapshots.forEach { snapshot ->
+            diagnostics.emit {
+                val operationWasSubmitted = providerCallOutcome == DiagnosticProviderCallOutcome.UNKNOWN
+                DeviceDiagnosticEvent(
+                    severity = DiagnosticSeverity.ERROR,
+                    component = DiagnosticComponent.CALENDAR,
+                    stage = stage,
+                    operation = operation,
+                    reasonCode =
+                        if (operationWasSubmitted) {
+                            "PROVIDER_OPERATION_ATTEMPTED"
+                        } else {
+                            "PROVIDER_OPERATION_NOT_SUBMITTED"
+                        },
+                    failureCategory = problem.name,
+                    outcome = if (operationWasSubmitted) "attempted_operation" else "unsubmitted_operation",
+                    attemptedOperationCount = if (operationWasSubmitted) activeSubBatch?.operations?.size else 0,
+                    appliedOperationCount = if (operationWasSubmitted) null else confirmedOperationCount,
+                    providerOperationCount = activeSubBatch?.totalOperationCount,
+                    subBatchCount = activeSubBatch?.totalSubBatchCount,
+                    subBatchOrdinal = activeSubBatch?.ordinal,
+                    subBatchOperationCount = activeSubBatch?.operations?.size,
+                    confirmedOperationCount = confirmedOperationCount,
+                    providerCallOutcome = providerCallOutcome,
+                    providerFailureCause = providerFailureCause,
+                    providerOperationSnapshot = snapshot,
+                )
+            }
+        }
     }
+
+    private fun Throwable.providerDispatchState(): CalendarProviderDispatchState =
+        when (this) {
+            is CalendarProviderAccessException -> dispatchState
+            else -> CalendarProviderDispatchState.UNKNOWN
+        }
 
     private fun emitProgressFailure(
         operation: net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticOperation,
@@ -557,7 +638,11 @@ private object CalendarChangeIdentity {
         when (change) {
             is net.mixalich7b.exchangesync.core.calendar.ActiveSyncCalendarMutation.Delete -> change.serverId
             is net.mixalich7b.exchangesync.core.calendar.ActiveSyncCalendarMutation.Upsert -> change.item.serverId
-            else -> throw CalendarPlanningException("Calendar page contains an unsupported change")
+            else ->
+                throw CalendarPlanningException(
+                    CalendarPlanningRule.UNSUPPORTED_CALENDAR_CHANGE,
+                    "Calendar page contains an unsupported change",
+                )
         }
 }
 

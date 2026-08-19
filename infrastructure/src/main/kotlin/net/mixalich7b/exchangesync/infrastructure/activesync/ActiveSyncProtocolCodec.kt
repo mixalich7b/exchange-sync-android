@@ -13,6 +13,8 @@ import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlReadLimi
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlReadLimitKind
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlTag
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlWriter
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarFailureSnapshot
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarField
 
 internal enum class ActiveSyncValidationReason {
     MALFORMED_WBXML,
@@ -46,6 +48,11 @@ internal class ActiveSyncProtocolDataException(
     val reason: ActiveSyncValidationReason = reasonFor(message),
     val commandKind: String? = null,
     val serverId: String? = null,
+    val exceptionIndex: Int? = null,
+    val failedField: DiagnosticCalendarField? = null,
+    val attendeeIndex: Int? = null,
+    val currentUserAttendeeCount: Int? = null,
+    val calendarFailureSnapshot: DiagnosticCalendarFailureSnapshot? = null,
     cause: Throwable? = null,
 ) : IllegalArgumentException(message, cause) {
     fun withContext(
@@ -57,6 +64,39 @@ internal class ActiveSyncProtocolDataException(
             reason = reason,
             commandKind = commandKind,
             serverId = serverId,
+            exceptionIndex = exceptionIndex,
+            failedField = failedField,
+            attendeeIndex = attendeeIndex,
+            currentUserAttendeeCount = currentUserAttendeeCount,
+            calendarFailureSnapshot = calendarFailureSnapshot,
+            cause = this,
+        )
+
+    fun withExceptionIndex(index: Int): ActiveSyncProtocolDataException =
+        ActiveSyncProtocolDataException(
+            message = message.orEmpty(),
+            reason = reason,
+            commandKind = commandKind,
+            serverId = serverId,
+            exceptionIndex = index,
+            failedField = failedField,
+            attendeeIndex = attendeeIndex,
+            currentUserAttendeeCount = currentUserAttendeeCount,
+            calendarFailureSnapshot = calendarFailureSnapshot,
+            cause = this,
+        )
+
+    fun withCalendarFailureSnapshot(snapshot: DiagnosticCalendarFailureSnapshot): ActiveSyncProtocolDataException =
+        ActiveSyncProtocolDataException(
+            message = message.orEmpty(),
+            reason = reason,
+            commandKind = commandKind,
+            serverId = serverId,
+            exceptionIndex = exceptionIndex,
+            failedField = failedField,
+            attendeeIndex = attendeeIndex,
+            currentUserAttendeeCount = currentUserAttendeeCount,
+            calendarFailureSnapshot = snapshot,
             cause = this,
         )
 

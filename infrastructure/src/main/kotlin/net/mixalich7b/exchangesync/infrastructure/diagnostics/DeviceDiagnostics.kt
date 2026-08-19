@@ -1,7 +1,6 @@
 package net.mixalich7b.exchangesync.infrastructure.diagnostics
 
 import android.util.Log
-import java.net.URI
 import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.concurrent.atomic.AtomicLong
@@ -233,6 +232,8 @@ internal data class DeviceDiagnosticEvent(
     val providerFailureCause: DiagnosticProviderFailureCause? = null,
     val cleanupTrigger: CleanupTrigger? = null,
     val checkpointOutcome: CheckpointOutcome? = null,
+    val calendarFailureSnapshot: DiagnosticCalendarFailureSnapshot? = null,
+    val providerOperationSnapshot: DiagnosticProviderOperationSnapshot? = null,
     val throwable: Throwable? = null,
 )
 
@@ -267,6 +268,14 @@ internal class DeviceDiagnostics(
         }
     }
 
+    fun emit(eventFactory: () -> DeviceDiagnosticEvent) {
+        try {
+            emit(eventFactory())
+        } catch (_: Throwable) {
+            // Diagnostic projection must never change connection or synchronization behavior.
+        }
+    }
+
     private companion object {
         val processSequence = AtomicLong()
     }
@@ -275,11 +284,12 @@ internal class DeviceDiagnostics(
 internal class AndroidLogcatDiagnosticSink : DeviceDiagnosticSink {
     override fun emit(event: DeviceDiagnosticEvent) {
         try {
-            val record = DeviceDiagnosticFormatter.format(event)
-            when (event.severity) {
-                DiagnosticSeverity.INFO -> Log.i(DIAGNOSTIC_LOG_TAG, record)
-                DiagnosticSeverity.WARN -> Log.w(DIAGNOSTIC_LOG_TAG, record)
-                DiagnosticSeverity.ERROR -> Log.e(DIAGNOSTIC_LOG_TAG, record)
+            DeviceDiagnosticFormatter.formatRecords(event).forEach { record ->
+                when (event.severity) {
+                    DiagnosticSeverity.INFO -> Log.i(DIAGNOSTIC_LOG_TAG, record)
+                    DiagnosticSeverity.WARN -> Log.w(DIAGNOSTIC_LOG_TAG, record)
+                    DiagnosticSeverity.ERROR -> Log.e(DIAGNOSTIC_LOG_TAG, record)
+                }
             }
         } catch (_: Throwable) {
             // Android logging and formatting are deliberately non-fatal.
@@ -287,9 +297,18 @@ internal class AndroidLogcatDiagnosticSink : DeviceDiagnosticSink {
     }
 }
 
-private object DeviceDiagnosticFormatter {
+internal object DeviceDiagnosticFormatter {
     private const val MAX_RECORD_LENGTH = 3_000
     private const val MAX_AGGREGATE_COUNT = 1_000_000
+
+    fun formatRecords(event: DeviceDiagnosticEvent): List<String> =
+        when {
+            event.calendarFailureSnapshot != null ->
+                formatCalendarFailure(event, event.calendarFailureSnapshot)
+            event.providerOperationSnapshot != null ->
+                formatProviderOperation(event, event.providerOperationSnapshot)
+            else -> listOf(format(event))
+        }
 
     fun format(event: DeviceDiagnosticEvent): String {
         val values = mutableListOf<String>()
@@ -380,6 +399,170 @@ private object DeviceDiagnosticFormatter {
         return values.joinToString(" ").take(MAX_RECORD_LENGTH)
     }
 
+    private fun formatCalendarFailure(
+        event: DeviceDiagnosticEvent,
+        snapshot: DiagnosticCalendarFailureSnapshot,
+    ): List<String> {
+        val header = snapshotHeader(event)
+        header += "snapshot=calendar_failure"
+        snapshot.commandKind?.let { header += "command_kind=${it.name.lowercase()}" }
+        snapshot.serverId?.let { header += "server_id=${DiagnosticTextSanitizer.sanitize(it)}" }
+        header += "rule=${snapshot.rule.name.lowercase()}"
+        snapshot.failedField?.let { header += "failed_field=${it.name.lowercase()}" }
+        appendCount(header, "attendee_index", snapshot.attendeeIndex)
+        header +=
+            when (val path = snapshot.path) {
+                DiagnosticCalendarPath.Event -> "calendar_path=event"
+                is DiagnosticCalendarPath.Exception ->
+                    "calendar_path=exception exception_index=${path.index.coerceIn(0, MAX_AGGREGATE_COUNT)}"
+            }
+        header.appendThrowable(event)
+        appendCount(header, "field_count", snapshot.fields.size)
+        val segments =
+            snapshot.fields
+                .sortedWith(
+                    compareBy<DiagnosticCalendarFieldEntry>(
+                        { field -> field.source.ordinal },
+                        { field -> field.field.ordinal },
+                        { field -> field.state.ordinal },
+                        { field -> field.value?.render().orEmpty() },
+                    ),
+                ).map { field ->
+                    val prefix = "${field.source.name.lowercase()}.${field.field.name.lowercase()}"
+                    buildList {
+                        add("$prefix.state=${field.state.name.lowercase()}")
+                        if (
+                            field.field.policy == DiagnosticCalendarFieldPolicy.FULL_VALUE &&
+                            field.value != null
+                        ) {
+                            add("$prefix.value=${field.value.render()}")
+                        }
+                    }.joinToString(" ")
+                }
+        return chunkedRecords(header, segments)
+    }
+
+    private fun formatProviderOperation(
+        event: DeviceDiagnosticEvent,
+        snapshot: DiagnosticProviderOperationSnapshot,
+    ): List<String> {
+        val header = snapshotHeader(event)
+        header += "snapshot=provider_operation"
+        appendCount(header, "global_operation_index", snapshot.globalOperationIndex)
+        appendCount(header, "sub_batch_operation_index", snapshot.subBatchOperationIndex)
+        header += "provider_operation_kind=${snapshot.operationKind.name.lowercase()}"
+        header += "provider_target=${snapshot.target.name.lowercase()}"
+        header += "calendar_id=${snapshot.calendarId}"
+        when (val reference = snapshot.reference) {
+            null -> Unit
+            is DiagnosticProviderReference.Existing -> {
+                header += "reference_kind=existing"
+                header += "reference_value=${reference.rowId}"
+            }
+            is DiagnosticProviderReference.BackReference -> {
+                header += "reference_kind=back_reference"
+                appendCount(header, "reference_value", reference.operationIndex)
+            }
+            is DiagnosticProviderReference.SyncId -> {
+                header += "reference_kind=sync_id"
+                header += "reference_value=${DiagnosticTextSanitizer.sanitize(reference.value)}"
+            }
+        }
+        appendCount(header, "column_count", snapshot.columns.size)
+        val structuralOnly =
+            snapshot.target == DiagnosticProviderTarget.ATTENDEE ||
+                snapshot.target == DiagnosticProviderTarget.ORGANIZER
+        val segments =
+            snapshot.columns
+                .sortedWith(
+                    compareBy<DiagnosticProviderColumnEntry>(
+                        { entry -> entry.column.ordinal },
+                        { entry -> entry.state.ordinal },
+                        { entry -> entry.value?.render().orEmpty() },
+                    ),
+                ).map { entry ->
+                    val prefix = "column.${entry.column.wireName}"
+                    buildList {
+                        add("$prefix.state=${entry.state.name.lowercase()}")
+                        if (
+                            !structuralOnly &&
+                            entry.column.policy == DiagnosticProviderColumnPolicy.FULL_VALUE &&
+                            entry.value != null
+                        ) {
+                            add("$prefix.value=${entry.value.render()}")
+                        }
+                    }.joinToString(" ")
+                }
+        return chunkedRecords(header, segments)
+    }
+
+    private fun snapshotHeader(event: DeviceDiagnosticEvent): MutableList<String> =
+        mutableListOf(
+            "component=${event.component.name.lowercase()}",
+            "stage=${event.stage.name.lowercase()}",
+        ).apply {
+            event.operation?.let { operation ->
+                add("operation=${DiagnosticTextSanitizer.sanitize(operation.id)}")
+                add("operation_kind=${operation.kind.name.lowercase()}")
+                operation.generation?.let { add("generation=$it") }
+                operation.runToken?.let { add("run_token=$it") }
+            }
+            event.failureCategory?.let { add("failure=${DiagnosticTextSanitizer.sanitize(it)}") }
+            event.outcome?.let { add("outcome=${DiagnosticTextSanitizer.sanitize(it)}") }
+            event.providerCallOutcome?.let { add("provider_call_outcome=${it.name.lowercase()}") }
+            event.providerFailureCause?.let { add("provider_failure_cause=${it.name.lowercase()}") }
+            appendCount(this, "provider_operation_count", event.providerOperationCount)
+            appendCount(this, "sub_batch_count", event.subBatchCount)
+            appendCount(this, "sub_batch_ordinal", event.subBatchOrdinal)
+            appendCount(this, "sub_batch_operation_count", event.subBatchOperationCount)
+            appendCount(this, "confirmed_operation_count", event.confirmedOperationCount)
+        }
+
+    private fun chunkedRecords(
+        header: List<String>,
+        segments: List<String>,
+    ): List<String> {
+        val headerText = header.joinToString(" ")
+        val availableLength = MAX_RECORD_LENGTH - headerText.length - MAX_CHUNK_TOKEN_LENGTH - 2
+        check(availableLength > 0) { "Diagnostic snapshot header exceeds record limit" }
+        val chunks = mutableListOf<MutableList<String>>()
+        var current = mutableListOf<String>()
+        var currentLength = 0
+        segments.forEach { segment ->
+            check(segment.length <= availableLength) { "Diagnostic snapshot field exceeds record limit" }
+            val addedLength = segment.length + if (current.isEmpty()) 0 else 1
+            if (current.isNotEmpty() && currentLength + addedLength > availableLength) {
+                chunks += current
+                current = mutableListOf()
+                currentLength = 0
+            }
+            current += segment
+            currentLength += segment.length + if (current.size == 1) 0 else 1
+        }
+        if (current.isNotEmpty() || chunks.isEmpty()) chunks += current
+        return chunks.mapIndexed { index, chunk ->
+            buildList {
+                addAll(header)
+                add("chunk=${index + 1}/${chunks.size}")
+                addAll(chunk)
+            }.joinToString(" ").also { record ->
+                check(record.length <= MAX_RECORD_LENGTH) { "Diagnostic snapshot record exceeds record limit" }
+            }
+        }
+    }
+
+    private fun DiagnosticFieldValue.render(): String =
+        when (this) {
+            is DiagnosticFieldValue.Text -> DiagnosticTextSanitizer.sanitize(value)
+            is DiagnosticFieldValue.IntegerValue -> value.toString()
+            is DiagnosticFieldValue.BooleanValue -> value.toString()
+            is DiagnosticFieldValue.Timestamp -> value.toString()
+            is DiagnosticFieldValue.EnumName -> DiagnosticTextSanitizer.sanitize(value.lowercase())
+            is DiagnosticFieldValue.Count -> value.coerceIn(0, MAX_AGGREGATE_COUNT).toString()
+            is DiagnosticFieldValue.Relationship -> value.name.lowercase()
+            is DiagnosticFieldValue.TypeName -> DiagnosticTextSanitizer.sanitize(value)
+        }
+
     private fun MutableList<String>.appendThrowable(event: DeviceDiagnosticEvent) {
         event.throwable?.let { throwable ->
             this +=
@@ -447,11 +630,17 @@ private object DeviceDiagnosticFormatter {
             DiagnosticStage.EVENT_PARSE,
             DiagnosticStage.EVENT_MAP,
         )
+
+    private const val MAX_CHUNK_TOKEN_LENGTH: Int = 15
 }
 
 private object ThrowableDiagnosticFormatter {
     private const val MAX_THROWABLES = 8
     private const val MAX_FRAMES = 4
+    private const val MAX_TRAVERSAL_ATTEMPTS = 32
+    private const val MAX_PENDING_THROWABLES = 32
+    private const val MAX_CLASS_NAME_LENGTH = 96
+    private const val MAX_FORMAT_LENGTH = 1_024
 
     fun format(
         root: Throwable,
@@ -460,40 +649,68 @@ private object ThrowableDiagnosticFormatter {
         val seen = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())
         val pending = ArrayDeque<Throwable>()
         pending += root
-        val records = mutableListOf<String>()
-        while (pending.isNotEmpty() && records.size < MAX_THROWABLES) {
+        val classes = mutableListOf<String>()
+        val frames = mutableListOf<String>()
+        var throwableCount = 0
+        var traversalAttempts = 0
+        var traversalTruncated = false
+        while (
+            pending.isNotEmpty() &&
+            throwableCount < MAX_THROWABLES &&
+            traversalAttempts < MAX_TRAVERSAL_ATTEMPTS
+        ) {
             val throwable = pending.removeFirst()
+            traversalAttempts += 1
             if (!seen.add(throwable)) {
-                records += "cycle"
+                classes += "cycle"
                 continue
             }
-            val frames =
-                throwable.stackTrace.take(MAX_FRAMES).joinToString(",") { frame ->
+            val throwableIndex = throwableCount
+            throwableCount += 1
+            classes +=
+                DiagnosticTextSanitizer
+                    .sanitize(throwable.javaClass.name)
+                    .take(MAX_CLASS_NAME_LENGTH)
+            throwable.stackTrace.take(MAX_FRAMES).forEach { frame ->
+                frames +=
+                    "$throwableIndex:" +
                     DiagnosticTextSanitizer.sanitize(
                         "${frame.className}.${frame.methodName}(${frame.fileName.orEmpty()}:${frame.lineNumber})",
                     )
+            }
+            fun enqueue(candidate: Throwable) {
+                if (pending.size < MAX_PENDING_THROWABLES) {
+                    pending.addLast(candidate)
+                } else {
+                    traversalTruncated = true
                 }
-            records +=
-                buildString {
-                    append(throwable.javaClass.name)
-                    if (throwable === root && includeRootMessage) {
-                        throwable.message?.let { message ->
-                            append(':').append(DiagnosticTextSanitizer.sanitize(message))
-                        }
-                    }
-                    if (frames.isNotEmpty()) append('@').append(frames)
-                }
-            throwable.cause?.let(pending::addLast)
-            throwable.suppressed.forEach(pending::addLast)
+            }
+            throwable.cause?.let(::enqueue)
+            val suppressed = throwable.suppressed
+            val remainingCapacity = (MAX_PENDING_THROWABLES - pending.size).coerceAtLeast(0)
+            val retainedSuppressedCount = suppressed.size.coerceAtMost(remainingCapacity)
+            repeat(retainedSuppressedCount) { index -> pending.addLast(suppressed[index]) }
+            if (retainedSuppressedCount < suppressed.size) traversalTruncated = true
         }
-        if (pending.isNotEmpty()) records += "truncated"
-        return records.joinToString("|")
+        if (pending.isNotEmpty() || traversalTruncated) classes += "truncated"
+        val values = mutableListOf("classes=${classes.joinToString("|")}")
+        if (includeRootMessage) {
+            root.message?.let { message ->
+                values += "root_message=${DiagnosticTextSanitizer.sanitize(message)}"
+            }
+        }
+        if (frames.isNotEmpty()) values += "frames=${frames.joinToString(",")}"
+        val formatted = values.joinToString(";")
+        if (formatted.length <= MAX_FORMAT_LENGTH) return formatted
+        val marker = ";details_truncated"
+        return formatted.take(MAX_FORMAT_LENGTH - marker.length) + marker
     }
 }
 
 internal object DiagnosticTextSanitizer {
     private const val MAX_VALUE_LENGTH = 256
-    private val urlPattern = Regex("https://[^\\s]+", RegexOption.IGNORE_CASE)
+    private val uriPattern = Regex("(?i)\\b[a-z][a-z0-9+.-]*:[^\\s]+")
+    private val queryPattern = Regex("\\?[^\\s]+")
     private val headerPattern =
         Regex("(?i)\\b(?:cookie|set-cookie|authorization)\\s*[:=]\\s*[^\\r\\n]*")
     private val aliasPattern =
@@ -507,13 +724,8 @@ internal object DiagnosticTextSanitizer {
         value = value.replace(Regex("[\\p{Cntrl}&&[^\\t]]"), " ")
         value = emailPattern.replace(value, "<email>")
         value = accountPattern.replace(value, "<account>")
-        value =
-            urlPattern.replace(value) { match ->
-                runCatching {
-                    val uri = URI(match.value.trimEnd('.', ',', ';', ')', ']'))
-                    "https://${uri.host.orEmpty()}${uri.rawPath.orEmpty()}"
-                }.getOrDefault("https://<redacted>")
-            }
+        value = uriPattern.replace(value, "<redacted-uri>")
+        value = queryPattern.replace(value, "?<redacted-query>")
         return value.replace(' ', '_').take(MAX_VALUE_LENGTH)
     }
 }

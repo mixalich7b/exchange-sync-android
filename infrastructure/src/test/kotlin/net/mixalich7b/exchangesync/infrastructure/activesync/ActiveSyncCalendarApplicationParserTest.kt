@@ -16,6 +16,13 @@ import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.ActiveSyncWbx
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlElement
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlReader
 import net.mixalich7b.exchangesync.infrastructure.activesync.wbxml.WbxmlTag
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarCommandKind
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarField
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarFieldSource
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarPath
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarRule
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticFieldState
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticFieldValue
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
@@ -627,6 +634,328 @@ class ActiveSyncCalendarApplicationParserTest {
     }
 
     @Test
+    fun `malformed Add retains typed safe scalar and excluded field presence`() {
+        val data =
+            element(
+                AirSync.APPLICATION_DATA,
+                text(Calendar.SUBJECT, "title-must-not-enter-snapshot"),
+                text(Calendar.START_TIME, "20260809T090000Z"),
+                text(Calendar.END_TIME, "invalid-end-marker"),
+                text(Calendar.ALL_DAY_EVENT, "0"),
+                text(Calendar.LOCATION, "Room 7"),
+            )
+
+        val failure =
+            assertThrows(ActiveSyncProtocolDataException::class.java) {
+                ActiveSyncCalendarApplicationParser.parse(
+                    RawCalendarCommand(RawCalendarCommandKind.ADD, "malformed-add", data),
+                    PROFILE_EMAIL,
+                )
+            }
+        val snapshot = checkNotNull(failure.calendarFailureSnapshot)
+
+        assertEquals("ADD", failure.commandKind)
+        assertEquals("malformed-add", failure.serverId)
+        assertEquals(ActiveSyncValidationReason.INVALID_VALUE, failure.reason)
+        assertEquals(DiagnosticCalendarCommandKind.ADD, snapshot.commandKind)
+        assertEquals("malformed-add", snapshot.serverId)
+        assertEquals(DiagnosticCalendarRule.INVALID_VALUE, snapshot.rule)
+        assertEquals(DiagnosticCalendarPath.Event, snapshot.path)
+        assertEquals(DiagnosticCalendarField.END, snapshot.failedField)
+        assertEquals(
+            DiagnosticFieldValue.Text("invalid-end-marker"),
+            snapshot.field(DiagnosticCalendarFieldSource.RESPONSE, DiagnosticCalendarField.END).value,
+        )
+        val subject = snapshot.field(DiagnosticCalendarFieldSource.RESPONSE, DiagnosticCalendarField.SUBJECT)
+        assertEquals(DiagnosticFieldState.PRESENT, subject.state)
+        assertNull(subject.value)
+    }
+
+    @Test
+    fun `malformed nested Change retains failing exception scalar and exception index`() {
+        val data =
+            element(
+                AirSync.APPLICATION_DATA,
+                element(
+                    Calendar.EXCEPTIONS,
+                    element(
+                        Calendar.EXCEPTION,
+                        text(Calendar.EXCEPTION_START_TIME, "20260810T090000Z"),
+                        text(Calendar.DELETED, "1"),
+                    ),
+                    element(
+                        Calendar.EXCEPTION,
+                        text(Calendar.EXCEPTION_START_TIME, "20260811T090000Z"),
+                        text(Calendar.END_TIME, "nested-invalid-end-marker"),
+                        element(Calendar.LOCATION),
+                    ),
+                ),
+            )
+
+        val failure =
+            assertThrows(ActiveSyncProtocolDataException::class.java) {
+                ActiveSyncCalendarApplicationParser.parse(
+                    RawCalendarCommand(RawCalendarCommandKind.CHANGE, "malformed-change", data),
+                    PROFILE_EMAIL,
+                )
+            }
+        val snapshot = checkNotNull(failure.calendarFailureSnapshot)
+
+        assertEquals(DiagnosticCalendarCommandKind.CHANGE, snapshot.commandKind)
+        assertEquals("malformed-change", snapshot.serverId)
+        assertEquals(DiagnosticCalendarRule.INVALID_VALUE, snapshot.rule)
+        assertEquals(DiagnosticCalendarPath.Exception(1), snapshot.path)
+        assertEquals(DiagnosticCalendarField.END, snapshot.failedField)
+        assertEquals(
+            DiagnosticFieldValue.Text("nested-invalid-end-marker"),
+            snapshot.field(DiagnosticCalendarFieldSource.EXCEPTION, DiagnosticCalendarField.END).value,
+        )
+        assertEquals(
+            DiagnosticFieldState.EMPTY,
+            snapshot.field(DiagnosticCalendarFieldSource.EXCEPTION, DiagnosticCalendarField.LOCATION).state,
+        )
+    }
+
+    @Test
+    fun `exception identity and deleted failures retain typed field context for 14 and 16`() {
+        val identities =
+            listOf(
+                Triple(ActiveSyncVersion.V14_0, Calendar.EXCEPTION_START_TIME, "20260810T090000Z"),
+                Triple(ActiveSyncVersion.V16_1, AirSyncBase.INSTANCE_ID, "20260810T090000Z"),
+            )
+
+        identities.forEach { (version, identityTag, validIdentity) ->
+            val malformedIdentity =
+                exceptionFailure(
+                    version,
+                    element(Calendar.EXCEPTION, text(identityTag, "invalid-identity-marker")),
+                )
+            val missingIdentity = exceptionFailure(version, element(Calendar.EXCEPTION))
+            val invalidDeleted =
+                exceptionFailure(
+                    version,
+                    element(
+                        Calendar.EXCEPTION,
+                        text(identityTag, validIdentity),
+                        text(Calendar.DELETED, "invalid-deleted-marker"),
+                    ),
+                )
+
+            assertEquals(ActiveSyncValidationReason.INVALID_VALUE, malformedIdentity.reason, version.name)
+            assertEquals(
+                DiagnosticCalendarField.EXCEPTION_INSTANCE,
+                malformedIdentity.calendarFailureSnapshot?.failedField,
+                version.name,
+            )
+            assertEquals(ActiveSyncValidationReason.MISSING_REQUIRED_VALUE, missingIdentity.reason, version.name)
+            assertEquals(
+                DiagnosticCalendarField.EXCEPTION_INSTANCE,
+                missingIdentity.calendarFailureSnapshot?.failedField,
+                version.name,
+            )
+            assertEquals(ActiveSyncValidationReason.INVALID_VALUE, invalidDeleted.reason, version.name)
+            assertEquals(
+                DiagnosticCalendarField.EXCEPTION_DELETED,
+                invalidDeleted.calendarFailureSnapshot?.failedField,
+                version.name,
+            )
+            listOf(malformedIdentity, missingIdentity, invalidDeleted).forEach { failure ->
+                assertEquals(DiagnosticCalendarPath.Exception(0), failure.calendarFailureSnapshot?.path)
+            }
+        }
+    }
+
+    @Test
+    fun `attendee parse failure retains only structural narrative and people context`() {
+        val markers =
+            listOf(
+                "title-parse-secret-marker",
+                "body-parse-secret-marker",
+                "organizer-email-parse-secret-marker@example.test",
+                "organizer-name-parse-secret-marker",
+                "attendee-email-parse-secret-marker@example.test",
+                "attendee-name-parse-secret-marker",
+            )
+        val data =
+            element(
+                AirSync.APPLICATION_DATA,
+                text(Calendar.SUBJECT, markers[0]),
+                element(AirSyncBase.BODY, text(AirSyncBase.DATA, markers[1])),
+                text(Calendar.START_TIME, "20260809T090000Z"),
+                text(Calendar.END_TIME, "20260809T100000Z"),
+                text(Calendar.ALL_DAY_EVENT, "0"),
+                text(Calendar.ORGANIZER_EMAIL, markers[2]),
+                text(Calendar.ORGANIZER_NAME, markers[3]),
+                element(
+                    Calendar.ATTENDEES,
+                    element(
+                        Calendar.ATTENDEE,
+                        text(Calendar.EMAIL, markers[4]),
+                        text(Calendar.NAME, markers[5]),
+                        text(Calendar.ATTENDEE_STATUS, "99"),
+                        text(Calendar.ATTENDEE_TYPE, "1"),
+                    ),
+                ),
+            )
+
+        val failure =
+            assertThrows(ActiveSyncProtocolDataException::class.java) {
+                ActiveSyncCalendarApplicationParser.parse(
+                    RawCalendarCommand(RawCalendarCommandKind.ADD, "people-failure", data),
+                    PROFILE_EMAIL,
+                )
+            }
+        val snapshot = checkNotNull(failure.calendarFailureSnapshot)
+
+        assertEquals(ActiveSyncValidationReason.INVALID_ATTENDEE, failure.reason)
+        assertEquals(DiagnosticCalendarRule.INVALID_ATTENDEE, snapshot.rule)
+        assertEquals(DiagnosticCalendarField.ATTENDEE_STATUS, snapshot.failedField)
+        assertEquals(0, snapshot.attendeeIndex)
+        listOf(
+            DiagnosticCalendarField.SUBJECT,
+            DiagnosticCalendarField.BODY,
+            DiagnosticCalendarField.ORGANIZER_EMAIL,
+            DiagnosticCalendarField.ORGANIZER_NAME,
+            DiagnosticCalendarField.ATTENDEES,
+        ).forEach { field ->
+            val entry = snapshot.field(DiagnosticCalendarFieldSource.RESPONSE, field)
+            assertEquals(DiagnosticFieldState.PRESENT, entry.state, field.name)
+            assertNull(entry.value, field.name)
+        }
+        assertEquals(
+            DiagnosticFieldValue.Count(1),
+            snapshot.field(DiagnosticCalendarFieldSource.RESPONSE, DiagnosticCalendarField.ATTENDEE_COUNT).value,
+        )
+        listOf(
+            DiagnosticCalendarField.ATTENDEE_EMAIL,
+            DiagnosticCalendarField.ATTENDEE_NAME,
+            DiagnosticCalendarField.ATTENDEE_STATUS,
+            DiagnosticCalendarField.ATTENDEE_TYPE,
+        ).forEach { field ->
+            val entry = snapshot.field(DiagnosticCalendarFieldSource.RESPONSE, field)
+            assertEquals(DiagnosticFieldState.PRESENT, entry.state, field.name)
+            assertNull(entry.value, field.name)
+        }
+        assertEquals(
+            DiagnosticFieldValue.Count(0),
+            snapshot.field(
+                DiagnosticCalendarFieldSource.DERIVED,
+                DiagnosticCalendarField.CURRENT_USER_ATTENDEE_COUNT,
+            ).value,
+        )
+        val retainedThrowableGraph = throwableGraphText(failure)
+        markers.forEach { marker -> assertFalse(retainedThrowableGraph.contains(marker), marker) }
+    }
+
+    @Test
+    fun `ambiguous current-user response retains only its typed rule and matching count`() {
+        val attendees =
+            List(2) { index ->
+                element(
+                    Calendar.ATTENDEE,
+                    text(Calendar.EMAIL, PROFILE_EMAIL),
+                    text(Calendar.NAME, "current-user-name-secret-marker-$index"),
+                    text(Calendar.ATTENDEE_STATUS, "3"),
+                    text(Calendar.ATTENDEE_TYPE, "1"),
+                )
+            }
+        val data =
+            element(
+                AirSync.APPLICATION_DATA,
+                *ordinaryChildren(subject = "response-title-secret-marker").toTypedArray(),
+                text(Calendar.MEETING_STATUS, "3"),
+                element(Calendar.ATTENDEES, *attendees.toTypedArray()),
+            )
+
+        val failure =
+            assertThrows(ActiveSyncProtocolDataException::class.java) {
+                ActiveSyncCalendarApplicationParser.parse(
+                    RawCalendarCommand(RawCalendarCommandKind.ADD, "ambiguous-current-user", data),
+                    PROFILE_EMAIL,
+                )
+            }
+        val snapshot = checkNotNull(failure.calendarFailureSnapshot)
+
+        assertEquals(ActiveSyncValidationReason.INVALID_MEETING_RESPONSE, failure.reason)
+        assertEquals(DiagnosticCalendarRule.INVALID_MEETING_RESPONSE, snapshot.rule)
+        assertEquals(DiagnosticCalendarField.RESPONSE_TYPE, snapshot.failedField)
+        assertEquals(
+            DiagnosticFieldValue.Count(2),
+            snapshot.field(
+                DiagnosticCalendarFieldSource.DERIVED,
+                DiagnosticCalendarField.CURRENT_USER_ATTENDEE_COUNT,
+            ).value,
+        )
+        assertFalse(throwableGraphText(failure).contains("current-user-name-secret-marker"))
+        assertFalse(throwableGraphText(failure).contains("response-title-secret-marker"))
+    }
+
+    @Test
+    fun `malformed timezone retains its typed rule and raw field identity`() {
+        val data =
+            element(
+                AirSync.APPLICATION_DATA,
+                *ordinaryChildren(subject = "timezone-title-secret-marker").toTypedArray(),
+                text(Calendar.TIMEZONE, "invalid-timezone-marker"),
+            )
+
+        val failure =
+            assertThrows(ActiveSyncProtocolDataException::class.java) {
+                ActiveSyncCalendarApplicationParser.parse(
+                    RawCalendarCommand(RawCalendarCommandKind.ADD, "invalid-timezone", data),
+                    PROFILE_EMAIL,
+                )
+            }
+        val snapshot = checkNotNull(failure.calendarFailureSnapshot)
+
+        assertEquals(ActiveSyncValidationReason.INVALID_TIME_ZONE, failure.reason)
+        assertEquals(DiagnosticCalendarRule.INVALID_TIME_ZONE, snapshot.rule)
+        assertEquals(DiagnosticCalendarField.TIME_ZONE_RAW, snapshot.failedField)
+        assertEquals(
+            DiagnosticFieldValue.Text("invalid-timezone-marker"),
+            snapshot.field(DiagnosticCalendarFieldSource.RESPONSE, DiagnosticCalendarField.TIME_ZONE_RAW).value,
+        )
+    }
+
+    @Test
+    fun `all-day and response value failures retain tag-specific rules`() {
+        val base = ordinaryChildren(subject = "typed-rule")
+        val invalidAllDay =
+            element(
+                AirSync.APPLICATION_DATA,
+                *(base.filterNot { child -> child.tag == Calendar.ALL_DAY_EVENT } +
+                    text(Calendar.ALL_DAY_EVENT, "not-a-boolean")).toTypedArray(),
+            )
+        val invalidResponse =
+            element(
+                AirSync.APPLICATION_DATA,
+                *base.toTypedArray(),
+                text(Calendar.MEETING_STATUS, "3"),
+                text(Calendar.RESPONSE_TYPE, "99"),
+            )
+
+        val allDayFailure =
+            assertThrows(ActiveSyncProtocolDataException::class.java) {
+                ActiveSyncCalendarApplicationParser.parse(
+                    RawCalendarCommand(RawCalendarCommandKind.ADD, "invalid-all-day", invalidAllDay),
+                    PROFILE_EMAIL,
+                )
+            }
+        val responseFailure =
+            assertThrows(ActiveSyncProtocolDataException::class.java) {
+                ActiveSyncCalendarApplicationParser.parse(
+                    RawCalendarCommand(RawCalendarCommandKind.ADD, "invalid-response", invalidResponse),
+                    PROFILE_EMAIL,
+                )
+            }
+
+        assertEquals(ActiveSyncValidationReason.INVALID_ALL_DAY, allDayFailure.reason)
+        assertEquals(DiagnosticCalendarField.ALL_DAY, allDayFailure.calendarFailureSnapshot?.failedField)
+        assertEquals(ActiveSyncValidationReason.INVALID_MEETING_RESPONSE, responseFailure.reason)
+        assertEquals(DiagnosticCalendarField.RESPONSE_TYPE, responseFailure.calendarFailureSnapshot?.failedField)
+    }
+
+    @Test
     fun `non-Gregorian recurrence calendar system is rejected instead of shifted`() {
         val data =
             recurrenceData(
@@ -637,12 +966,18 @@ class ActiveSyncCalendarApplicationParserTest {
                 text(Calendar.IS_LEAP_MONTH, "1"),
             )
 
-        assertThrows(ActiveSyncProtocolDataException::class.java) {
-            ActiveSyncCalendarApplicationParser.parse(
-                RawCalendarCommand(RawCalendarCommandKind.ADD, "hebrew-recurrence", data),
-                PROFILE_EMAIL,
-            )
-        }
+        val failure =
+            assertThrows(ActiveSyncProtocolDataException::class.java) {
+                ActiveSyncCalendarApplicationParser.parse(
+                    RawCalendarCommand(RawCalendarCommandKind.ADD, "hebrew-recurrence", data),
+                    PROFILE_EMAIL,
+                )
+            }
+
+        assertEquals(ActiveSyncValidationReason.INVALID_RECURRENCE, failure.reason)
+        val snapshot = checkNotNull(failure.calendarFailureSnapshot)
+        assertEquals(DiagnosticCalendarRule.INVALID_RECURRENCE, snapshot.rule)
+        assertEquals(DiagnosticCalendarField.RECURRENCE_CALENDAR_TYPE, snapshot.failedField)
     }
 
     @Test
@@ -759,6 +1094,25 @@ class ActiveSyncCalendarApplicationParserTest {
             element(Calendar.RECURRENCE, *recurrenceChildren),
         )
 
+    private fun exceptionFailure(
+        version: ActiveSyncVersion,
+        exception: WbxmlElement,
+    ): ActiveSyncProtocolDataException =
+        assertThrows(ActiveSyncProtocolDataException::class.java) {
+            ActiveSyncCalendarApplicationParser.parse(
+                RawCalendarCommand(
+                    RawCalendarCommandKind.CHANGE,
+                    "exception-field-context",
+                    element(
+                        AirSync.APPLICATION_DATA,
+                        element(Calendar.EXCEPTIONS, exception),
+                    ),
+                ),
+                PROFILE_EMAIL,
+                version,
+            )
+        }
+
     private fun ordinaryChildren(subject: String): List<WbxmlElement> =
         listOf(
             text(Calendar.SUBJECT, subject),
@@ -768,6 +1122,23 @@ class ActiveSyncCalendarApplicationParserTest {
         )
 
     private fun element(tag: WbxmlTag, vararg children: WbxmlElement) = WbxmlElement(tag, children = children.toList())
+
+    private fun net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarFailureSnapshot.field(
+        source: DiagnosticCalendarFieldSource,
+        field: DiagnosticCalendarField,
+    ) = fields.single { entry -> entry.source == source && entry.field == field }
+
+    private fun throwableGraphText(root: Throwable): String =
+        generateSequence(root) { throwable -> throwable.cause }
+            .joinToString("|") { throwable ->
+                buildString {
+                    append(throwable.javaClass.name)
+                    append(':').append(throwable.message)
+                    if (throwable is ActiveSyncProtocolDataException) {
+                        append(':').append(throwable.calendarFailureSnapshot)
+                    }
+                }
+            }
 
     private fun text(tag: WbxmlTag, value: String) = WbxmlElement(tag, text = value)
 

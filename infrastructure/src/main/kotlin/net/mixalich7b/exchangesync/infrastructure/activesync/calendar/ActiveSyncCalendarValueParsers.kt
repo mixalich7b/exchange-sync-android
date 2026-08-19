@@ -25,9 +25,32 @@ import net.mixalich7b.exchangesync.core.calendar.ActiveSyncResponseType
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncSensitivity
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncSystemTime
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncTimeZone
+import net.mixalich7b.exchangesync.infrastructure.activesync.ActiveSyncValidationReason
+import net.mixalich7b.exchangesync.infrastructure.diagnostics.DiagnosticCalendarField
 
-internal class ActiveSyncCalendarValueException(message: String, cause: Throwable? = null) :
-    IllegalArgumentException(message, cause)
+internal class ActiveSyncCalendarValueException(
+    message: String,
+    cause: Throwable? = null,
+    val reason: ActiveSyncValidationReason = ActiveSyncValidationReason.INVALID_VALUE,
+    val field: DiagnosticCalendarField? = null,
+    val attendeeIndex: Int? = null,
+    val currentUserAttendeeCount: Int? = null,
+) : IllegalArgumentException(message, cause) {
+    fun withContext(
+        reason: ActiveSyncValidationReason = this.reason,
+        field: DiagnosticCalendarField? = this.field,
+        attendeeIndex: Int? = this.attendeeIndex,
+        currentUserAttendeeCount: Int? = this.currentUserAttendeeCount,
+    ): ActiveSyncCalendarValueException =
+        ActiveSyncCalendarValueException(
+            message = message.orEmpty(),
+            cause = this,
+            reason = reason,
+            field = field,
+            attendeeIndex = attendeeIndex,
+            currentUserAttendeeCount = currentUserAttendeeCount,
+        )
+}
 
 internal data class ActiveSyncAllDayRange(
     val start: LocalDate,
@@ -60,7 +83,10 @@ internal object ActiveSyncCalendarValueParsers {
             endInstant.atOffset(ZoneOffset.UTC).toLocalTime() != java.time.LocalTime.MIDNIGHT ||
             !endInstant.isAfter(startInstant)
         ) {
-            throw ActiveSyncCalendarValueException("Invalid all-day boundaries")
+            throw ActiveSyncCalendarValueException(
+                message = "Invalid all-day boundaries",
+                reason = ActiveSyncValidationReason.INVALID_ALL_DAY,
+            )
         }
         return ActiveSyncAllDayRange(
             start = startInstant.atOffset(ZoneOffset.UTC).toLocalDate(),
@@ -86,7 +112,11 @@ internal object ActiveSyncCalendarValueParsers {
     fun parseMeetingStatus(value: String): ActiveSyncMeetingStatus {
         val raw = value.parseInteger("meeting status")
         if (raw != 0 && (raw !in 1..15 || raw and MEETING_BIT == 0)) {
-            throw ActiveSyncCalendarValueException("Invalid meeting status")
+            throw ActiveSyncCalendarValueException(
+                message = "Invalid meeting status",
+                reason = ActiveSyncValidationReason.INVALID_MEETING_RESPONSE,
+                field = DiagnosticCalendarField.MEETING_STATUS_RAW,
+            )
         }
         return ActiveSyncMeetingStatus(
             rawValue = raw,
@@ -104,7 +134,12 @@ internal object ActiveSyncCalendarValueParsers {
         when (value) {
             "0" -> false
             "1" -> true
-            else -> throw ActiveSyncCalendarValueException("Invalid response-requested value")
+            else ->
+                throw ActiveSyncCalendarValueException(
+                    message = "Invalid response-requested value",
+                    reason = ActiveSyncValidationReason.INVALID_MEETING_RESPONSE,
+                    field = DiagnosticCalendarField.RESPONSE_REQUESTED,
+                )
         }
 
     fun parseAvailability(value: String): ActiveSyncAvailability =
@@ -143,13 +178,37 @@ internal object ActiveSyncCalendarValueParsers {
         statusParser: (String) -> ActiveSyncAttendeeStatus?,
     ): ActiveSyncAttendee {
         val parsedEmail = email?.takeIf(String::isNotBlank)
-            ?: throw ActiveSyncCalendarValueException("Attendee email is missing")
+            ?: throw ActiveSyncCalendarValueException(
+                message = "Attendee email is missing",
+                reason = ActiveSyncValidationReason.INVALID_ATTENDEE,
+                field = DiagnosticCalendarField.ATTENDEE_EMAIL,
+            )
         val parsedName = name?.takeIf(String::isNotBlank)
-            ?: throw ActiveSyncCalendarValueException("Attendee name is missing")
-        val parsedStatus = status?.let(statusParser)
-        val parsedType = type?.let { raw ->
-            enumByWireValue(raw, "attendee type", ActiveSyncAttendeeType.entries) { it.wireValue }
-        }
+            ?: throw ActiveSyncCalendarValueException(
+                message = "Attendee name is missing",
+                reason = ActiveSyncValidationReason.INVALID_ATTENDEE,
+                field = DiagnosticCalendarField.ATTENDEE_NAME,
+            )
+        val parsedStatus =
+            try {
+                status?.let(statusParser)
+            } catch (error: ActiveSyncCalendarValueException) {
+                throw error.withContext(
+                    reason = ActiveSyncValidationReason.INVALID_ATTENDEE,
+                    field = DiagnosticCalendarField.ATTENDEE_STATUS,
+                )
+            }
+        val parsedType =
+            try {
+                type?.let { raw ->
+                    enumByWireValue(raw, "attendee type", ActiveSyncAttendeeType.entries) { it.wireValue }
+                }
+            } catch (error: ActiveSyncCalendarValueException) {
+                throw error.withContext(
+                    reason = ActiveSyncValidationReason.INVALID_ATTENDEE,
+                    field = DiagnosticCalendarField.ATTENDEE_TYPE,
+                )
+            }
         return ActiveSyncAttendee(parsedEmail, parsedName, parsedStatus, parsedType)
     }
 
@@ -208,12 +267,43 @@ internal object ActiveSyncRecurrenceParser {
     fun parse(raw: RawActiveSyncRecurrence): ActiveSyncRecurrence {
         validateCalendarSystem(raw)
         val type = parseType(raw.type)
-        val interval = raw.interval?.positiveInteger("recurrence interval") ?: 1
-        val dayOfWeek = raw.dayOfWeek?.boundedInteger("day-of-week mask", 1, 127)
-        val dayOfMonth = raw.dayOfMonth?.boundedInteger("day of month", 1, 31)
-        val weekOfMonth = raw.weekOfMonth?.boundedInteger("week of month", 1, 5)
-        val monthOfYear = raw.monthOfYear?.boundedInteger("month of year", 1, 12)
-        val firstDayOfWeek = raw.firstDayOfWeek?.boundedInteger("first day of week", 0, 6)
+        val interval =
+            raw.interval?.positiveInteger("recurrence interval", DiagnosticCalendarField.RECURRENCE_INTERVAL) ?: 1
+        val dayOfWeek =
+            raw.dayOfWeek?.boundedInteger(
+                "day-of-week mask",
+                1,
+                127,
+                DiagnosticCalendarField.RECURRENCE_DAY_OF_WEEK_MASK,
+            )
+        val dayOfMonth =
+            raw.dayOfMonth?.boundedInteger(
+                "day of month",
+                1,
+                31,
+                DiagnosticCalendarField.RECURRENCE_DAY_OF_MONTH,
+            )
+        val weekOfMonth =
+            raw.weekOfMonth?.boundedInteger(
+                "week of month",
+                1,
+                5,
+                DiagnosticCalendarField.RECURRENCE_WEEK_OF_MONTH,
+            )
+        val monthOfYear =
+            raw.monthOfYear?.boundedInteger(
+                "month of year",
+                1,
+                12,
+                DiagnosticCalendarField.RECURRENCE_MONTH_OF_YEAR,
+            )
+        val firstDayOfWeek =
+            raw.firstDayOfWeek?.boundedInteger(
+                "first day of week",
+                0,
+                6,
+                DiagnosticCalendarField.RECURRENCE_FIRST_DAY_OF_WEEK,
+            )
         validateRequiredPattern(type, dayOfWeek, dayOfMonth, weekOfMonth, monthOfYear)
         return ActiveSyncRecurrence(
             type = type,
@@ -228,17 +318,33 @@ internal object ActiveSyncRecurrenceParser {
     }
 
     private fun parseType(value: String?): ActiveSyncRecurrenceType {
-        val parsed = value?.toIntOrNull() ?: throw ActiveSyncCalendarValueException("Recurrence type is missing")
+        val parsed =
+            value?.toIntOrNull()
+                ?: throw recurrenceFailure("Recurrence type is missing", DiagnosticCalendarField.RECURRENCE_TYPE)
         return ActiveSyncRecurrenceType.entries.firstOrNull { type -> type.wireValue == parsed }
-            ?: throw ActiveSyncCalendarValueException("Unsupported recurrence type")
+            ?: throw recurrenceFailure("Unsupported recurrence type", DiagnosticCalendarField.RECURRENCE_TYPE)
     }
 
     private fun validateCalendarSystem(raw: RawActiveSyncRecurrence) {
-        val calendarType = raw.calendarType?.boundedInteger("calendar type", 0, 255) ?: DEFAULT_CALENDAR_TYPE
+        val calendarType =
+            raw.calendarType?.boundedInteger(
+                "calendar type",
+                0,
+                255,
+                DiagnosticCalendarField.RECURRENCE_CALENDAR_TYPE,
+            ) ?: DEFAULT_CALENDAR_TYPE
         if (calendarType !in GREGORIAN_CALENDAR_TYPES) {
-            throw ActiveSyncCalendarValueException("Unsupported recurrence calendar system")
+            throw recurrenceFailure(
+                "Unsupported recurrence calendar system",
+                DiagnosticCalendarField.RECURRENCE_CALENDAR_TYPE,
+            )
         }
-        raw.isLeapMonth?.boundedInteger("recurrence leap-month flag", 0, 1)
+        raw.isLeapMonth?.boundedInteger(
+            "recurrence leap-month flag",
+            0,
+            1,
+            DiagnosticCalendarField.RECURRENCE_IS_LEAP_MONTH,
+        )
     }
 
     private fun validateRequiredPattern(
@@ -258,27 +364,64 @@ internal object ActiveSyncRecurrenceParser {
                 ActiveSyncRecurrenceType.YEARLY_NTH ->
                     dayOfWeek != null && weekOfMonth != null && monthOfYear != null
             }
-        if (!valid) throw ActiveSyncCalendarValueException("Required recurrence fields are missing")
+        if (!valid) {
+            throw ActiveSyncCalendarValueException(
+                message = "Required recurrence fields are missing",
+                reason = ActiveSyncValidationReason.INVALID_RECURRENCE,
+            )
+        }
     }
 
     private fun parseEnd(raw: RawActiveSyncRecurrence): ActiveSyncRecurrenceEnd {
         if (raw.occurrences != null && raw.until != null) {
-            throw ActiveSyncCalendarValueException("Recurrence has conflicting end rules")
+            throw ActiveSyncCalendarValueException(
+                message = "Recurrence has conflicting end rules",
+                reason = ActiveSyncValidationReason.INVALID_RECURRENCE,
+            )
         }
         return when {
-            raw.occurrences != null -> ActiveSyncRecurrenceEnd.Count(raw.occurrences.positiveInteger("occurrences"))
-            raw.until != null -> ActiveSyncRecurrenceEnd.Until(ActiveSyncCalendarValueParsers.parseDateTime(raw.until))
+            raw.occurrences != null ->
+                ActiveSyncRecurrenceEnd.Count(
+                    raw.occurrences.positiveInteger("occurrences", DiagnosticCalendarField.RECURRENCE_OCCURRENCES),
+                )
+            raw.until != null ->
+                try {
+                    ActiveSyncRecurrenceEnd.Until(ActiveSyncCalendarValueParsers.parseDateTime(raw.until))
+                } catch (error: ActiveSyncCalendarValueException) {
+                    throw error.withContext(
+                        reason = ActiveSyncValidationReason.INVALID_RECURRENCE,
+                        field = DiagnosticCalendarField.RECURRENCE_UNTIL,
+                    )
+                }
             else -> ActiveSyncRecurrenceEnd.Infinite
         }
     }
 
-    private fun String.positiveInteger(label: String): Int = boundedInteger(label, 1, Int.MAX_VALUE)
+    private fun String.positiveInteger(
+        label: String,
+        field: DiagnosticCalendarField,
+    ): Int = boundedInteger(label, 1, Int.MAX_VALUE, field)
 
-    private fun String.boundedInteger(label: String, minimum: Int, maximum: Int): Int {
-        val parsed = toIntOrNull() ?: throw ActiveSyncCalendarValueException("Invalid $label")
-        if (parsed !in minimum..maximum) throw ActiveSyncCalendarValueException("Invalid $label")
+    private fun String.boundedInteger(
+        label: String,
+        minimum: Int,
+        maximum: Int,
+        field: DiagnosticCalendarField,
+    ): Int {
+        val parsed = toIntOrNull() ?: throw recurrenceFailure("Invalid $label", field)
+        if (parsed !in minimum..maximum) throw recurrenceFailure("Invalid $label", field)
         return parsed
     }
+
+    private fun recurrenceFailure(
+        message: String,
+        field: DiagnosticCalendarField,
+    ): ActiveSyncCalendarValueException =
+        ActiveSyncCalendarValueException(
+            message = message,
+            reason = ActiveSyncValidationReason.INVALID_RECURRENCE,
+            field = field,
+        )
 
     private const val DEFAULT_CALENDAR_TYPE: Int = 0
     private val GREGORIAN_CALENDAR_TYPES: Set<Int> = setOf(0, 1, 2, 9, 10, 11, 12)
@@ -288,10 +431,20 @@ internal object CurrentUserResponseResolver {
     fun resolveRequired(profileEmail: String, attendees: List<ActiveSyncAttendee>): ActiveSyncResponseType {
         val matching = attendees.filter { attendee -> attendee.email.equals(profileEmail, ignoreCase = true) }
         if (matching.size != 1) {
-            throw ActiveSyncCalendarValueException("Current-user attendee response is ambiguous")
+            throw ActiveSyncCalendarValueException(
+                message = "Current-user attendee response is ambiguous",
+                reason = ActiveSyncValidationReason.INVALID_MEETING_RESPONSE,
+                field = DiagnosticCalendarField.RESPONSE_TYPE,
+                currentUserAttendeeCount = matching.size,
+            )
         }
         return matching.single().status?.toResponseType()
-            ?: throw ActiveSyncCalendarValueException("Current-user attendee response is missing")
+            ?: throw ActiveSyncCalendarValueException(
+                message = "Current-user attendee response is missing",
+                reason = ActiveSyncValidationReason.INVALID_MEETING_RESPONSE,
+                field = DiagnosticCalendarField.RESPONSE_TYPE,
+                currentUserAttendeeCount = 1,
+            )
     }
 
     fun resolveOptional(profileEmail: String, attendees: List<ActiveSyncAttendee>): ActiveSyncResponseType? =
@@ -320,9 +473,9 @@ internal object ActiveSyncTimeZoneParser {
             try {
                 Base64.getDecoder().decode(encoded)
             } catch (error: IllegalArgumentException) {
-                throw ActiveSyncCalendarValueException("Invalid ActiveSync time zone encoding", error)
+                throw timeZoneFailure("Invalid ActiveSync time zone encoding", error)
             }
-        if (bytes.size != ENCODED_SIZE) throw ActiveSyncCalendarValueException("Invalid ActiveSync time zone size")
+        if (bytes.size != ENCODED_SIZE) throw timeZoneFailure("Invalid ActiveSync time zone size")
 
         val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
         return ActiveSyncTimeZone(
@@ -351,7 +504,7 @@ internal object ActiveSyncTimeZoneParser {
                 .decode(ByteBuffer.wrap(bytes, 0, length))
                 .toString()
         } catch (error: java.nio.charset.CharacterCodingException) {
-            throw ActiveSyncCalendarValueException("Invalid ActiveSync time zone name", error)
+            throw timeZoneFailure("Invalid ActiveSync time zone name", error)
         }
     }
 
@@ -377,7 +530,18 @@ internal object ActiveSyncTimeZoneParser {
                 value.second in 0..59 &&
                 value.milliseconds in 0..999 &&
                 if (noTransition) value.day == 0 else value.day in 1..5
-        if (!valid) throw ActiveSyncCalendarValueException("Invalid ActiveSync time zone transition")
+        if (!valid) throw timeZoneFailure("Invalid ActiveSync time zone transition")
         return value
     }
+
+    private fun timeZoneFailure(
+        message: String,
+        cause: Throwable? = null,
+    ): ActiveSyncCalendarValueException =
+        ActiveSyncCalendarValueException(
+            message = message,
+            cause = cause,
+            reason = ActiveSyncValidationReason.INVALID_TIME_ZONE,
+            field = DiagnosticCalendarField.TIME_ZONE_RAW,
+        )
 }

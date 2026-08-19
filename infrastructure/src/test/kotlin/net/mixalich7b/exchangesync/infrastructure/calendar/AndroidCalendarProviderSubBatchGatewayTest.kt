@@ -146,6 +146,59 @@ class AndroidCalendarProviderSubBatchGatewayTest {
             }
 
         assertEquals(CalendarProviderFailureCause.REMOTE, failure.failureCause)
+        assertEquals(CalendarProviderDispatchState.UNKNOWN, failure.dispatchState)
+    }
+
+    @Test
+    fun `invalid local reference is classified before provider dispatch`() {
+        var executorCalls = 0
+        val gateway =
+            AndroidCalendarProviderSubBatchGateway(
+                AndroidCalendarProviderBatchExecutor {
+                    executorCalls += 1
+                    results(1)
+                },
+            )
+
+        val failure =
+            assertThrows(CalendarProviderAccessException::class.java) {
+                gateway.apply(
+                    subBatch(
+                        listOf(
+                            CalendarProviderBatchOperation.AttendeeInsert(
+                                CALENDAR_ID,
+                                EventReference.Existing(0),
+                                emptyMap(),
+                            ),
+                        ),
+                    ),
+                )
+            }
+
+        assertEquals(CalendarProviderFailureCause.INVALID_REFERENCE, failure.failureCause)
+        assertEquals(CalendarProviderDispatchState.NOT_DISPATCHED, failure.dispatchState)
+        assertEquals(0, executorCalls)
+    }
+
+    @Test
+    fun `every Android operation construction failure is classified before dispatch`() {
+        val fixtures =
+            listOf(
+                IllegalArgumentException("invalid builder input") to CalendarProviderFailureCause.INVALID_ARGUMENT,
+                SecurityException("builder access denied") to CalendarProviderFailureCause.SECURITY,
+                IllegalStateException("builder runtime failure") to CalendarProviderFailureCause.UNEXPECTED,
+            )
+
+        fixtures.forEach { (source, expectedCause) ->
+            val failure =
+                assertThrows(CalendarProviderAccessException::class.java) {
+                    beforeCalendarProviderDispatch<Unit> { throw source }
+                }
+
+            assertEquals(expectedCause, failure.failureCause, source.javaClass.simpleName)
+            assertEquals(CalendarProviderDispatchState.NOT_DISPATCHED, failure.dispatchState)
+            assertEquals(source, failure.cause)
+        }
     }
 
     private fun subBatch(

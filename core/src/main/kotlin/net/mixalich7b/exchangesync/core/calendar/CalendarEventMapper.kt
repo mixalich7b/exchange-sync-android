@@ -5,7 +5,35 @@ import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import kotlin.math.roundToInt
 
-public class CalendarMappingException(message: String) : IllegalArgumentException(message)
+public enum class CalendarMappingRule {
+    MEETING_RESPONSE_EMPTY,
+    RECEIVED_MEETING_RESPONSE_MISSING,
+    RECEIVED_MEETING_RESPONSE_EMPTY,
+    EVENT_TIME_RANGE_INVALID,
+    EVENT_ALL_DAY_NOT_UTC_ALIGNED,
+    EXCEPTION_TIME_RANGE_INVALID,
+    RECURRENCE_INTERVAL_INVALID,
+    RECURRENCE_COUNT_INVALID,
+    RECURRENCE_WEEKDAYS_MISSING,
+    RECURRENCE_WEEKDAY_MASK_INVALID,
+    RECURRENCE_FIRST_WEEKDAY_INVALID,
+    RECURRENCE_WEEK_POSITION_INVALID,
+    RECURRENCE_DAY_OF_MONTH_INVALID,
+    RECURRENCE_MONTH_OF_YEAR_INVALID,
+}
+
+public sealed interface CalendarMappingPath {
+    public data object Event : CalendarMappingPath
+
+    public data class Exception(public val index: Int) : CalendarMappingPath
+}
+
+public class CalendarMappingException(
+    public val rule: CalendarMappingRule,
+    message: String,
+    public val path: CalendarMappingPath = CalendarMappingPath.Event,
+    cause: Throwable? = null,
+) : IllegalArgumentException(message, cause)
 
 public enum class ProviderEventStatus {
     TENTATIVE,
@@ -168,14 +196,25 @@ public object CalendarEventMapper {
         val mappedExceptions =
             if (item.exceptions != ActiveSyncField.Absent) {
                 item.exceptions.mapValues { exceptions ->
-                    exceptions.map { exception ->
-                        mapException(effectiveItem, exception, ownedCalendarColor, previous)
+                    exceptions.mapIndexed { index, exception ->
+                        mapException(
+                            effectiveItem,
+                            exception,
+                            ownedCalendarColor,
+                            previous,
+                            CalendarMappingPath.Exception(index),
+                        )
                     }
                 }
             } else if (item.responseType != ActiveSyncField.Absent) {
                 previous?.exceptions?.mapValues { exceptions ->
-                    exceptions.map { exception ->
-                        refreshInheritedExceptionResponse(effectiveItem, exception, ownedCalendarColor)
+                    exceptions.mapIndexed { index, exception ->
+                        refreshInheritedExceptionResponse(
+                            effectiveItem,
+                            exception,
+                            ownedCalendarColor,
+                            CalendarMappingPath.Exception(index),
+                        )
                     }
                 } ?: ActiveSyncField.Absent
             } else {
@@ -217,6 +256,7 @@ public object CalendarEventMapper {
         series: ActiveSyncCalendarItem,
         exception: ProviderCalendarException,
         ownedCalendarColor: Int,
+        path: CalendarMappingPath,
     ): ProviderCalendarException {
         if (exception.responseTypeOverride != ActiveSyncField.Absent) return exception
         val presentation =
@@ -229,6 +269,7 @@ public object CalendarEventMapper {
                 ),
                 isAddition = true,
                 ownedCalendarColor = ownedCalendarColor,
+                path = path,
             )
         return exception.copy(
             responseType = series.responseType,
@@ -244,6 +285,7 @@ public object CalendarEventMapper {
         exception: ActiveSyncCalendarException,
         ownedCalendarColor: Int,
         previous: ProviderEvent?,
+        path: CalendarMappingPath,
     ): ProviderCalendarException {
         val previousException =
             (previous?.exceptions as? ActiveSyncField.Value)
@@ -270,7 +312,7 @@ public object CalendarEventMapper {
                 responseType = response,
                 availability = availability,
             )
-        val presentation = presentation(exceptionItem, isAddition = true, ownedCalendarColor)
+        val presentation = presentation(exceptionItem, isAddition = true, ownedCalendarColor, path)
         return ProviderCalendarException(
             originalInstance = exception.instanceStart,
             deleted = exception.deleted,
@@ -304,19 +346,25 @@ public object CalendarEventMapper {
             selfStatus = presentation.selfStatus,
             eventColor = presentation.eventColor,
             responseTypeOverride = responseOverride,
-        ).also(ProviderCalendarException::validateTimeConsistency)
+        ).also { mappedException -> mappedException.validateTimeConsistency(path) }
     }
 
     private fun presentation(
         item: ActiveSyncCalendarItem,
         isAddition: Boolean,
         ownedCalendarColor: Int,
+        path: CalendarMappingPath = CalendarMappingPath.Event,
     ): Presentation {
         val meeting = (item.meetingStatus as? ActiveSyncField.Value)?.value
         if (meeting == null) {
             when (val response = item.responseType) {
                 is ActiveSyncField.Value -> return response.value.toPresentation(item.availability, ownedCalendarColor)
-                ActiveSyncField.Empty -> throw CalendarMappingException("Meeting response is empty")
+                ActiveSyncField.Empty ->
+                    throw CalendarMappingException(
+                        CalendarMappingRule.MEETING_RESPONSE_EMPTY,
+                        "Meeting response is empty",
+                        path,
+                    )
                 ActiveSyncField.Absent -> Unit
             }
             return if (isAddition) {
@@ -363,10 +411,21 @@ public object CalendarEventMapper {
             when (val field = item.responseType) {
                 is ActiveSyncField.Value -> field.value
                 ActiveSyncField.Absent -> {
-                    if (isAddition) throw CalendarMappingException("Received meeting response is missing")
+                    if (isAddition) {
+                        throw CalendarMappingException(
+                            CalendarMappingRule.RECEIVED_MEETING_RESPONSE_MISSING,
+                            "Received meeting response is missing",
+                            path,
+                        )
+                    }
                     return Presentation.absent()
                 }
-                ActiveSyncField.Empty -> throw CalendarMappingException("Received meeting response is empty")
+                ActiveSyncField.Empty ->
+                    throw CalendarMappingException(
+                        CalendarMappingRule.RECEIVED_MEETING_RESPONSE_EMPTY,
+                        "Received meeting response is empty",
+                        path,
+                    )
             }
         return response.toPresentation(item.availability, ownedCalendarColor)
     }
@@ -475,23 +534,33 @@ private fun ProviderEvent.validateTimeConsistency() {
     val effectiveStart = (start as? ActiveSyncField.Value)?.value ?: return
     val effectiveEnd = (end as? ActiveSyncField.Value)?.value ?: return
     if (!effectiveEnd.isAfter(effectiveStart)) {
-        throw CalendarMappingException("Calendar event time range is invalid")
+        throw CalendarMappingException(
+            CalendarMappingRule.EVENT_TIME_RANGE_INVALID,
+            "Calendar event time range is invalid",
+        )
     }
     if ((allDay as? ActiveSyncField.Value)?.value == true) {
         val startTime = effectiveStart.atOffset(ZoneOffset.UTC).toLocalTime()
         val endTime = effectiveEnd.atOffset(ZoneOffset.UTC).toLocalTime()
         if (startTime != java.time.LocalTime.MIDNIGHT || endTime != java.time.LocalTime.MIDNIGHT) {
-            throw CalendarMappingException("All-day calendar event is not aligned to UTC dates")
+            throw CalendarMappingException(
+                CalendarMappingRule.EVENT_ALL_DAY_NOT_UTC_ALIGNED,
+                "All-day calendar event is not aligned to UTC dates",
+            )
         }
     }
 }
 
-private fun ProviderCalendarException.validateTimeConsistency() {
+private fun ProviderCalendarException.validateTimeConsistency(path: CalendarMappingPath) {
     if (deleted) return
     val explicitEnd = (end as? ActiveSyncField.Value)?.value ?: return
     val effectiveStart = (start as? ActiveSyncField.Value)?.value ?: originalInstance
     if (!explicitEnd.isAfter(effectiveStart)) {
-        throw CalendarMappingException("Calendar exception time range is invalid")
+        throw CalendarMappingException(
+            CalendarMappingRule.EXCEPTION_TIME_RANGE_INVALID,
+            "Calendar exception time range is invalid",
+            path,
+        )
     }
 }
 
@@ -499,7 +568,12 @@ private fun <T> ActiveSyncField<T>?.mergeCurrent(current: ActiveSyncField<T>): A
     if (current == ActiveSyncField.Absent) this ?: ActiveSyncField.Absent else current
 
 private fun ActiveSyncRecurrence.toRecurrenceRule(): String {
-    if (interval <= 0) throw CalendarMappingException("Recurrence interval is invalid")
+    if (interval <= 0) {
+        throw CalendarMappingException(
+            CalendarMappingRule.RECURRENCE_INTERVAL_INVALID,
+            "Recurrence interval is invalid",
+        )
+    }
     val dailyWeekPattern = type == ActiveSyncRecurrenceType.DAILY && dayOfWeekMask != null
     val frequency = if (dailyWeekPattern) "WEEKLY" else type.frequency
     val values = mutableListOf("FREQ=$frequency", "INTERVAL=$interval")
@@ -514,17 +588,38 @@ private fun ActiveSyncRecurrence.toRecurrenceRule(): String {
             values += "BYDAY=${dayOfWeekMask.requiredDays()}"
             firstDayOfWeek?.let { firstDay -> values += "WKST=${firstDay.toWeekday()}" }
         }
-        ActiveSyncRecurrenceType.MONTHLY -> values += "BYMONTHDAY=${dayOfMonth.requiredIn(1..31, "day of month")}" 
+        ActiveSyncRecurrenceType.MONTHLY ->
+            values +=
+                "BYMONTHDAY=${dayOfMonth.requiredIn(
+                    1..31,
+                    "day of month",
+                    CalendarMappingRule.RECURRENCE_DAY_OF_MONTH_INVALID,
+                )}"
         ActiveSyncRecurrenceType.MONTHLY_NTH -> {
             values += "BYDAY=${dayOfWeekMask.requiredDays()}"
             values += "BYSETPOS=${weekOfMonth.requiredWeekPosition()}"
         }
         ActiveSyncRecurrenceType.YEARLY -> {
-            values += "BYMONTH=${monthOfYear.requiredIn(1..12, "month of year")}" 
-            values += "BYMONTHDAY=${dayOfMonth.requiredIn(1..31, "day of month")}" 
+            values +=
+                "BYMONTH=${monthOfYear.requiredIn(
+                    1..12,
+                    "month of year",
+                    CalendarMappingRule.RECURRENCE_MONTH_OF_YEAR_INVALID,
+                )}"
+            values +=
+                "BYMONTHDAY=${dayOfMonth.requiredIn(
+                    1..31,
+                    "day of month",
+                    CalendarMappingRule.RECURRENCE_DAY_OF_MONTH_INVALID,
+                )}"
         }
         ActiveSyncRecurrenceType.YEARLY_NTH -> {
-            values += "BYMONTH=${monthOfYear.requiredIn(1..12, "month of year")}" 
+            values +=
+                "BYMONTH=${monthOfYear.requiredIn(
+                    1..12,
+                    "month of year",
+                    CalendarMappingRule.RECURRENCE_MONTH_OF_YEAR_INVALID,
+                )}"
             values += "BYDAY=${dayOfWeekMask.requiredDays()}"
             values += "BYSETPOS=${weekOfMonth.requiredWeekPosition()}"
         }
@@ -532,7 +627,12 @@ private fun ActiveSyncRecurrence.toRecurrenceRule(): String {
     when (val recurrenceEnd = end) {
         ActiveSyncRecurrenceEnd.Infinite -> Unit
         is ActiveSyncRecurrenceEnd.Count -> {
-            if (recurrenceEnd.occurrences <= 0) throw CalendarMappingException("Recurrence count is invalid")
+            if (recurrenceEnd.occurrences <= 0) {
+                throw CalendarMappingException(
+                    CalendarMappingRule.RECURRENCE_COUNT_INVALID,
+                    "Recurrence count is invalid",
+                )
+            }
             values += "COUNT=${recurrenceEnd.occurrences}"
         }
         is ActiveSyncRecurrenceEnd.Until ->
@@ -555,23 +655,46 @@ private val ActiveSyncRecurrenceType.frequency: String
         }
 
 private fun Int?.requiredDays(): String {
-    val mask = this ?: throw CalendarMappingException("Recurrence weekdays are missing")
-    if (mask !in 1..127) throw CalendarMappingException("Recurrence weekday mask is invalid")
+    val mask =
+        this ?: throw CalendarMappingException(
+            CalendarMappingRule.RECURRENCE_WEEKDAYS_MISSING,
+            "Recurrence weekdays are missing",
+        )
+    if (mask !in 1..127) {
+        throw CalendarMappingException(
+            CalendarMappingRule.RECURRENCE_WEEKDAY_MASK_INVALID,
+            "Recurrence weekday mask is invalid",
+        )
+    }
     return WEEKDAYS.filter { (bit, _) -> mask and bit != 0 }.joinToString(",") { (_, name) -> name }
 }
 
 private fun Int.toWeekday(): String =
-    WEEKDAYS.getOrNull(this)?.second ?: throw CalendarMappingException("First recurrence weekday is invalid")
+    WEEKDAYS.getOrNull(this)?.second ?: throw CalendarMappingException(
+        CalendarMappingRule.RECURRENCE_FIRST_WEEKDAY_INVALID,
+        "First recurrence weekday is invalid",
+    )
 
 private fun Int?.requiredWeekPosition(): Int =
     when (this) {
         in 1..4 -> checkNotNull(this)
         5 -> -1
-        else -> throw CalendarMappingException("Recurrence week position is invalid")
+        else ->
+            throw CalendarMappingException(
+                CalendarMappingRule.RECURRENCE_WEEK_POSITION_INVALID,
+                "Recurrence week position is invalid",
+            )
     }
 
-private fun Int?.requiredIn(range: IntRange, label: String): Int =
-    this?.takeIf { value -> value in range } ?: throw CalendarMappingException("Recurrence $label is invalid")
+private fun Int?.requiredIn(
+    range: IntRange,
+    label: String,
+    rule: CalendarMappingRule,
+): Int =
+    this?.takeIf { value -> value in range } ?: throw CalendarMappingException(
+        rule,
+        "Recurrence $label is invalid",
+    )
 
 private fun <T> ActiveSyncField<T>.mergeException(exception: ActiveSyncField<T>): ActiveSyncField<T> =
     if (exception == ActiveSyncField.Absent) this else exception

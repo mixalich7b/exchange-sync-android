@@ -34,6 +34,8 @@ An exhaustive projector will classify every current ActiveSync and Calendar Prov
 
 Attendee and organizer operations will expose operation structure, indexes, reference kind, column names, and bounded counts but no submitted values. Unknown provider value types will be represented by a stable type marker, never arbitrary `toString()` output. New calendar/provider fields will require an explicit policy branch before they can be logged.
 
+An unrecognized provider column will default to one anonymous structural-only entry without retaining its wire name or value. An independently derived completeness test will compare every current `CalendarProviderField` constant with the explicit diagnostic policy, so a newly introduced internal field still requires review instead of silently remaining on the fallback.
+
 This is preferred to a generic map plus a deny-list because a newly added field could otherwise become loggable without privacy review. Reusing exception messages was rejected because messages are unstable, incomplete, and can contain payload data.
 
 ### 2. Carry stable validation rules and the nearest safe context
@@ -41,6 +43,8 @@ This is preferred to a generic map plus a deny-list because a newly added field 
 Core calendar validation will replace message-only `CalendarMappingException` construction with a stable typed rule while retaining a developer-readable message and cause behavior. This keeps the rule beside the domain policy that detects it without introducing an infrastructure dependency into `:core`.
 
 At the ActiveSync application-data boundary, a failed Add or Change will attach a projected safe command snapshot to the protocol-data failure while the raw command tree is still available. The projector will traverse only explicitly classified calendar tags, skip forbidden subtrees, and sanitize/limit individual allowed values. If parsing fails on an allowed scalar, the bounded sanitized source value can be retained; the raw tree itself cannot leave the parser boundary.
+
+Value parsing will propagate its typed validation reason and nearest safe failing field rather than collapsing recurrence, attendee, meeting-response, timezone, or all-day failures into a generic value error. Attendee failures may retain the affected collection index, structural presence of the selected attendee subfields, and a bounded current-user match count, but never any attendee value.
 
 At calendar mapping/planning, the failure context will include the incoming mutation and prior provider snapshot already available to `CalendarPagePlanner`. The projector will label response, prior, and effective values separately and compute diagnostic-only relationships such as `before`, `equal`, `after`, and `not_comparable`. For nested exception validation, the mapper will retain the failed exception index/path so diagnostics describe the affected exception plus bounded collection counts rather than dumping every unrelated exception.
 
@@ -59,11 +63,15 @@ The adapter already retains `activeSubBatch` until a provider call is confirmed.
 
 The platform does not reliably expose the failing `applyBatch` operation index. Diagnostics will therefore label every detail as attempted and the provider-call outcome as unknown, never select one operation as causal. Operations confirmed by previous sub-batches remain represented only by the existing cumulative count.
 
+Failures while validating or constructing the Android provider request before `applyBatch` are not provider-call failures. The gateway will propagate an explicit not-dispatched state; diagnostics will retain the same privacy-filtered plan as `unsubmitted_operation`, use a zero attempted-call count, and omit `provider_call_outcome`. For an actually dispatched call with an unknown outcome, `applied_operation_count` will be omitted and only the separately named cumulative `confirmed_operation_count` will retain earlier successful sub-batches.
+
 Logging only an exception-reported index was rejected because `RemoteException`, OEM runtime failures, and ambiguous Binder termination do not supply one. Logging the entire unfiltered operation map was rejected because event, attendee, and organizer values share that map.
 
 ### 4. Chunk structured details without dropping permitted fields
 
 Each field value will be sanitized and length-bounded before record assembly. Operation and event snapshots will be deterministically split into records below the existing Logcat record limit, with snapshot/operation identity plus chunk ordinal and chunk count repeated on every record. Collection sizes, exception indexes, sub-batch size, and the known maximum of 50 provider operations bound record production. A validation failure emits the affected series or exception detail and counts for unrelated collection members.
+
+The throwable class/cause graph will also have its own aggregate character bound and bounded traversal queue/attempt count in addition to its object and frame-count bounds, so a maximal, cyclic, or wide suppressed graph cannot consume the repeated snapshot header and suppress every detail record.
 
 Blindly truncating one assembled record was rejected because the field needed to diagnose a failure could disappear based on map iteration order. One record per field was rejected because it would create excessive Logcat noise for ordinary event inserts.
 
