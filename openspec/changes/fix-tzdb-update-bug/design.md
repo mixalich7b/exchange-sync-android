@@ -32,13 +32,13 @@ This keeps the workaround at the boundary that produced the artifact. The core m
 
 ### 2. Keep the recovery predicate narrow and fail closed
 
-The duration parser will accept only the existing `PT<n>S` representation, require a positive value, and reject numeric multiplication or instant-addition overflow. Normal SQL `NULL` fallback will retain its current behavior. A non-recurring row, a duration that is absent, malformed, zero, negative, or overflowing, and any nonzero conflicting `DTEND` will retain the current snapshot interpretation and therefore the existing validation or reset outcome.
+The duration parser will accept only the existing `PT<n>S` representation, require a positive value, and reject numeric multiplication, provider epoch-millisecond addition, or instant-addition overflow. Normal SQL `NULL` fallback will retain its current behavior. A clean recurring epoch-zero row whose start or duration cannot produce a trustworthy end will expose no inherited end and will carry an infrastructure-local untrusted-range marker into page planning. A partial change that still lacks a complete range will then follow the existing protocol-data failure path, while a server `Delete` or an explicit valid replacement range remains authoritative. A non-recurring row and any nonzero conflicting `DTEND` will retain the current snapshot interpretation and therefore the existing validation or reset outcome.
 
 Preferring duration for every row that happens to expose both fields was rejected because it would hide provider inconsistencies outside the observed failure. Treating every nonpositive end as missing was rejected because the product retains all server history and valid pre-epoch timestamps must not be globally reclassified.
 
 ### 3. Do not weaken response precedence or dirty-row fencing
 
-The normalized value is only prior state. A partial `Change` with an absent `EndTime` may inherit it, while any explicit response `EndTime` still replaces it and passes through the existing time-range validation. The gateway's existing dirty-row detection continues to request a full mirror reset before local user or OEM modifications can be accepted as server truth.
+The normalized value is only prior state. A partial `Change` with an absent `EndTime` may inherit it, while any explicit response `EndTime` still replaces it and passes through the existing time-range validation. An untrustworthy local end is deferred until the server mutation is known so it cannot block a `Delete` or a complete explicit replacement range. The gateway's existing dirty-row detection continues to request a full mirror reset before local user or OEM modifications can be accepted as server truth.
 
 Auto-resetting every affected mirror was rejected because the clean recurring row already contains enough canonical information for lossless recovery. Skipping the event or advancing the checkpoint around it was rejected because it would break the complete mirror and page atomicity guarantees.
 
@@ -51,7 +51,7 @@ Guard regressions will prove that the normalization does not apply to a non-recu
 ## Risks / Trade-offs
 
 - [An epoch-zero end could be intentional historical data] → Require a recurrence rule and positive provider duration and normalize only the local provider snapshot; explicit server values remain authoritative and validated.
-- [Duration arithmetic can overflow or produce an unrepresentable instant] → Use checked conversion/addition and fail closed into the existing validation path.
+- [Duration arithmetic can overflow or produce an instant outside Calendar Provider epoch milliseconds] → Use checked conversion/addition, mark the inherited range untrustworthy, and fail closed if the server does not replace it.
 - [An OEM emits another duration syntax] → Preserve current parser scope; unsupported syntax is not silently coerced and remains diagnosable.
 - [Calendar Provider can repeat the corruption after recovery] → Perform normalization on every clean snapshot read rather than relying on a one-time database repair.
 - [A successful later provider update may or may not clear the stored epoch value on every OEM] → Do not depend on that side effect; correctness comes from read-time normalization.

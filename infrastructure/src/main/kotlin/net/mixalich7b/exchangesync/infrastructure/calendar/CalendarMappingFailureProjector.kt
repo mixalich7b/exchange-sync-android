@@ -810,6 +810,8 @@ internal object CalendarMappingFailureProjector {
             CalendarPlanningRule.UNSUPPORTED_CALENDAR_CHANGE ->
                 DiagnosticCalendarRule.UNSUPPORTED_CALENDAR_CHANGE
             CalendarPlanningRule.CALENDAR_EVENT_MAPPING -> DiagnosticCalendarRule.CALENDAR_EVENT_MAPPING
+            CalendarPlanningRule.PROVIDER_SNAPSHOT_TIME_RANGE_UNTRUSTWORTHY ->
+                DiagnosticCalendarRule.EVENT_TIME_RANGE_INVALID
             CalendarPlanningRule.PROVIDER_BATCH_SCOPE -> DiagnosticCalendarRule.PROVIDER_BATCH_SCOPE
             CalendarPlanningRule.PROVIDER_REQUIRED_VALUE_NULL ->
                 DiagnosticCalendarRule.PROVIDER_REQUIRED_VALUE_NULL

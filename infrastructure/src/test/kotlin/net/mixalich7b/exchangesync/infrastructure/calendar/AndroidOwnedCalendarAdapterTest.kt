@@ -64,6 +64,288 @@ class AndroidOwnedCalendarAdapterTest {
     }
 
     @Test
+    fun `recurring provider snapshot derives an epoch-zero end from its positive duration`() {
+        val start = Instant.parse("2026-08-09T09:00:00Z")
+
+        val snapshot =
+            readProviderSnapshot(
+                providerCursor(
+                    start = start,
+                    end = Instant.EPOCH,
+                    duration = "PT3600S",
+                    recurrenceRule = "FREQ=DAILY;INTERVAL=1",
+                ),
+            )
+
+        assertEquals(ActiveSyncField.Value(start.plusSeconds(3_600)), snapshot.end)
+    }
+
+    @Test
+    fun `non-recurring provider snapshot preserves an epoch-zero end`() {
+        val snapshot =
+            readProviderSnapshot(
+                providerCursor(
+                    end = Instant.EPOCH,
+                    duration = "PT3600S",
+                    recurrenceRule = null,
+                ),
+            )
+
+        assertEquals(ActiveSyncField.Value(Instant.EPOCH), snapshot.end)
+    }
+
+    @Test
+    fun `dirty recurring provider snapshot preserves an epoch-zero end`() {
+        val snapshot =
+            readProviderSnapshot(
+                providerCursor(
+                    end = Instant.EPOCH,
+                    duration = "PT3600S",
+                    recurrenceRule = "FREQ=DAILY;INTERVAL=1",
+                    dirty = 1,
+                ),
+            )
+
+        assertEquals(ActiveSyncField.Value(Instant.EPOCH), snapshot.end)
+    }
+
+    @Test
+    fun `recurring provider snapshot exposes no inherited end without a trustworthy provider duration`() {
+        val invalidDurations =
+            listOf(
+                "absent" to null,
+                "malformed" to "one hour",
+                "zero" to "PT0S",
+                "negative" to "PT-1S",
+                "provider-millis overflowing" to "PT9223372036854775S",
+                "overflowing" to "PT9223372036854776S",
+            )
+
+        invalidDurations.forEach { (label, duration) ->
+            val snapshot =
+                readProviderSnapshot(
+                    providerCursor(
+                        end = Instant.EPOCH,
+                        duration = duration,
+                        recurrenceRule = "FREQ=DAILY;INTERVAL=1",
+                    ),
+                )
+
+            assertEquals(
+                ActiveSyncField.Empty,
+                snapshot.end,
+                label,
+            )
+        }
+    }
+
+    @Test
+    fun `recurring provider snapshot exposes no epoch sentinel after a pre-epoch start`() {
+        val snapshot =
+            readProviderSnapshot(
+                providerCursor(
+                    start = Instant.parse("1960-01-01T00:00:00Z"),
+                    end = Instant.EPOCH,
+                    duration = null,
+                    recurrenceRule = "FREQ=DAILY;INTERVAL=1",
+                ),
+            )
+
+        assertEquals(ActiveSyncField.Empty, snapshot.end)
+    }
+
+    @Test
+    fun `recurring provider snapshot exposes no epoch sentinel without a start`() {
+        val snapshot =
+            readProviderSnapshot(
+                providerCursor(
+                    start = null,
+                    end = Instant.EPOCH,
+                    duration = "PT3600S",
+                    recurrenceRule = "FREQ=DAILY;INTERVAL=1",
+                ),
+            )
+
+        assertEquals(ActiveSyncField.Empty, snapshot.end)
+    }
+
+    @Test
+    fun `partial Change cannot inherit an untrustworthy recurring range`() = runTest {
+        val previous =
+            readProviderSnapshot(
+                providerCursor(
+                    syncId = "series-1",
+                    end = null,
+                    recurrenceRule = "FREQ=DAILY;INTERVAL=1",
+                ),
+            )
+        val gateway =
+            RecordingCalendarGateway(
+                existingEvents =
+                    listOf(
+                        ExistingProviderEvent(
+                            31,
+                            OWNED_CALENDAR,
+                            "series-1",
+                            previous,
+                            hasTrustworthyTimeRange = false,
+                        ),
+                    ),
+            )
+        val page =
+            RemoteCalendarPage(
+                listOf(
+                    ActiveSyncCalendarMutation.Upsert(
+                        ActiveSyncCalendarItem(
+                            serverId = "series-1",
+                            subject = ActiveSyncField.Value("Updated recurring event"),
+                        ),
+                        false,
+                    ),
+                ),
+                SyncCheckpoints(collectionSyncKey = "sync-43"),
+                moreAvailable = false,
+            )
+
+        val outcome = adapter(gateway).applyPage(SyncFence(3, 9), page)
+
+        assertEquals(LocalPageOutcome.Failed(SyncProblem.PROTOCOL_DATA), outcome)
+        assertTrue(gateway.applied.isEmpty())
+    }
+
+    @Test
+    fun `explicit valid end replaces an untrustworthy recurring range`() = runTest {
+        val start = Instant.parse("2026-08-09T09:00:00Z")
+        val previous =
+            readProviderSnapshot(
+                providerCursor(
+                    syncId = "series-1",
+                    start = start,
+                    end = null,
+                    recurrenceRule = "FREQ=DAILY;INTERVAL=1",
+                ),
+            )
+        val gateway =
+            RecordingCalendarGateway(
+                existingEvents =
+                    listOf(
+                        ExistingProviderEvent(
+                            31,
+                            OWNED_CALENDAR,
+                            "series-1",
+                            previous,
+                            hasTrustworthyTimeRange = false,
+                        ),
+                    ),
+            )
+        val page =
+            RemoteCalendarPage(
+                listOf(
+                    ActiveSyncCalendarMutation.Upsert(
+                        ActiveSyncCalendarItem(
+                            serverId = "series-1",
+                            end = ActiveSyncField.Value(start.plusSeconds(7_200)),
+                        ),
+                        false,
+                    ),
+                ),
+                SyncCheckpoints(collectionSyncKey = "sync-43"),
+                moreAvailable = false,
+            )
+
+        val outcome = adapter(gateway).applyPage(SyncFence(3, 9), page)
+
+        assertEquals(LocalPageOutcome.Applied, outcome)
+        val update = gateway.applied.single().operations.filterIsInstance<CalendarProviderBatchOperation.EventUpdate>().single()
+        assertEquals("PT7200S", update.values[CalendarProviderField.DURATION])
+    }
+
+    @Test
+    fun `server Delete ignores an untrustworthy recurring range`() = runTest {
+        val gateway =
+            RecordingCalendarGateway(
+                existingEvents =
+                    listOf(
+                        ExistingProviderEvent(
+                            31,
+                            OWNED_CALENDAR,
+                            "series-1",
+                            hasTrustworthyTimeRange = false,
+                        ),
+                    ),
+            )
+        val page =
+            RemoteCalendarPage(
+                listOf(ActiveSyncCalendarMutation.Delete("series-1", soft = false)),
+                SyncCheckpoints(collectionSyncKey = "sync-43"),
+                moreAvailable = false,
+            )
+
+        val outcome = adapter(gateway).applyPage(SyncFence(3, 9), page)
+
+        assertEquals(LocalPageOutcome.Applied, outcome)
+        assertTrue(
+            gateway.applied.single().operations.single() is CalendarProviderBatchOperation.EventDelete,
+        )
+    }
+
+    @Test
+    fun `recurring provider snapshot retains SQL-null end reconstruction`() {
+        val start = Instant.parse("2026-08-09T09:00:00Z")
+
+        val snapshot =
+            readProviderSnapshot(
+                providerCursor(
+                    start = start,
+                    end = null,
+                    duration = "PT1800S",
+                    recurrenceRule = "FREQ=DAILY;INTERVAL=1",
+                ),
+            )
+
+        assertEquals(ActiveSyncField.Value(start.plusSeconds(1_800)), snapshot.end)
+    }
+
+    @Test
+    fun `recurring SQL-null end with a nonpositive duration still rejects a partial Change`() = runTest {
+        val start = Instant.parse("2026-08-09T09:00:00Z")
+        listOf("zero" to "PT0S", "negative" to "PT-1S").forEach { (label, duration) ->
+            val previous =
+                readProviderSnapshot(
+                    providerCursor(
+                        syncId = "series-1",
+                        start = start,
+                        end = null,
+                        duration = duration,
+                        recurrenceRule = "FREQ=DAILY;INTERVAL=1",
+                    ),
+                )
+            val gateway =
+                RecordingCalendarGateway(
+                    existingEvents = listOf(ExistingProviderEvent(31, OWNED_CALENDAR, "series-1", previous)),
+                )
+            val partial =
+                ActiveSyncCalendarItem(
+                    serverId = "series-1",
+                    subject = ActiveSyncField.Value("Updated recurring event"),
+                )
+
+            val outcome =
+                adapter(gateway).applyPage(
+                    SyncFence(3, 9),
+                    RemoteCalendarPage(
+                        listOf(ActiveSyncCalendarMutation.Upsert(partial, false)),
+                        SyncCheckpoints(collectionSyncKey = "sync-43"),
+                        moreAvailable = false,
+                    ),
+                )
+
+            assertEquals(LocalPageOutcome.Failed(SyncProblem.PROTOCOL_DATA), outcome, label)
+            assertTrue(gateway.applied.isEmpty(), label)
+        }
+    }
+
+    @Test
     fun `exception response snapshot retains deletion and response inputs`() {
         val snapshot = readProviderExceptionResponseSnapshot(exceptionResponseCursor())
 
@@ -542,6 +824,80 @@ class AndroidOwnedCalendarAdapterTest {
                     field.field == DiagnosticCalendarField.TIME_RELATIONSHIP
             }.value,
         )
+    }
+
+    @Test
+    fun `partial recurring Change inherits a normalized provider range and applies the same identity`() = runTest {
+        val start = Instant.parse("2026-08-09T09:00:00Z")
+        val previous =
+            readProviderSnapshot(
+                providerCursor(
+                    syncId = "series-1",
+                    start = start,
+                    end = Instant.EPOCH,
+                    duration = "PT3600S",
+                    recurrenceRule = "FREQ=DAILY;INTERVAL=1",
+                ),
+            )
+        val gateway =
+            RecordingCalendarGateway(
+                existingEvents = listOf(ExistingProviderEvent(31, OWNED_CALENDAR, "series-1", previous)),
+            )
+        val partial =
+            ActiveSyncCalendarItem(
+                serverId = "series-1",
+                subject = ActiveSyncField.Value("Updated recurring event"),
+            )
+        val page =
+            RemoteCalendarPage(
+                listOf(ActiveSyncCalendarMutation.Upsert(partial, false)),
+                SyncCheckpoints(collectionSyncKey = "sync-43"),
+                moreAvailable = false,
+            )
+
+        val outcome = adapter(gateway).applyPage(SyncFence(3, 9), page)
+
+        assertEquals(LocalPageOutcome.Applied, outcome)
+        val update = gateway.applied.single().operations.single() as CalendarProviderBatchOperation.EventUpdate
+        assertEquals(31, update.eventId)
+        assertEquals("Updated recurring event", update.values[CalendarProviderField.TITLE])
+    }
+
+    @Test
+    fun `partial recurring Change with an explicit invalid end rejects the page`() = runTest {
+        val start = Instant.parse("2026-08-09T09:00:00Z")
+        val previous =
+            readProviderSnapshot(
+                providerCursor(
+                    syncId = "series-1",
+                    start = start,
+                    end = Instant.EPOCH,
+                    duration = "PT3600S",
+                    recurrenceRule = "FREQ=DAILY;INTERVAL=1",
+                ),
+            )
+        val gateway =
+            RecordingCalendarGateway(
+                existingEvents = listOf(ExistingProviderEvent(31, OWNED_CALENDAR, "series-1", previous)),
+            )
+        val partial =
+            ActiveSyncCalendarItem(
+                serverId = "series-1",
+                end = ActiveSyncField.Value(start),
+            )
+
+        val outcome =
+            adapter(gateway).applyPage(
+                SyncFence(3, 9),
+                RemoteCalendarPage(
+                    listOf(ActiveSyncCalendarMutation.Upsert(partial, false)),
+                    SyncCheckpoints(collectionSyncKey = "sync-43"),
+                    moreAvailable = false,
+                ),
+            )
+
+        assertEquals(LocalPageOutcome.Failed(SyncProblem.PROTOCOL_DATA), outcome)
+        assertTrue(gateway.applied.isEmpty())
     }
 
     @Test
@@ -1251,19 +1607,28 @@ class AndroidOwnedCalendarAdapterTest {
             ),
         )
 
-    private fun providerCursor(selfAttendeeStatus: Int): Cursor {
+    private fun providerCursor(
+        syncId: String = "ordinary-event",
+        start: Instant? = Instant.parse("2026-08-09T09:00:00Z"),
+        end: Instant? = Instant.parse("2026-08-09T10:00:00Z"),
+        duration: String? = null,
+        recurrenceRule: String? = null,
+        dirty: Int = 0,
+        selfAttendeeStatus: Int = ProviderInteger.NONE_ATTENDEE,
+    ): Cursor {
         val values =
             linkedMapOf<String, Any?>(
-                "_sync_id" to "ordinary-event",
+                "_sync_id" to syncId,
+                "dirty" to dirty,
                 "uid2445" to null,
                 "title" to "Ordinary event",
                 "description" to null,
                 "eventLocation" to null,
-                "dtstart" to Instant.parse("2026-08-09T09:00:00Z").toEpochMilli(),
-                "dtend" to Instant.parse("2026-08-09T10:00:00Z").toEpochMilli(),
-                "duration" to null,
+                "dtstart" to start?.toEpochMilli(),
+                "dtend" to end?.toEpochMilli(),
+                "duration" to duration,
                 "allDay" to 0,
-                "rrule" to null,
+                "rrule" to recurrenceRule,
                 "organizer" to null,
                 "eventStatus" to ProviderInteger.CONFIRMED_EVENT,
                 "availability" to ProviderInteger.BUSY,

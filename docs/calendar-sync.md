@@ -54,6 +54,24 @@ recoverable от уменьшения Calendar window. HTTP body огранич�
 sync metadata exception row и переживает последующий partial `Change`. Structured
 `AirSyncBase:Location` и `InstanceId` recurrence exceptions разбираются с учётом
 версии.
+
+Во время обслуживания базы часовых поясов Calendar Provider может заменить
+обычно отсутствующий `DTEND` recurring series на epoch zero, сохранив её
+`DTSTART`, `DURATION` и `RRULE`. При чтении clean snapshot такой epoch-zero end
+считается отсутствующим только для recurring row с присутствующим start и
+положительным provider duration строго вида `PT<n>S`; effective end
+восстанавливается как `DTSTART + DURATION`. Отсутствующий start, а также
+некорректный, нулевой, отрицательный или непредставимый в provider epoch-millis
+duration помечает inherited range недоверенным: partial `Change` без полной
+замены диапазона отклоняется как protocol data без продвижения checkpoint, но
+серверный `Delete` или явный валидный replacement range сохраняет приоритет.
+Эта нормализация создаёт только trustworthy prior state для omitted
+полей partial `Change`: она не
+применяется к non-recurring или dirty rows, не заменяет ненулевой provider end и
+никогда не имеет приоритета над explicit `StartTime`/`EndTime` из Exchange.
+Явный равный или обратный server range по-прежнему отклоняет всю страницу без
+продвижения checkpoint.
+
 Для ActiveSync 16.0/16.1 `InstanceId` принимает только Compact DateTime UTC
 `yyyyMMdd'T'HHmmss'Z'`. Extended/fractional и malformed значения отклоняют всю
 страницу как protocol data, поэтому checkpoint такой страницы не продвигается.

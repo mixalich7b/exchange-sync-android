@@ -16,6 +16,7 @@ internal enum class CalendarPlanningRule {
     DUPLICATE_SERVER_ID,
     UNSUPPORTED_CALENDAR_CHANGE,
     CALENDAR_EVENT_MAPPING,
+    PROVIDER_SNAPSHOT_TIME_RANGE_UNTRUSTWORTHY,
     PROVIDER_BATCH_SCOPE,
     PROVIDER_REQUIRED_VALUE_NULL,
     REFRESH_EXCEPTIONS_NEW_SERIES,
@@ -91,6 +92,7 @@ internal data class ExistingProviderEvent(
     val snapshot: ProviderEvent? = null,
     val providerTimeZone: String? = null,
     val isDirty: Boolean = false,
+    val hasTrustworthyTimeRange: Boolean = true,
 )
 
 internal sealed interface CalendarEventPlan {
@@ -167,6 +169,16 @@ internal object CalendarPagePlanner {
                             val source = mutation as ActiveSyncCalendarMutation.Upsert
                             if (!mapped.isAddition && existing == null) {
                                 throw CalendarMirrorResetRequiredException(serverId)
+                            }
+                            if (
+                                existing?.hasTrustworthyTimeRange == false &&
+                                (mapped.event.start !is ActiveSyncField.Value ||
+                                    mapped.event.end !is ActiveSyncField.Value)
+                            ) {
+                                throw CalendarPlanningException(
+                                    CalendarPlanningRule.PROVIDER_SNAPSHOT_TIME_RANGE_UNTRUSTWORTHY,
+                                    "Calendar Provider snapshot has no trustworthy time range",
+                                )
                             }
                             CalendarEventPlan.Upsert(
                                 calendarId = owned.calendarId,

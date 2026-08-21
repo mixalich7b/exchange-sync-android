@@ -16,6 +16,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import java.time.DateTimeException
 import java.time.Instant
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncAvailability
 import net.mixalich7b.exchangesync.core.calendar.ActiveSyncField
@@ -676,14 +677,16 @@ private class AndroidOwnedCalendarProviderGateway(
         val events = cursor.use {
             buildList {
                 while (it.moveToNext()) {
+                    val providerSnapshot = it.readProviderSnapshot()
                     add(
                         ExistingProviderEvent(
                             eventId = it.getLong(it.getColumnIndexOrThrow(BaseColumns._ID)),
                             calendarId = it.getLong(it.getColumnIndexOrThrow(Events.CALENDAR_ID)),
                             syncId = it.getString(it.getColumnIndexOrThrow(Events._SYNC_ID)),
-                            snapshot = it.toProviderSnapshot(),
+                            snapshot = providerSnapshot.event,
                             providerTimeZone = it.nullableString(CalendarProviderField.EVENT_TIME_ZONE),
                             isDirty = it.getInt(it.getColumnIndexOrThrow(CalendarProviderField.DIRTY)) != 0,
+                            hasTrustworthyTimeRange = providerSnapshot.hasTrustworthyTimeRange,
                         ),
                     )
                 }
@@ -876,57 +879,101 @@ private fun Cursor.requiredBooleanField(column: String): Boolean {
     return getInt(index) != 0
 }
 
-private fun Cursor.toProviderSnapshot(): ProviderEvent {
+private data class ProviderSnapshotRead(
+    val event: ProviderEvent,
+    val hasTrustworthyTimeRange: Boolean,
+)
+
+private data class SnapshotEndResolution(
+    val end: ActiveSyncField<Instant>,
+    val isTrustworthy: Boolean = true,
+)
+
+private fun Cursor.toProviderSnapshot(): ProviderEvent = readProviderSnapshot().event
+
+private fun Cursor.readProviderSnapshot(): ProviderSnapshotRead {
     val syncId = getString(getColumnIndexOrThrow(Events._SYNC_ID))
     val start = instantField(CalendarProviderField.START)
-    val end =
-        when (val direct = instantField(CalendarProviderField.END)) {
-            ActiveSyncField.Empty -> {
-                val startInstant = (start as? ActiveSyncField.Value)?.value
-                val duration = nullableString(CalendarProviderField.DURATION)?.parseProviderDurationMillis()
-                if (startInstant != null && duration != null) ActiveSyncField.Value(startInstant.plusMillis(duration))
-                else ActiveSyncField.Empty
-            }
-            else -> direct
-        }
-    return ProviderEvent(
-        syncId = syncId,
-        uid = stringField(CalendarProviderField.UID),
-        title = stringField(CalendarProviderField.TITLE),
-        description = stringField(CalendarProviderField.DESCRIPTION),
-        location = stringField(CalendarProviderField.LOCATION),
-        start = start,
-        end = end,
-        allDay = intField(CalendarProviderField.ALL_DAY) { value -> value != 0 },
-        timeZone = ActiveSyncField.Absent,
-        recurrenceRule = stringField(CalendarProviderField.RECURRENCE_RULE),
-        exceptions = ActiveSyncField.Absent,
-        organizerEmail = stringField(CalendarProviderField.ORGANIZER_EMAIL),
-        organizerName = ActiveSyncField.Absent,
-        attendees = ActiveSyncField.Absent,
-        meetingStatus =
-            intField(CalendarProviderField.MEETING_STATUS) { value ->
-                ActiveSyncCalendarValueParsers.parseMeetingStatus(value.toString())
-            },
-        responseType = intEnumField(CalendarProviderField.RESPONSE_TYPE, ActiveSyncResponseType.entries) { it.wireValue },
-        responseRequested = intField(CalendarProviderField.RESPONSE_REQUESTED) { value -> value != 0 },
-        serverAvailability =
-            intEnumField(CalendarProviderField.SERVER_AVAILABILITY, ActiveSyncAvailability.entries) { it.wireValue },
-        status = intEnumField(CalendarProviderField.STATUS, ProviderEventStatus.entries) { it.providerValue },
-        availability =
-            intField(CalendarProviderField.AVAILABILITY) { value ->
-                when (value) {
-                    ProviderInteger.BUSY -> ProviderAvailability.BUSY
-                    ProviderInteger.FREE -> ProviderAvailability.FREE
-                    ProviderInteger.TENTATIVE_AVAILABILITY -> ProviderAvailability.TENTATIVE
-                    else -> throw CalendarProviderAccessException()
-                }
-            },
-        selfStatus = selfStatusField(CalendarProviderField.SELF_ATTENDEE_STATUS),
-        eventColor = intField(CalendarProviderField.EVENT_COLOR) { it },
-        accessLevel = intEnumField(CalendarProviderField.ACCESS_LEVEL, ProviderAccessLevel.entries) { it.providerValue },
-        reminderMinutes = ActiveSyncField.Absent,
+    val recurrenceRule = stringField(CalendarProviderField.RECURRENCE_RULE)
+    val endResolution = resolveSnapshotEnd(start, recurrenceRule)
+    return ProviderSnapshotRead(
+        event =
+            ProviderEvent(
+                syncId = syncId,
+                uid = stringField(CalendarProviderField.UID),
+                title = stringField(CalendarProviderField.TITLE),
+                description = stringField(CalendarProviderField.DESCRIPTION),
+                location = stringField(CalendarProviderField.LOCATION),
+                start = start,
+                end = endResolution.end,
+                allDay = intField(CalendarProviderField.ALL_DAY) { value -> value != 0 },
+                timeZone = ActiveSyncField.Absent,
+                recurrenceRule = recurrenceRule,
+                exceptions = ActiveSyncField.Absent,
+                organizerEmail = stringField(CalendarProviderField.ORGANIZER_EMAIL),
+                organizerName = ActiveSyncField.Absent,
+                attendees = ActiveSyncField.Absent,
+                meetingStatus =
+                    intField(CalendarProviderField.MEETING_STATUS) { value ->
+                        ActiveSyncCalendarValueParsers.parseMeetingStatus(value.toString())
+                    },
+                responseType =
+                    intEnumField(CalendarProviderField.RESPONSE_TYPE, ActiveSyncResponseType.entries) { it.wireValue },
+                responseRequested = intField(CalendarProviderField.RESPONSE_REQUESTED) { value -> value != 0 },
+                serverAvailability =
+                    intEnumField(CalendarProviderField.SERVER_AVAILABILITY, ActiveSyncAvailability.entries) {
+                        it.wireValue
+                    },
+                status = intEnumField(CalendarProviderField.STATUS, ProviderEventStatus.entries) { it.providerValue },
+                availability =
+                    intField(CalendarProviderField.AVAILABILITY) { value ->
+                        when (value) {
+                            ProviderInteger.BUSY -> ProviderAvailability.BUSY
+                            ProviderInteger.FREE -> ProviderAvailability.FREE
+                            ProviderInteger.TENTATIVE_AVAILABILITY -> ProviderAvailability.TENTATIVE
+                            else -> throw CalendarProviderAccessException()
+                        }
+                    },
+                selfStatus = selfStatusField(CalendarProviderField.SELF_ATTENDEE_STATUS),
+                eventColor = intField(CalendarProviderField.EVENT_COLOR) { it },
+                accessLevel =
+                    intEnumField(CalendarProviderField.ACCESS_LEVEL, ProviderAccessLevel.entries) { it.providerValue },
+                reminderMinutes = ActiveSyncField.Absent,
+            ),
+        hasTrustworthyTimeRange = endResolution.isTrustworthy,
     )
+}
+
+private fun Cursor.resolveSnapshotEnd(
+    start: ActiveSyncField<Instant>,
+    recurrenceRule: ActiveSyncField<String>,
+): SnapshotEndResolution {
+    val direct = instantField(CalendarProviderField.END)
+    val isCleanRecurringEpoch =
+        direct == ActiveSyncField.Value(Instant.EPOCH) &&
+            recurrenceRule is ActiveSyncField.Value &&
+            getInt(getColumnIndexOrThrow(CalendarProviderField.DIRTY)) == 0
+    if (isCleanRecurringEpoch) {
+        val startInstant = (start as? ActiveSyncField.Value)?.value
+        val durationMillis =
+            nullableString(CalendarProviderField.DURATION)?.parsePositiveProviderDurationMillis()
+        val resolvedEnd =
+            if (startInstant != null && durationMillis != null) {
+                startInstant.plusProviderMillisOrNull(durationMillis)
+            } else {
+                null
+            }
+        return resolvedEnd?.let { value -> SnapshotEndResolution(ActiveSyncField.Value(value)) }
+            ?: SnapshotEndResolution(ActiveSyncField.Empty, isTrustworthy = false)
+    }
+    if (direct != ActiveSyncField.Empty) return SnapshotEndResolution(direct)
+
+    val startInstant = (start as? ActiveSyncField.Value)?.value
+    val durationMillis = nullableString(CalendarProviderField.DURATION)?.parseProviderDurationMillis()
+    val resolvedEnd =
+        if (startInstant != null && durationMillis != null) ActiveSyncField.Value(startInstant.plusMillis(durationMillis))
+        else ActiveSyncField.Empty
+    return SnapshotEndResolution(resolvedEnd)
 }
 
 private fun Cursor.stringField(column: String): ActiveSyncField<String> =
@@ -985,6 +1032,27 @@ private fun Cursor.nullableString(column: String): String? {
 private fun String.parseProviderDurationMillis(): Long? =
     removePrefix("PT").removeSuffix("S").takeIf { this.startsWith("PT") && this.endsWith("S") }
         ?.toLongOrNull()?.times(1_000)
+
+private fun String.parsePositiveProviderDurationMillis(): Long? {
+    if (!startsWith("PT") || !endsWith("S")) return null
+    val secondsText = substring(2, lastIndex)
+    if (secondsText.isEmpty() || secondsText.any { character -> character !in '0'..'9' }) return null
+    val seconds = secondsText.toLongOrNull()?.takeIf { value -> value > 0 } ?: return null
+    return try {
+        Math.multiplyExact(seconds, 1_000L)
+    } catch (_: ArithmeticException) {
+        null
+    }
+}
+
+private fun Instant.plusProviderMillisOrNull(durationMillis: Long): Instant? =
+    try {
+        Instant.ofEpochMilli(Math.addExact(toEpochMilli(), durationMillis))
+    } catch (_: DateTimeException) {
+        null
+    } catch (_: ArithmeticException) {
+        null
+    }
 
 private val ProviderEventStatus.providerValue: Int
     get() = when (this) {
