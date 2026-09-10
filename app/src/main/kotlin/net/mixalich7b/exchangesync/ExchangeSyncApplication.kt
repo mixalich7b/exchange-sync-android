@@ -17,6 +17,9 @@ public class ExchangeSyncApplication : Application(), Configuration.Provider {
     override fun onCreate() {
         super.onCreate()
         container.syncProblems.createChannel()
-        applicationScope.launch { container.reconcileSynchronizationScheduling.execute() }
+        applicationScope.launch {
+            container.ownedCalendarDisplayNameMigrator.execute()
+            container.reconcileSynchronizationScheduling.execute()
+        }
     }
 }

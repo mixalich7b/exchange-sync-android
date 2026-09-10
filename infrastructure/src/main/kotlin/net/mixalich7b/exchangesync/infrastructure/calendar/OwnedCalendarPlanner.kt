@@ -4,7 +4,7 @@ internal object OwnedCalendarIdentity {
     const val ACCOUNT_NAME = "net.mixalich7b.exchangesync.calendar"
     const val ACCOUNT_TYPE = "LOCAL"
     const val INTERNAL_NAME = "exchange_primary_calendar"
-    const val DISPLAY_NAME = "Exchange Calendar"
+    const val DISPLAY_NAME = "Exchange-sync"
 }
 
 internal data class OwnedCalendarRow(

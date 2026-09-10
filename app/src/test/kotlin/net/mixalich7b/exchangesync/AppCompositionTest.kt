@@ -17,6 +17,7 @@ class AppCompositionTest {
                 "DataStoreSynchronizationStateRepository",
                 "AndroidActiveSyncProcessRuntime",
                 "AndroidOwnedCalendarAdapter",
+                "AndroidOwnedCalendarDisplayNameMigrator",
                 "AndroidSyncPermissionPort",
                 "WorkManagerSyncScheduler",
                 "SyncProblemNotificationReporter",
@@ -50,6 +51,7 @@ class AppCompositionTest {
         assertTrue("Configuration.Provider" in source)
         assertTrue("setWorkerFactory(container.workerFactory)" in source)
         assertTrue("container.syncProblems.createChannel()" in source)
+        assertTrue("container.ownedCalendarDisplayNameMigrator.execute()" in source)
         assertTrue("android:name=\".ExchangeSyncApplication\"" in manifest)
     }
 

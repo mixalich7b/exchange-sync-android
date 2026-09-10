@@ -214,10 +214,10 @@ The application SHALL treat a recurrence exception's response as an optional ove
 - **THEN** the application rejects the page without committing its next synchronization key and reports a user-actionable protocol-data problem
 
 ### Requirement: Isolated read-only Android calendar ownership
-The application SHALL create at most one visible local Android calendar with a stable application-specific account identity and read-only access. Every query, insert, update, clear, and delete SHALL be scoped to that owned identity and, once resolved, its provider calendar identifier; no operation SHALL select another calendar merely by display name, owner email, or profile email.
+The application SHALL create at most one visible local Android calendar with a stable application-specific account identity, the display name `Exchange-sync`, and read-only access. Every query, insert, update, clear, and delete SHALL be scoped to that owned identity and, once resolved, its provider calendar identifier; no operation SHALL select another calendar merely by display name, owner email, or profile email. On the first launch after an upgrade containing this requirement, the application SHALL rename every existing application-owned calendar to `Exchange-sync` without deleting or recreating its events. The migration SHALL be retried after a Calendar Provider failure and SHALL NOT modify unrelated calendars.
 
 #### Scenario: Device contains other calendars
-- **WHEN** synchronization, full reset, profile replacement, disable, or cleanup runs on a device with unrelated calendars
+- **WHEN** synchronization, full reset, profile replacement, disable, cleanup, or display-name migration runs on a device with unrelated calendars
 - **THEN** no calendar, event, attendee, reminder, or extended property outside the application-owned calendar is inserted, updated, or deleted
 
 #### Scenario: Another calendar has a matching display name
@@ -226,11 +226,19 @@ The application SHALL create at most one visible local Android calendar with a s
 
 #### Scenario: Owned calendar is missing
 - **WHEN** synchronization is enabled but the application-owned calendar no longer exists
-- **THEN** the application recreates one read-only owned calendar before applying server events
+- **THEN** the application recreates one read-only owned calendar with display name `Exchange-sync` before applying server events
 
 #### Scenario: Owned calendar is presented by a calendar app
 - **WHEN** a device calendar application displays the synchronized calendar
-- **THEN** it can display events and reminders but is told by Calendar Provider that the calendar does not permit event modification
+- **THEN** it can display events and reminders, shows `Exchange-sync`, and is told by Calendar Provider that the calendar does not permit event modification
+
+#### Scenario: Existing owned calendar is migrated after upgrade
+- **WHEN** the updated application starts and an existing calendar matches the complete stable application-owned identity
+- **THEN** it changes only that calendar's display name to `Exchange-sync`, preserves its provider identifier and all dependent data, and records the migration as complete
+
+#### Scenario: Display-name migration cannot access Calendar Provider
+- **WHEN** the updated application cannot query or update the owned calendar during startup migration
+- **THEN** it does not record the migration as complete, leaves unrelated calendars unchanged, and retries the migration on a later application start
 
 ### Requirement: Owned calendar cleanup compatibility
 The application SHALL delete every application-owned calendar row through an Android Calendar Provider operation that remains scoped by the stable account identity, internal calendar name, and resolved provider identifier. It SHALL treat provider runtime rejection as an actionable cleanup failure and SHALL NOT broaden or redirect deletion to any unrelated local calendar.

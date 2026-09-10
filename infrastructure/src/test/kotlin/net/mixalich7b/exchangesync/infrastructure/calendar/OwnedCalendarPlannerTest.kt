@@ -56,6 +56,7 @@ class OwnedCalendarPlannerTest {
     fun `creation definition is visible synchronized read-only and supports alert reminders`() {
         val definition = OwnedCalendarDefinition.forProfile("calendar@example.test")
 
+        assertEquals("Exchange-sync", definition.displayName)
         assertEquals(OwnedCalendarIdentity.ACCOUNT_NAME, definition.accountName)
         assertEquals(OwnedCalendarIdentity.ACCOUNT_TYPE, definition.accountType)
         assertEquals(OwnedCalendarIdentity.INTERNAL_NAME, definition.internalName)

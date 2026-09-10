@@ -61,6 +61,7 @@ class OwnedCalendarResolverTest {
         val rows: MutableList<OwnedCalendarRow>,
     ) : OwnedCalendarStore {
         val deleted = mutableListOf<Long>()
+        val updated = mutableListOf<Pair<Long, String>>()
         val created = mutableListOf<OwnedCalendarDefinition>()
         var queryCallsAfterCreate = 0
         private var didCreate = false
@@ -90,6 +91,11 @@ class OwnedCalendarResolverTest {
         override fun deleteOwned(calendarId: Long): Boolean {
             deleted += calendarId
             return rows.removeAll { row -> row.id == calendarId }
+        }
+
+        override fun updateDisplayName(calendarId: Long, displayName: String): Boolean {
+            updated += calendarId to displayName
+            return rows.any { row -> row.id == calendarId }
         }
     }
 

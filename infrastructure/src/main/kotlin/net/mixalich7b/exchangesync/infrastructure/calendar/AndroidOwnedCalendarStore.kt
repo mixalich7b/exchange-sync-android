@@ -26,9 +26,24 @@ internal fun interface OwnedCalendarDeleteOperation {
     fun execute(request: OwnedCalendarDeleteRequest): Int
 }
 
+internal data class OwnedCalendarUpdateRequest(
+    val target: CalendarDeleteTarget,
+    val callerIsSyncAdapter: Boolean,
+    val accountNameParameter: String,
+    val accountTypeParameter: String,
+    val selection: String,
+    val selectionArguments: List<String>,
+    val displayName: String,
+)
+
+internal fun interface OwnedCalendarUpdateOperation {
+    fun execute(request: OwnedCalendarUpdateRequest): Int
+}
+
 internal class AndroidOwnedCalendarStore private constructor(
     private val resolver: ContentResolver?,
     private val deleteOperation: OwnedCalendarDeleteOperation,
+    private val updateOperation: OwnedCalendarUpdateOperation,
 ) : OwnedCalendarStore {
     constructor(contentResolver: ContentResolver) : this(
         resolver = contentResolver,
@@ -40,11 +55,31 @@ internal class AndroidOwnedCalendarStore private constructor(
                     request.selectionArguments.toTypedArray(),
                 )
             },
-    )
+        updateOperation =
+            OwnedCalendarUpdateOperation { request ->
+                contentResolver.update(
+                    request.target.contentUri().withSyncAdapterParameters(request),
+                    ContentValues().apply {
+                        put(Calendars.CALENDAR_DISPLAY_NAME, request.displayName)
+                    },
+                    request.selection,
+                    request.selectionArguments.toTypedArray(),
+                )
+            },
+        )
 
     internal constructor(deleteOperation: OwnedCalendarDeleteOperation) : this(
         resolver = null,
         deleteOperation = deleteOperation,
+        updateOperation = OwnedCalendarUpdateOperation { error("unused") },
+    )
+
+    internal constructor(
+        updateOperation: OwnedCalendarUpdateOperation,
+    ) : this(
+        resolver = null,
+        deleteOperation = OwnedCalendarDeleteOperation { error("unused") },
+        updateOperation = updateOperation,
     )
 
     override fun queryOwned(): List<OwnedCalendarRow> {
@@ -120,6 +155,25 @@ internal class AndroidOwnedCalendarStore private constructor(
             ),
         ) > 0
 
+    override fun updateDisplayName(calendarId: Long, displayName: String): Boolean =
+        updateOperation.execute(
+            OwnedCalendarUpdateRequest(
+                target = CalendarDeleteTarget.COLLECTION,
+                callerIsSyncAdapter = true,
+                accountNameParameter = OwnedCalendarIdentity.ACCOUNT_NAME,
+                accountTypeParameter = OwnedCalendarIdentity.ACCOUNT_TYPE,
+                selection = UPDATE_SELECTION,
+                selectionArguments =
+                    listOf(
+                        calendarId.toString(),
+                        OwnedCalendarIdentity.ACCOUNT_NAME,
+                        OwnedCalendarIdentity.ACCOUNT_TYPE,
+                        OwnedCalendarIdentity.INTERNAL_NAME,
+                    ),
+                displayName = displayName,
+            ),
+        ) > 0
+
     private fun syncAdapterUri(uri: Uri): Uri =
         uri.buildUpon()
             .appendQueryParameter(CalendarContract.CALLER_IS_SYNCADAPTER, "true")
@@ -145,6 +199,7 @@ internal class AndroidOwnedCalendarStore private constructor(
         const val OWNERSHIP_SELECTION =
             "${Calendars.ACCOUNT_NAME}=? AND ${Calendars.ACCOUNT_TYPE}=? AND ${Calendars.NAME}=?"
         const val DELETE_SELECTION = "${Calendars._ID}=? AND $OWNERSHIP_SELECTION"
+        const val UPDATE_SELECTION = DELETE_SELECTION
         val OWNERSHIP_ARGUMENTS =
             arrayOf(
                 OwnedCalendarIdentity.ACCOUNT_NAME,
@@ -160,6 +215,16 @@ private fun CalendarDeleteTarget.contentUri(): Uri =
     }
 
 private fun Uri.withSyncAdapterParameters(request: OwnedCalendarDeleteRequest): Uri =
+    buildUpon()
+        .appendQueryParameter(
+            CalendarContract.CALLER_IS_SYNCADAPTER,
+            request.callerIsSyncAdapter.toString(),
+        )
+        .appendQueryParameter(Calendars.ACCOUNT_NAME, request.accountNameParameter)
+        .appendQueryParameter(Calendars.ACCOUNT_TYPE, request.accountTypeParameter)
+        .build()
+
+private fun Uri.withSyncAdapterParameters(request: OwnedCalendarUpdateRequest): Uri =
     buildUpon()
         .appendQueryParameter(
             CalendarContract.CALLER_IS_SYNCADAPTER,

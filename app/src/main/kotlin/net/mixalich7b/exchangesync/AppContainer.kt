@@ -10,6 +10,7 @@ import net.mixalich7b.exchangesync.core.connection.VerifyConnectionAction
 import net.mixalich7b.exchangesync.infrastructure.activesync.AndroidActiveSyncProcessRuntime
 import net.mixalich7b.exchangesync.infrastructure.diagnostics.AndroidSyncDiagnostics
 import net.mixalich7b.exchangesync.infrastructure.calendar.AndroidOwnedCalendarAdapter
+import net.mixalich7b.exchangesync.infrastructure.calendar.AndroidOwnedCalendarDisplayNameMigrator
 import net.mixalich7b.exchangesync.infrastructure.notification.SyncProblemNotificationReporter
 import net.mixalich7b.exchangesync.infrastructure.permission.AndroidSyncPermissionPort
 import net.mixalich7b.exchangesync.infrastructure.persistence.DataStoreConnectionProfileRepository
@@ -54,6 +55,12 @@ internal class AppContainer(context: Context) {
             profileRepository = repository,
             stateRepository = synchronizationStateRepository,
             mutationLock = synchronizationMutationLock,
+        )
+
+    val ownedCalendarDisplayNameMigrator =
+        AndroidOwnedCalendarDisplayNameMigrator(
+            context = applicationContext,
+            dataStore = dataStore,
         )
 
     val syncProblems =

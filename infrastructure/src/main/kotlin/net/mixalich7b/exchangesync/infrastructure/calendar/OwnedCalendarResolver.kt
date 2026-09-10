@@ -8,6 +8,8 @@ internal interface OwnedCalendarStore {
     fun create(definition: OwnedCalendarDefinition): Long
 
     fun deleteOwned(calendarId: Long): Boolean
+
+    fun updateDisplayName(calendarId: Long, displayName: String): Boolean
 }
 
 internal data class OwnedCalendarResolution(

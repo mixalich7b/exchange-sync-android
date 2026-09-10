@@ -52,4 +52,34 @@ class AndroidOwnedCalendarStoreTest {
         assertEquals(listOf("99"), requests.single().selectionArguments.take(1))
         assertEquals(CalendarDeleteTarget.COLLECTION, requests.single().target)
     }
+
+    @Test
+    fun `display name update uses the sync-adapter collection target and complete ownership predicate`() {
+        lateinit var captured: OwnedCalendarUpdateRequest
+        val store =
+            AndroidOwnedCalendarStore(
+                OwnedCalendarUpdateOperation { request ->
+                    captured = request
+                    1
+                },
+            )
+
+        assertTrue(store.updateDisplayName(42, "Exchange-sync"))
+
+        assertEquals(CalendarDeleteTarget.COLLECTION, captured.target)
+        assertTrue(captured.callerIsSyncAdapter)
+        assertEquals("net.mixalich7b.exchangesync.calendar", captured.accountNameParameter)
+        assertEquals("LOCAL", captured.accountTypeParameter)
+        assertEquals("_id=? AND account_name=? AND account_type=? AND name=?", captured.selection)
+        assertEquals(
+            listOf(
+                "42",
+                "net.mixalich7b.exchangesync.calendar",
+                "LOCAL",
+                "exchange_primary_calendar",
+            ),
+            captured.selectionArguments,
+        )
+        assertEquals("Exchange-sync", captured.displayName)
+    }
 }

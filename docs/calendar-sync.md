@@ -195,7 +195,13 @@ series, а partial change сохраняет ранее синхронизиро
 
 Ownership определяется постоянными account name/type и внутренним именем, а не
 display name или email пользователя. Calendar создаётся как local,
-read-only/visible и изменяется только через sync-adapter-qualified URI.
+read-only/visible с отображаемым именем `Exchange-sync` и изменяется только
+через sync-adapter-qualified URI. При первом запуске обновлённой версии
+существующая owned calendar переименовывается на месте по полному ownership
+tuple: provider ID, события, reminders и прочие дочерние строки сохраняются.
+Успешное выполнение фиксируется в общем DataStore-маркере; при недоступности
+Calendar Provider маркер не записывается, и миграция повторяется при следующем
+запуске.
 Разрешение owned calendar ремонтирует дубликаты и воссоздаёт отсутствующую
 строку. Новая строка может принять данные только до первой страницы full sync.
 Если календарь исчез после committed full-sync page или во время incremental
