@@ -28,11 +28,12 @@ internal fun interface OwnedCalendarDeleteOperation {
 
 internal data class OwnedCalendarUpdateRequest(
     val target: CalendarDeleteTarget,
+    val calendarId: Long,
     val callerIsSyncAdapter: Boolean,
     val accountNameParameter: String,
     val accountTypeParameter: String,
-    val selection: String,
-    val selectionArguments: List<String>,
+    val selection: String?,
+    val selectionArguments: List<String>?,
     val displayName: String,
 )
 
@@ -58,12 +59,13 @@ internal class AndroidOwnedCalendarStore private constructor(
         updateOperation =
             OwnedCalendarUpdateOperation { request ->
                 contentResolver.update(
-                    request.target.contentUri().withSyncAdapterParameters(request),
+                    ContentUris.withAppendedId(request.target.contentUri(), request.calendarId)
+                        .withSyncAdapterParameters(request),
                     ContentValues().apply {
                         put(Calendars.CALENDAR_DISPLAY_NAME, request.displayName)
                     },
                     request.selection,
-                    request.selectionArguments.toTypedArray(),
+                    request.selectionArguments?.toTypedArray(),
                 )
             },
         )
@@ -159,17 +161,12 @@ internal class AndroidOwnedCalendarStore private constructor(
         updateOperation.execute(
             OwnedCalendarUpdateRequest(
                 target = CalendarDeleteTarget.COLLECTION,
+                calendarId = calendarId,
                 callerIsSyncAdapter = true,
                 accountNameParameter = OwnedCalendarIdentity.ACCOUNT_NAME,
                 accountTypeParameter = OwnedCalendarIdentity.ACCOUNT_TYPE,
-                selection = UPDATE_SELECTION,
-                selectionArguments =
-                    listOf(
-                        calendarId.toString(),
-                        OwnedCalendarIdentity.ACCOUNT_NAME,
-                        OwnedCalendarIdentity.ACCOUNT_TYPE,
-                        OwnedCalendarIdentity.INTERNAL_NAME,
-                    ),
+                selection = null,
+                selectionArguments = null,
                 displayName = displayName,
             ),
         ) > 0
@@ -199,7 +196,6 @@ internal class AndroidOwnedCalendarStore private constructor(
         const val OWNERSHIP_SELECTION =
             "${Calendars.ACCOUNT_NAME}=? AND ${Calendars.ACCOUNT_TYPE}=? AND ${Calendars.NAME}=?"
         const val DELETE_SELECTION = "${Calendars._ID}=? AND $OWNERSHIP_SELECTION"
-        const val UPDATE_SELECTION = DELETE_SELECTION
         val OWNERSHIP_ARGUMENTS =
             arrayOf(
                 OwnedCalendarIdentity.ACCOUNT_NAME,

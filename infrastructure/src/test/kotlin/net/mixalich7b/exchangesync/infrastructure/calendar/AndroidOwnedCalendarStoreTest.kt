@@ -2,6 +2,7 @@ package net.mixalich7b.exchangesync.infrastructure.calendar
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
@@ -54,7 +55,7 @@ class AndroidOwnedCalendarStoreTest {
     }
 
     @Test
-    fun `display name update uses the sync-adapter collection target and complete ownership predicate`() {
+    fun `display name update targets the owned calendar row without a selection`() {
         lateinit var captured: OwnedCalendarUpdateRequest
         val store =
             AndroidOwnedCalendarStore(
@@ -67,19 +68,12 @@ class AndroidOwnedCalendarStoreTest {
         assertTrue(store.updateDisplayName(42, "Exchange-sync"))
 
         assertEquals(CalendarDeleteTarget.COLLECTION, captured.target)
+        assertEquals(42, captured.calendarId)
         assertTrue(captured.callerIsSyncAdapter)
         assertEquals("net.mixalich7b.exchangesync.calendar", captured.accountNameParameter)
         assertEquals("LOCAL", captured.accountTypeParameter)
-        assertEquals("_id=? AND account_name=? AND account_type=? AND name=?", captured.selection)
-        assertEquals(
-            listOf(
-                "42",
-                "net.mixalich7b.exchangesync.calendar",
-                "LOCAL",
-                "exchange_primary_calendar",
-            ),
-            captured.selectionArguments,
-        )
+        assertNull(captured.selection)
+        assertNull(captured.selectionArguments)
         assertEquals("Exchange-sync", captured.displayName)
     }
 }
