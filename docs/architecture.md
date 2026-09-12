@@ -1,37 +1,33 @@
 # Архитектура приложения
 
+[Все документы](README.md)
+
+Exchange Sync самостоятельно переносит основной календарь частного Exchange
+в отдельный календарь Android. Здесь описаны граница продукта, модули и
+владельцы данных; детали процессов вынесены в тематические документы.
+
 ## Текущая граница
 
-Реализованы настройка единственного профиля Exchange, проверка HTTPS/mTLS и
-совместимости ActiveSync, а также одностороннее зеркало основного календаря
-Exchange в отдельный локальный календарь Android. Синхронизация переносит
-историю и будущие события, напоминания, recurrence и exceptions. Attendees
-материализуются полностью до 100 non-organizer rows; при превышении порога они
-опускаются все, а organizer сохраняется отдельно.
-Непринятые приглашения сохраняются как tentative и получают бледный
-event-color override; после принятия та же запись обновляется без смены
-ServerId identity и без дубликата.
+| Область | Реализовано |
+|---|---|
+| Платформа | Android 16; прямая локальная установка APK |
+| Подключение | Один профиль, ActiveSync через HTTPS:443 и mTLS |
+| Направление | Только Exchange → Android; локальные изменения и ответы на приглашения не отправляются |
+| Календарь | Один основной календарь; вся возвращённая сервером история и будущие события |
+| События | Напоминания, участники, приглашения, повторения и исключения — по [правилам представления](event-mapping.md) |
+| Выполнение | Ручной запуск и периодическая работа через WorkManager, независимо от Activity |
+| Проблемы | Сохранённое состояние ошибки и одно системное уведомление при наличии разрешения |
 
-Ручная и 15-минутная периодическая синхронизация выполняются через WorkManager,
-продолжаются без Activity и используют retry/backoff. Постоянные проблемы
-сохраняются в DataStore и, при наличии разрешения, показываются одним системным
-уведомлением. Реализация не регистрирует Android Exchange account или
-SyncAdapter и не отправляет локальные изменения обратно на сервер.
-
-Нормативное поведение описано в
-[`openspec/specs/`](../openspec/specs/), прежде всего в спецификациях
-[`connection-settings`](../openspec/specs/connection-settings/spec.md),
-[`calendar-sync`](../openspec/specs/calendar-sync/spec.md)
-и [`project-bootstrap`](../openspec/specs/project-bootstrap/spec.md).
+Приложение не регистрирует Android Exchange account или SyncAdapter.
+Нормативные требования: [подключение](../openspec/specs/connection-settings/spec.md),
+[календарь](../openspec/specs/calendar-sync/spec.md),
+[фоновая работа](../openspec/specs/sync-scheduling/spec.md),
+[уведомления](../openspec/specs/sync-problem-notifications/spec.md) и
+[граница проекта](../openspec/specs/project-bootstrap/spec.md).
 
 ## Модули и зависимости
 
-Разрешённое направление зависимостей:
-
-```text
-:app -> :feature:settings -> :core
-     -> :infrastructure  -> :core
-```
+![Разрешённые зависимости четырёх Gradle-модулей](diagrams/module-dependencies.svg)
 
 | Модуль | Ответственность |
 |---|---|
@@ -44,133 +40,69 @@ SyncAdapter и не отправляет локальные изменения �
 Kotlin/JVM-модулем без Android и HTTP API. Такое разделение оставляет доменную
 политику и переходы состояния доступными для локальных JVM unit-тестов.
 
-Статические зависимости и runtime-композиция показаны на
-[компонентной схеме приложения](diagrams/architecture-components.puml).
-
 ## Композиция приложения
 
-`ExchangeSyncApplication` создаёт один `AppContainer` на процесс, а контейнер
-вручную связывает:
+![Композиция приложения и его внешние адаптеры](diagrams/architecture-components.svg)
 
-- общий Preferences DataStore для профиля и sync metadata;
-- один process-wide ActiveSync runtime для проверки и календарных команд с
-  profile-scoped cookie/capability sessions;
-- owned-only Calendar Provider adapter;
-- WorkManager scheduler и ручной `WorkerFactory`;
-- permission port и generation-aware notification reporter;
-- Logcat-backed diagnostics adapter и Android-free `SyncDiagnosticsPort`;
-- один core-сценарий `VerifyConnection`, используемый и `SaveConnection`, и
-  ручной повторной проверкой;
-- core-сценарии `SaveConnection`, lifecycle, manual/periodic trigger и bounded
-  execution slice;
-- `SettingsViewModel` через lifecycle-aware `ViewModelProvider`.
+`ExchangeSyncApplication` создаёт один `AppContainer` на процесс.
+Контейнер вручную связывает следующие компоненты:
+
+| Группа | Компоненты |
+|---|---|
+| Подключение | Общий `VerifyConnection` для Save и повторной проверки; `SaveConnection` |
+| Синхронизация | Lifecycle, manual/periodic triggers, ограниченный по объёму execution slice |
+| Данные | Общий Preferences DataStore для профиля и sync metadata; адаптер собственного календаря |
+| Сеть | Один ActiveSync runtime с сеансами, привязанными к точному профилю |
+| Android | WorkManager scheduler, ручной `WorkerFactory`, permission port, generation-aware notification reporter |
+| Диагностика | Logcat adapter и Android-независимый `SyncDiagnosticsPort` |
+| UI | `SettingsViewModel` через lifecycle-aware `ViewModelProvider` |
 
 Dependency-injection framework не используется. Android KeyChain chooser
 остаётся на уровне Activity, поэтому feature-модуль получает только callback и
 alias выбранного сертификата.
 
-## Потоки проверки профиля
+## Основные процессы и границы
 
-Сохранение реализовано как validate-probe-commit:
+| Процесс | Где описан |
+|---|---|
+| Валидация → проверка → commit профиля → запуск синхронизации | [Подключение](connection.md#сохранение-и-повторная-проверка) |
+| KeyChain, TLS, capability discovery и HTTP-сеанс | [Транспорт](transport.md) |
+| Получение страницы → применение → commit checkpoint | [Синхронизация](calendar-sync.md) |
+| Сериализация записей и проверка актуальности worker | [Calendar Provider](calendar-provider.md#конкурентный-доступ) |
+| Запуск, продолжение, отмена и отключение | [Фоновая синхронизация](background-sync.md) |
 
-1. Compose-экран передаёт текущий draft во ViewModel.
-2. Core валидирует все четыре значения без сетевого доступа.
-3. Infrastructure разрешает KeyChain alias в закрытый ключ и цепочку
-   сертификатов только на время проверки.
-4. Infrastructure создаёт объединённый TLS-контекст и выполняет ActiveSync
-   `OPTIONS` probe.
-5. После полного успеха profile replacement и новая synchronization generation
-   фиксируются одной DataStore-транзакцией.
-6. В non-cancellable post-commit handoff очищается только owned calendar,
-   восстанавливаются periodic/immediate work и запускается полный sync.
-7. ViewModel показывает подключённое состояние либо сохраняет введённый draft
-   и отображает типизированную ошибку.
-
-TLS transport предоставляет только выбранную fixed client identity. Успешный
-проверенный response не зависит от того, публикует ли Android provider локальную
-цепочку через handshake metadata; опубликованное несовпадение при этом
-отклоняется. Redirects для `OPTIONS` и ActiveSync `POST` выполняет общий
-application-controlled tracker при отключённых automatic redirects OkHttp, так
-что HTTPS-only, cycle/five-hop policy и сохранение method/body едины на обоих
-путях.
-
-Редактирование формы и выбор сертификата сами по себе не запускают сеть и не
-изменяют сохранённый профиль. Повторный Save блокируется до завершения текущей
-проверки.
-
-Для неизменённого загруженного профиля ViewModel также запускает общий
-`VerifyConnection` без `SaveConnection`: результат проходит те же validation,
-mTLS, TLS, redirect и ActiveSync checks, но не вызывает repository replacement.
-После успеха ViewModel показывает terminal TLS certificate diagnostics; после
-изменения формы или неуспешной попытки эти diagnostics очищаются и не
-persistятся.
-
-## Android и конкурентные границы
-
-Android API сосредоточены в `:app` и `:infrastructure`. Начальная загрузка
-профиля представлена отдельным состоянием: до её завершения поля, certificate
-chooser и Save заблокированы, поэтому позднее чтение DataStore не может
-перезаписать пользовательский draft.
-
-ViewModel хранит private snapshot последнего загруженного или успешно
-сохранённого профиля. Только равный ему draft может пройти ручную повторную
-проверку. Save и повторная проверка представлены одним operation state, поэтому
-во время любой проверки заблокированы все поля, chooser и оба действия; поздний
-результат не может быть показан для другого draft.
-
-Provider mutations и изменения generation/run token сериализуются общим
-`SynchronizationMutationLock` на всю Calendar page. Упорядоченный provider plan
-применяется атомарными вызовами не более чем по 50 операций; перед каждым
-вызовом повторно проверяются cancellation и fence. Поэтому старый worker не
-начинает следующий sub-batch, `resolveOwned` или cleanup после
-profile/cancel/disable fence. Уже подтверждённый префикс page может быть видим
-после поздней или неоднозначной ошибки, но новый SyncKey сохраняется только
-после всех sub-batches. Повтор страницы идемпотентен по ServerId и сходится без
-дубликатов parent/child rows.
-
-Получение материала из KeyChain и создание TLS transport выполняются вне Main
-dispatcher. Создание trust managers, `SSLContext` и OkHttp-клиента синхронно и
-не получает отдельный жёсткий deadline. Если security provider блокируется,
-Save может оставаться активным дольше номинального timeout; это принятый
-trade-off текущей реализации.
-
-Созданный один раз на процесс ActiveSync runtime разделяет только внутри точной
-profile identity потокобезопасный cookie jar и live capability result. Реестр
-ограничен четырьмя LRU entries. Новые verifier/remote-calendar transports для
-того же профиля получают этот сеанс, но продолжают создавать TLS client с
-выбранной mTLS identity и объединённым server trust. После process death сеанс
-пуст: перед календарной командой выполняется новый `OPTIONS`; persisted protocol
-version сохраняется только если остаётся в свежем advertised set.
+Android API сосредоточены в `:app` и `:infrastructure`.
+ViewModel защищает редактируемую форму от поздней загрузки и результатов
+проверки, а core координирует фоновые операции через порты.
 
 ## Хранение данных
 
-Preferences DataStore содержит ровно один профиль:
+| Данные | Где находятся | Срок жизни |
+|---|---|---|
+| Email, `domain\login`, hostname, непрозрачный KeyChain alias | Preferences DataStore | До замены профиля |
+| Generation, run token, phase, safe problem, device ID, last-success, checkpoints и служебные sync-флаги | Namespace `sync.` того же DataStore | Между запусками приложения |
+| Перенесённые события и дочерние строки | Собственный календарь в Android Calendar Provider | До серверного изменения, очистки или восстановления зеркала |
+| Закрытый ключ | Android KeyChain; приложение получает runtime handle | Управляется Android |
+| Cookie, capabilities, подготовленная папка и pacer | Память ActiveSync-сеанса | До завершения процесса или вытеснения сеанса |
+| Успешная TLS-сводка | Текущее состояние ViewModel | Пока результат актуален; не восстанавливается из DataStore |
+| Диагностические записи | Системный Logcat | До ротации или очистки буфера Android |
 
-- email;
-- имя в формате `domain\login`;
-- hostname сервера;
-- непрозрачный KeyChain alias.
+Пароль в модели отсутствует. DataStore не хранит ключи и байты сертификатов,
+ответы сервера, event payload, TLS-сводки, exception text или stack traces.
+Backup приложения отключён. Политика логов описана отдельно в
+[справочнике диагностики](reference/diagnostic-fields.md).
 
-В том же DataStore, под отдельным `sync.` namespace, находятся non-secret
-generation/run token, phase, safe problem category, device ID, last-success и
-ActiveSync endpoint/version/folder/collection checkpoints. Пароль, закрытый
-ключ, байты сертификата, ответы сервера, event payload, exception text,
-TLS-диагностика и stack trace не сохраняются. Успешная TLS-диагностика содержит только public metadata
-terminal peer chain: hostname, subject/issuer, serial, validity и SHA-256
-fingerprint. Android продолжает владеть закрытым ключом, а backup приложения
-отключён.
+## Термины
 
-Process-local cookie/capability sessions и структурированные diagnostic records
-также не сохраняются в DataStore. Diagnostics идут только в системный Logcat с
-тегом `ExchangeSync`; приложение не создаёт архив, экран просмотра или канал
-upload. Корреляция сетевых, protocol, provider и worker boundaries выполняется
-process-local operation ID и, для sync, generation/run token. Безопасные поля и
-ADB-команды описаны в [диагностике](diagnostics.md). Отдельные узкие records
-успешных attendee suppression и provider sub-batch progress показывают только
-агрегаты. Только failure-only snapshots отклонённого события или failed provider
-operation могут включать разрешённые protocol/provider identifiers,
-row/back-reference identity, location, time, timezone и recurrence; subject/body,
-attendee/organizer values, SyncKey и payload туда не попадают.
+| Термин | Значение |
+|---|---|
+| Generation | Поколение синхронизации; изменение делает прежнюю работу неактуальной |
+| Run token | Идентификатор логического запуска внутри поколения |
+| Fence | Пара generation/run token, проверяемая перед побочными эффектами |
+| Checkpoint | Сохранённая позиция протокола после полностью применённой страницы |
+| Owned calendar | Календарь, принадлежащий приложению по внутренним признакам ownership |
+| Page / sub-batch | Страница изменений Exchange / один атомарный вызов записи части её плана |
+| Slice / continuation | Ограниченный участок выполнения / фоновая задача его продолжения |
 
 ## Проверка реализации
 
