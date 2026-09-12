@@ -1,54 +1,71 @@
 @startuml
-title Запуск и продолжение фоновой работы
+title Как выполняется фоновая синхронизация
 skinparam shadowing false
 skinparam backgroundColor white
 skinparam sequenceMessageAlign center
+skinparam ParticipantPadding 15
+skinparam maxMessageSize 180
 hide footbox
-autonumber
-actor Trigger
-control "Core lifecycle\n/ trigger" as Core
-database SyncState
-queue "Scheduler /\nWorkManager" as Work
-control "Execution worker\n/ slice" as Worker
-participant "Remote /\nowned calendar" as Adapters
 
-Trigger -> Core : Save / Enable /\nSync Now / periodic
-Core -> SyncState : transition + eligibility
-alt запуск разрешён
-  SyncState --> Core : QUEUED + fence
-  Core -> Work : unique execution
-  Work --> Core : durable enqueue
-else run активен / trigger недопустим
-  SyncState --> Core : Coalesced / Ignored
+actor "Пользователь /\nрасписание" as Trigger
+control "Координатор\nзапусков" as Core
+database "Сохранённое\nсостояние" as State
+queue "Фоновая работа\nWorkManager" as Work
+participant "Обработка страницы\nExchange → Android" as Calendar
+
+group 1. Запросить запуск
+  Trigger -> Core : сохранить профиль / включить /\nзапустить сейчас / очередной период
+  Core -> State : проверить, можно ли запустить
+  alt запуск разрешён
+    State --> Core : сохранить «Ожидает запуска»
+    Core -> Work : поставить единственную задачу
+    Work --> Core : подтвердить постановку
+  else работа уже идёт
+    State --> Core : запомнить одну повторную проверку
+  else запуск недопустим
+    State --> Core : не запускать
+  end
 end
+
 note over Core, Work
-Новый профиль / Enable: сначала owned cleanup,
-затем immediate и одна periodic work (15 минут).
+При новом профиле или включении:
+сначала очистить календарь приложения,
+затем настроить запуск и периодическую задачу.
 end note
-Work -> Worker : doWork(fence)
-Worker -> SyncState : проверить fence
-alt fence устарел
-  Worker --> Work : success (Obsolete)
-else fence актуален
-  loop pages, пока есть изменения и не достигнут лимит
-    Worker -> Adapters : fetchPage + applyPage
-    Adapters --> Worker : outcome
-    Worker -> SyncState : commit только\nпосле полного apply
-    Worker -> Worker : после успешной page:\n10 страниц / 4 минуты?
+
+group 2. Выполнить задачу, когда Android её запустит
+  Work -> State : проверить актуальность запуска
+  break запуск отменён или заменён
+    Work -> Work : завершить без новых действий
   end
-  alt terminal page, нет follow-up
-    Worker -> SyncState : IDLE + last success
-    Worker --> Work : success
-  else continuation / recoverable reset / capacity
-    Worker -> SyncState : QUEUED
-    Worker -> Work : continuation, тот же fence
-    Worker --> Work : success
-  else transient, budget не исчерпан
-    Worker -> SyncState : QUEUED + attempts
-    Worker --> Work : retry, backoff от 30 секунд
-  else persistent / пятая transient failure
-    Worker -> SyncState : BLOCKED + safe problem
-    Worker --> Work : success
+  loop до конца данных, ошибки или лимита участка
+    Work -> Calendar : получить страницу и записать в календарь
+    alt страница полностью записана
+      Calendar --> Work : успех
+      Work -> State : сохранить позицию синхронизации\n(checkpoint), если запуск актуален
+      Work -> Work : если есть ещё страницы:\nдостигнуты 10 страниц или 4 минуты?
+    else ошибка
+      Calendar --> Work : причина сбоя
+      Work -> Work : checkpoint страницы не продвигать;\nвыйти из цикла страниц
+    end
   end
 end
+
+group 3. Завершить или продолжить
+  alt всё получено, повторная проверка не запрошена
+    Work -> State : «Готова к запуску» + время успеха
+  else осталось продолжение
+    Work -> State : «Ожидает запуска»
+    Work -> Work : поставить следующую задачу\nс тем же номером запуска
+  else ошибка
+    Work -> State : возможен повтор / восстановление:\n«Ожидает запуска»; иначе — «Требует внимания»
+  end
+end
+
+legend bottom
+Перед новыми запросами и записью проверяется актуальность запуска.
+Лимиты проверяются после успешной страницы, а не по жёсткому таймеру.
+Новая задача продолжения сохраняет generation/run token.
+Повторы, уменьшение окна и полный сброс описаны в таблице ошибок.
+endlegend
 @enduml

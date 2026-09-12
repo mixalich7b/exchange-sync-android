@@ -1,50 +1,48 @@
 @startuml
-title Состояния синхронизации
+title Состояния фоновой синхронизации
 hide empty description
 skinparam shadowing false
 skinparam backgroundColor white
 skinparam state {
-  BackgroundColor #FFF6DA
-  BorderColor #8A6D1D
+  BackgroundColor #EAF2FA
+  BorderColor #54718A
 }
-state DISABLED
-state "enabled = true" as Enabled {
-  state IDLE
-  state BLOCKED
-  state CANCELLING
+state "Отключена" as DISABLED #F0F0F0
+state "Синхронизация включена" as Enabled {
+  state "Готова к запуску" as IDLE #E9F4E8
+  state "Требует внимания" as BLOCKED #FFF0DC
+  state "Отменяется" as CANCELLING #F0F0F0
   state "Ожидание и выполнение" as Active {
-    state QUEUED
-    state DISCOVERING_PROTOCOL
-    state DISCOVERING_FOLDERS
-    state DOWNLOADING
-    state APPLYING
-    QUEUED --> DISCOVERING_PROTOCOL : нет live capabilities
-    QUEUED --> DISCOVERING_FOLDERS : capabilities есть
-    DISCOVERING_PROTOCOL --> DISCOVERING_FOLDERS : OPTIONS
+    state "Ожидает запуска" as QUEUED
+    state "Проверяет протокол" as DISCOVERING_PROTOCOL
+    state "Готовит папку\nкалендаря" as DISCOVERING_FOLDERS
+    state "Получает страницу" as DOWNLOADING
+    state "Записывает страницу" as APPLYING
+
+    QUEUED --> DISCOVERING_PROTOCOL : нужна проверка
+    QUEUED --> DISCOVERING_FOLDERS : протокол\nуже известен
+    DISCOVERING_PROTOCOL --> DISCOVERING_FOLDERS : протокол подходит
     DISCOVERING_FOLDERS --> DOWNLOADING : папка готова
-    DOWNLOADING --> APPLYING : page получена
-    APPLYING --> DISCOVERING_FOLDERS : MoreAvailable, slice продолжается
-    APPLYING --> QUEUED : continuation / follow-up
+    DOWNLOADING --> APPLYING : страница получена
+    APPLYING --> DISCOVERING_FOLDERS : следующая страница
+    APPLYING --> QUEUED : нужна следующая задача\nили повторная проверка
   }
-  IDLE --> QUEUED : Sync Now / periodic
-  BLOCKED --> QUEUED : ручной retry / periodic\nпосле TRANSIENT_EXHAUSTED
-  APPLYING --> IDLE : terminal page, нет follow-up
-  Active --> CANCELLING : Cancel, run token++
-  CANCELLING --> IDLE : execution отменена
-  Active --> BLOCKED : постоянная проблема\nили исчерпан retry budget
+  IDLE --> QUEUED : запуск сейчас\nили по расписанию
+  BLOCKED --> QUEUED : ручная попытка;\nпо расписанию — только после\nпяти временных сбоев подряд
+  APPLYING --> IDLE : всё записано,\nповтор не запрошен
+  Active --> CANCELLING : отменить
+  CANCELLING --> IDLE : текущая работа отменена
+  Active --> BLOCKED : постоянная ошибка\nили пять временных\nсбоев подряд
 }
 [*] --> DISABLED
-DISABLED --> QUEUED : activation / Enable\nновая generation + run token
-Enabled --> DISABLED : Disable\ninvalidate, cancel, cleanup
+DISABLED --> QUEUED : активировать профиль\nили включить
+Enabled --> DISABLED : отключить:\nотменить задачи,\nудалить свой календарь
 
 legend bottom
-Transient failure -> QUEUED + retry.
-Recoverable capacity/reset -> QUEUED + continuation.
-Cold process: активная phase -> QUEUED.
-Повторный trigger сохраняет один follow-up.
-Cleanup failure оставляет DISABLED + pending cleanup.
-Retry очистки не включает сеть или schedules.
-Побочные эффекты разрешены только
-при совпадении generation/run token.
+При временном сбое: ожидание повтора с задержкой.
+При восстановлении или продолжении: ожидание следующей задачи.
+После перезапуска процесса активная работа снова ожидает запуска.
+Неудачная очистка оставляет синхронизацию отключённой.
+Точные имена состояний и условия повторов — в документе рядом.
 endlegend
 @enduml
