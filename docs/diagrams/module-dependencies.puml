@@ -1,0 +1,15 @@
+@startuml
+title Разрешённые зависимости модулей
+left to right direction
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam backgroundColor white
+component ":app" as App #E8F3FF
+component ":feature:settings" as Settings #EEF9E8
+component ":infrastructure" as Infra #F5ECFF
+component ":core\nчистый Kotlin/JVM" as Core #FFF6DA
+App --> Settings
+App --> Infra
+Settings --> Core
+Infra --> Core
+@enduml

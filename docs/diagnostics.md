@@ -1,5 +1,129 @@
 # Диагностика через Logcat
 
+[Все документы](README.md)
+
+Приложение пишет структурированные записи с тегом `ExchangeSync` в системный
+Logcat. Начните со сбора, найдите конечный результат операции, затем переходите
+к записям соответствующей подсистемы.
+
+Нормативные сценарии: [diagnostic-logging](../openspec/specs/diagnostic-logging/spec.md).
+Точные поля и правила раскрытия:
+[справочник диагностики](reference/diagnostic-fields.md).
+
+## Содержание
+
+- [Сбор через ADB](#сбор-через-adb)
+- [Корреляция записей](#корреляция-записей)
+- [Как читать результат](#как-читать-результат)
+- [Ошибка Calendar Provider](#ошибка-calendar-provider)
+- [Уровни логирования](#уровни-логирования)
+- [Граница реализации](#граница-реализации)
+
+## Сбор через ADB
+
+Убедитесь, что Android 16 device подключено:
+
+```shell
+adb devices -l
+```
+
+Для чтения уже удерживаемых записей:
+
+```shell
+adb logcat -d -v threadtime -s 'ExchangeSync:V' '*:S'
+```
+
+Для наблюдения в реальном времени запустите фильтр и воспроизведите ошибку:
+
+```shell
+adb logcat -v threadtime -s 'ExchangeSync:V' '*:S'
+```
+
+При необходимости чистого воспроизведения можно предварительно очистить буфер.
+**Команда ниже очищает общий Logcat устройства**, включая записи других приложений.
+Не выполняйте её, если предыдущие записи ещё нужны:
+
+```shell
+adb logcat -c
+```
+
+Фильтр по tag намеренно не привязан к PID: в сборе остаются записи до и после
+пересоздания процесса. Перед передачей логов проверьте корреляцию и соблюдение
+[политики раскрытия данных](reference/diagnostic-fields.md#политика-раскрытия-данных).
+
+## Корреляция записей
+
+1. Найдите terminal `failure` / `outcome`.
+2. Соберите записи с тем же `operation` внутри этого процесса.
+3. Для синхронизации дополнительно сопоставьте `generation` и `run_token`.
+4. Для большого snapshot соберите все части `chunk=N/M`.
+5. Проверьте результат checkpoint: наличие provider progress ещё не означает commit.
+
+| Поле | Назначение |
+|---|---|
+| `component`, `stage` | Подсистема и граница операции |
+| `operation`, `operation_kind` | Связь шагов внутри процесса |
+| `generation`, `run_token` | Поколение и логический sync-run |
+| `chunk=N/M` | Порядок частей большого failure snapshot |
+
+Operation IDs начинаются заново после перезапуска процесса и не являются
+persisted IDs. Нельзя объединять разные процессы только по совпавшему `operation`.
+
+## Как читать результат
+
+| Сигнал | Значение / следующий шаг |
+|---|---|
+| `capacity_outcome=window_reduction` | Восстанавливаемое превышение размера: окно уменьшено, checkpoint сохранён |
+| `minimum_window_block` | Лимит превышен даже при window 1; элемент не пропущен |
+| `MALFORMED_WBXML` | Настоящая syntax/encoding/token/structure ошибка |
+| `folder_preparation=reuse` | Подготовка папки переиспользована; нового успешного `FolderSync` request record нет |
+| `cold_refresh` / `refresh` / `invalidated` | Причина обновления записывается до command outcome, включая неуспешный refresh |
+| `attendee_suppression` | Превышен лимит non-organizer rows; итог `organizer_only` или `empty` |
+| `checkpoint_outcome=committed` | Страница полностью применена, checkpoint сохранён |
+| `checkpoint_outcome=skipped` / `failed` | Нельзя считать новый checkpoint сохранённым |
+
+`http_response_bytes`, `wbxml_document_bytes` и `wbxml_element_count`
+на обычной Calendar page при window > 1 обозначают adaptive recovery.
+При window 1 remote capacity блокирует run как `PROTOCOL_DATA`;
+`calendar_provider_transaction` — как `CALENDAR_PROVIDER`.
+`wbxml_depth` и `wbxml_inline_string_bytes` остаются terminal.
+
+`wbxml_element_count` возникает только при попытке прочитать 256 001-й
+элемент. Документ с не более чем 256 000 элементов может пройти обычные decode,
+attendee suppression, provider batches и commit.
+
+Полные [лимиты и правила восстановления](calendar-sync.md#ограничения-и-уменьшение-окна),
+[правила участников](event-mapping.md#участники).
+
+## Ошибка Calendar Provider
+
+`provider_batch` сначала фиксирует общий размер plan, затем подтверждённые
+sub-batches: номер, размер и cumulative число применённых операций.
+
+| Результат | Как интерпретировать |
+|---|---|
+| Успешный вызов | Только aggregate records |
+| Ошибка активного Binder call | Сначала aggregate outcome, затем detail каждой переданной операции; `provider_call_outcome=unknown` |
+| Неоднозначный вызов | `applied_operation_count` отсутствует; известный префикс отражён только в `confirmed_operation_count` |
+| Ошибка построения request до Binder | `unsubmitted_operation`, без `provider_call_outcome` и без утверждения о попытке записи |
+
+Detail failed call не доказывает, какая операция вызвала ошибку или применилось
+ли что-либо внутри неоднозначного вызова. Ранее подтверждённый префикс остаётся
+посчитанным. В обоих случаях ошибки checkpoint страницы не считается committed.
+
+Concrete cause ограничен enum: например, `remote`, `operation_application`,
+`invalid_result`, `transaction_too_large`. При capacity failure следующая
+запись того же generation/run token показывает `window_reduction` либо
+`minimum_window_block`; остальные permanent failures связываются с terminal block.
+
+## Уровни логирования
+
+| Уровень | События |
+|---|---|
+| `INFO` | Начало, capability/phase, terminal success/cancellation/obsolete; успешные RESPONSE, CALENDAR_SYNC, OWNERSHIP, EVENT_MAP, PROVIDER_BATCH, cleanup; checkpoint committed/skipped |
+| `WARN` | Rejected redirect, protocol/HTTP validation, invalid event, recoverable retry/reset, checkpoint failed |
+| `ERROR` | TLS/mTLS, block, критические локальные и неожиданные ошибки; неуспешный или exception-based cleanup |
+
 ## Граница реализации
 
 Приложение пишет структурированные on-device records в системный Logcat под
@@ -13,226 +137,3 @@ telemetry или analytics нет. Доступны только records, кот
 системный log buffer Android; после очистки или ротации восстановить их из
 приложения нельзя. Ошибка форматирования или записи diagnostics не меняет
 результат пользовательской операции.
-
-## Поля и корреляция
-
-Каждая строка начинается с allow-listed `component` и `stage`. В зависимости от
-границы она может содержать:
-
-- `operation` и `operation_kind` — уникальная в текущем процессе связь шагов;
-- `generation`, `run_token`, `trigger`, `phase` и `attempt` для sync/worker;
-- HTTP `method`, ActiveSync `command`, `host` и `path` без query, `status` и
-  `timeout_ms`;
-- безопасные protocol versions/commands, `reason`, `failure` и `outcome`;
-- opaque `server_id` для отклонённого события;
-- local-CA filename, длину certificate chain, алгоритм публичного ключа и
-  SHA-256 fingerprint, когда эти metadata доступны;
-- для `Sync` response/page — `sync_mode` (`priming`, `full`, `incremental`),
-  `window_size`, `response_bytes`, `response_empty`, `command_count`,
-  `add_count`, `change_count`, `delete_count`, `more_available` и
-  `key_advanced` без значений ключей;
-- для bounded page/provider capacity — `capacity_kind` (`http_response_bytes`,
-  `wbxml_document_bytes`, `wbxml_element_count`, `wbxml_depth`,
-  `wbxml_inline_string_bytes`, `calendar_provider_transaction`), typed
-  `capacity_command`, `capacity_outcome` (`window_reduction`,
-  `minimum_window_block`, `terminal`), safe `capacity_problem`, текущий
-  `window_size` и `reduced_window_size`, когда уменьшение возможно;
-- для подготовки основной папки — `folder_preparation` (`cold_refresh`,
-  `refresh`, `reuse`, `invalidated`); успешный `reuse` не сопровождается новым
-  successful `FolderSync` request record, а причина refresh фиксируется до
-  отдельного command outcome даже при неуспешном запросе;
-- для owned-calendar/provider boundaries — `ownership_action` (`created`,
-  `reused`, `repaired`, `deleted`, `unchanged`), `input_count`,
-  `accepted_count`, `rejected_count`, `planned_operation_count`,
-  `attempted_operation_count` и `applied_operation_count`;
-- для attendee suppression — `attendee_limit`, `attendee_input_count`,
-  `attendee_omitted_count` и безопасное `attendee_representation`
-  (`organizer_only`, `empty`);
-- для provider page/sub-batch — `provider_operation_count`, `sub_batch_count`,
-  `sub_batch_ordinal`, `sub_batch_operation_count`, cumulative
-  `confirmed_operation_count` и `provider_call_outcome` (`confirmed`,
-  `unknown`), а для ошибки — типизированный `provider_failure_cause` без текста
-  исключения;
-- только при отклонении calendar Add/Change или локального представления —
-  `snapshot=calendar_failure`, command kind, opaque `server_id`, стабильный
-  validation/planning `rule`, `failed_field`, event/exception path, безопасный
-  attendee index и типизированные поля со source `response`, `prior`,
-  `effective`, `exception` или `derived`; attendee subfields сохраняют только
-  presence, а число совпадений с текущим пользователем — только bounded count;
-- только после ошибки активного Calendar Provider call —
-  `snapshot=provider_operation` для каждой attempted операции: global/local
-  index, operation kind, target, существующая row/back-reference/sync identity,
-  состояния известных columns и разрешённые политикой значения;
-- ошибка построения provider request до `applyBatch` использует те же безопасные
-  snapshots как `unsubmitted_operation`, но не выставляет
-  `provider_call_outcome` и не называет операцию attempted;
-- для cleanup — `cleanup_trigger` (`profile_activation`, `full_reset`,
-  `disable`, `startup`, `permission_recovery`, `user_retry`), bounded row и
-  operation counts, delete outcome и durable failure category;
-- для checkpoint boundary — `checkpoint_outcome` (`committed`, `skipped`,
-  `failed`);
-- bounded exception/cause class graph и ограниченные stack frames; сообщения
-  допускаются только на границах, где они могут быть безопасно очищены.
-
-Большой failure snapshot разбивается на детерминированные записи с тем же
-`operation`, `generation` и `run_token` и ordinal `chunk=N/M`; каждая разрешённая
-field/column detail сохраняется ровно в одном chunk. Все новые числовые
-progress-поля formatter ограничивает диапазоном
-`0..1_000_000`. Полная запись ограничена 3000 символами, отдельное очищенное
-строковое значение — 256 символами, exception graph — восемью объектами,
-32 попытками обхода/ожидающими объектами и четырьмя stack frames на объект,
-а его итоговое представление — 1024 символами. Цикл помечается как `cycle`,
-остаток за пределом лимита — как `truncated`.
-
-Обычный путь расследования: найти terminal `failure`/`outcome`, затем собрать
-строки с тем же `operation`. Для синхронизации дополнительно сопоставляются
-`generation` и `run_token`. Идентификаторы operation начинаются заново после
-перезапуска процесса и не являются persisted IDs.
-
-`http_response_bytes`, `wbxml_document_bytes` и `wbxml_element_count` на обычной
-Calendar page при window больше одного означают adaptive recovery, а не
-malformed server data:
-связанные записи показывают старое и уменьшенное window и неизменённый
-checkpoint. `minimum_window_block` означает terminal `PROTOCOL_DATA` без
-пропуска элемента. `wbxml_element_count` возникает только при попытке прочитать
-256 001-й элемент: response не более чем с 256 000 элементов продолжает
-full-tree decode и может дать обычные `CALENDAR_SYNC`, attendee suppression,
-provider batch и checkpoint `committed` records. `wbxml_depth` и
-`wbxml_inline_string_bytes` остаются
-terminal, а настоящий syntax/encoding/token/structure defect сохраняет
-`MALFORMED_WBXML`. `folder_preparation` позволяет отличить cold/new-run refresh,
-reuse в page/retry/continuation и invalidation, не раскрывая содержимое cache.
-`calendar_provider_transaction` использует тот же typed window outcome, но
-сохраняет terminal problem `CALENDAR_PROVIDER` при window один.
-
-`attendee_suppression` означает, что effective список non-organizer attendees
-превысил лимит материализации; запись сообщает только лимит, входное и
-опущенное количество и итог `organizer_only`/`empty`. `provider_batch` сначала
-фиксирует общий размер plan, затем подтверждённые sub-batches с их порядковым
-номером, размером и cumulative числом применённых операций. Успешные вызовы
-остаются aggregate-only. При ошибке сначала пишется прежний aggregate outcome,
-а за ним — detail для каждой операции, переданной в failed call. Ошибка
-активного Binder-вызова получает `provider_call_outcome=unknown`: ранее
-подтверждённый префикс остаётся посчитанным, но detail не утверждает, какая
-операция была причиной и применилась ли какая-либо часть неоднозначного вызова.
-Для такого вызова `applied_operation_count` опускается, а известный префикс
-остаётся только в `confirmed_operation_count`. Ошибка локального построения
-request до Binder сохраняет операции как `unsubmitted_operation` без unknown
-call outcome. В обоих случаях checkpoint страницы не считается committed.
-Concrete cause остаётся ограниченным enum, например `remote`,
-`operation_application`, `invalid_result` или `transaction_too_large`. Для
-capacity failure следующий record с теми же `generation`/`run_token` сообщает
-точный `window_reduction` либо `minimum_window_block`; остальные permanent
-provider failures связываются с последующим terminal block record по тому же
-fence.
-
-Уровень `INFO` отмечает начало, capability/phase и terminal
-success/cancellation/obsolete. На нём же пишутся успешные `RESPONSE`, decoded
-`CALENDAR_SYNC`, `OWNERSHIP`, `EVENT_MAP`, `PROVIDER_BATCH`, cleanup success и
-checkpoint `committed`/`skipped`. `WARN` используется для rejected redirect,
-protocol/HTTP validation, invalid event, recoverable retry/reset и checkpoint
-`failed`. TLS/mTLS, block, критические локальные и неожиданные ошибки, а также
-неуспешный или exception-based cleanup имеют `ERROR`.
-
-## Failure-only field policy и запрещённые данные
-
-Подробные calendar/provider values появляются только на соответствующем пути
-ошибки. Для успешных parse/map/planning/provider операций сохраняются прежние
-aggregate records без значений. Политика snapshot является явным allow-list:
-
-- полное очищенное значение разрешено для UID/protocol identifiers, location,
-  времени, duration/relationship, all-day, timezone, recurrence, exception
-  identity и non-narrative metadata, meeting/response state, availability,
-  sensitivity, reminder, provider row/back-reference identity и технических
-  provider columns;
-- только `absent`/`empty`/`present` и bounded count разрешены для subject/title,
-  body/description, attendees и organizer; submitted attendee/organizer values
-  не сохраняются даже в provider-operation snapshot;
-- неизвестный тип provider value обозначается стабильным именем типа без вызова
-  произвольного `toString()`;
-- неизвестная provider column сохраняет анонимную structural presence с ключом
-  `<unknown>`, без исходного имени или значения; отдельная completeness-проверка
-  требует явной policy-классификации каждой новой `CalendarProviderField`;
-- raw WBXML/application tree, event export и другие payload containers не
-  передаются из boundary projector в event model или throwable graph.
-
-Каждое разрешённое строковое значение всё равно проходит общий sanitizer:
-email/account/header редактируется, абсолютный URI с корректным `scheme:`
-заменяется целиком, query component удаляется, control characters очищаются, а
-длина ограничивается до chunking. Канонический fixed-offset provider timezone
-вида `GMT±HH:MM` сохраняется как разрешённое timezone value и не считается URI.
-
-Diagnostics не должны содержать:
-
-- имена, значения или атрибуты cookie и заголовки `Cookie`/`Set-Cookie`;
-- `Authorization`, email, `domain\login` или KeyChain alias;
-- private keys, PEM/DER и другие raw certificate encodings;
-- полный URL, user-info, query string, request/response body, WBXML или raw
-  application/event payload;
-- значения subject/title и body/description, значения attendees и organizer;
-- значения FolderSync/collection SyncKey, primary collection ID, account
-  identity и любые calendar/provider values в progress summaries;
-- raw exception output.
-
-Progress summaries дополнительно не используют даже допустимый для точечной
-ошибки opaque `server_id`: они содержат только перечисленные выше агрегаты,
-booleans и enums. `response_bytes` — только ограниченный размер, а
-`key_advanced` — только boolean сравнения; ни body, ни предыдущее/следующее
-значение ключа в event model не передаются. Exception messages полностью
-опускаются для `WBXML`, `FolderSync`, `CalendarSync`, event parse/map, Calendar
-Provider и core synchronization stages; там остаются только классы и
-ограниченные frames.
-
-Capacity, folder-preparation и attendee-suppression records
-имеют более узкий formatter path: кроме `component`, `stage`, process-local
-operation ID, `generation`/`run_token` он принимает только соответствующие
-typed enums, bounded counts/window values и allow-listed failure/outcome. Свободные
-`command`/`reason`, host/path, `server_id`, provider row ID и exception text для этих
-records не форматируются. Поэтому collection ID, folder name, FolderSync и
-collection SyncKey, email, `domain\login`, payload и текст исключения не могут
-попасть в эти записи даже при ошибочном заполнении общего event model.
-
-Call sites передают только типизированные разрешённые поля. Дополнительный
-централизованный formatter ограничивает длину и глубину exception graph,
-обрывает циклы, удаляет control characters, query/user-info, header-like
-credentials и account-like text. Cookie session также не предоставляет свои
-данные diagnostics.
-
-Failure-only formatter paths не расширяют доступ к collection commands:
-FolderSync key, primary collection ID, collection SyncKey и payload команд
-`FolderSync`/`Sync` остаются исключёнными. Calendar application command kind
-ограничен enum `add`/`change`; provider detail использует только перечисленные
-operation kinds и column policies.
-
-## Сбор через ADB
-
-Подключите Android 16 device и убедитесь, что оно видно:
-
-```shell
-adb devices -l
-```
-
-Чтобы получить чистый воспроизводимый фрагмент, очистите текущие системные log
-buffers непосредственно перед сценарием:
-
-```shell
-adb logcat -c
-```
-
-Для наблюдения в реальном времени запустите фильтр, затем воспроизведите ошибку:
-
-```shell
-adb logcat -v threadtime -s 'ExchangeSync:V' '*:S'
-```
-
-Для однократного чтения уже удерживаемых записей используйте:
-
-```shell
-adb logcat -d -v threadtime -s 'ExchangeSync:V' '*:S'
-```
-
-`-c` очищает общий Logcat buffer устройства, поэтому не запускайте эту команду,
-если нужны ранее накопленные записи других приложений. Фильтр по tag намеренно
-не привязан к PID: так в одном сборе остаются события до и после recreation
-процесса. После сбора проверьте корреляцию и отсутствие всех данных из списка
-выше, прежде чем передавать лог другому человеку.

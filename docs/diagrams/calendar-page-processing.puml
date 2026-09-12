@@ -1,144 +1,81 @@
 @startuml
-title Обработка одной страницы календаря и commit checkpoint
-
+title Страница и commit checkpoint
 skinparam shadowing false
+skinparam backgroundColor white
 skinparam activity {
   BackgroundColor #FFF6DA
-  BorderColor #8A6D1D
   DiamondBackgroundColor #E8F3FF
-  DiamondBorderColor #386A99
 }
-
 start
-
-partition "ExecuteSynchronizationSlice (:core)" {
-  :Загрузить SyncState и профиль;
-  if (enabled и fence\ngeneration/runToken актуален?) then (да)
-    :Проверить READ/WRITE_CALENDAR;
-  else (нет)
-    :Obsolete — без side effects;
-    stop
-  endif
-}
-
-partition "ActiveSync remote adapter (:infrastructure)" {
-  :Подготовить capability и primary folder\n(OPTIONS / FolderSync при необходимости);
-  :POST Sync с текущими SyncKey и window;
-  :Прочитать bounded HTTP body\nдо выделения полного массива;
-  :WbxmlCodec.decode с limits;
-  :ActiveSyncCalendarApplicationParser.parse;
-  :Сформировать RemoteCalendarPage\nchanges + nextCheckpoints + MoreAvailable;
-}
-
-if (RemoteCalendarPage получена?) then (да)
-  :Передать page в core execution slice;
-else (typed failure)
-  if (TRANSIENT?) then (да)
-    :phase = QUEUED, attempts++;
-    :Worker Result.retry()\nс exponential backoff;
-    stop
-  else (нет)
-    if (page-scaled capacity\nи window > 1?) then (да)
-      :Уменьшить window вдвое;
-      :Оставить прежний SyncKey;
-      :Enqueue continuation той же page;
-      stop
-    else (нет)
-      if (invalid key / full reset?) then (да)
-        :Fenced cleanup owned calendar;
-        :Сбросить checkpoints;
-        :Enqueue continuation полного sync;
-        stop
-      else (critical или minimum window)
-        :BLOCKED: safe problem;
-        :Checkpoint не продвигается;
-        stop
-      endif
-    endif
-  endif
+if (Синхронизация включена\nи fence актуален?) then (да)
+else (нет)
+  :Obsolete; без side effects;
+  stop
 endif
-
-partition "Owned calendar adapter (:infrastructure)" {
-  :phase = APPLYING;
-  :Взять общий SynchronizationMutationLock\nна всю page;
-
-  if (fence всё ещё актуален?) then (да)
-    :resolveOwned(profile.email);
-    :queryExisting только по ServerId\nв owned calendar;
-    :CalendarPagePlanner + CalendarEventMapper;
-    :CalendarProviderBatchPlanner\nсоздаёт canonical ordered plan;
+if (Есть READ/WRITE_CALENDAR?) then (да)
+else (нет)
+  :BLOCKED: CALENDAR_PERMISSION;\nбез сети и записи календаря;
+  stop
+endif
+partition "Remote adapter" {
+  :Capabilities + основная папка;
+  :Sync -> bounded HTTP -> WBXML -> page;
+}
+if (Страница получена?) then (да)
+else (typed failure)
+  :Новый SyncKey не сохраняется;\nretry / меньшее window /\nfenced full reset / BLOCKED\nпо категории ошибки;
+  stop
+endif
+partition "Calendar Provider: mutation lock на всю page" {
+  if (Fence всё ещё актуален?) then (да)
   else (нет)
-    :Obsolete — provider не вызывается;
+    :Освободить lock; Obsolete;\nProvider не вызывается;
     stop
   endif
-
-  if (нужен full reset из-за\ndirty/missing mirror?) then (да)
-    :LocalPageOutcome.FullResetRequired;
-    :Checkpoint не продвигается;
-    :Fenced cleanup + continuation;
+  :resolveOwned; прочитать owned snapshots;
+  if (Обнаружен разрыв зеркала?) then (да)
+    :Освободить lock; FullResetRequired;\nстраница не применяется;\nfenced full reset вместо commit страницы;
     stop
-  else (нет)
-    :Продолжить применение provider plan;
   endif
-
-  while (Есть следующий sub-batch\nне более 50 операций?) is (да)
-    :Проверить coroutine cancellation;
-    if (fence актуален?) then (да)
-      :ContentResolver.applyBatch\nодна атомарная provider transaction;
+  :Построить и проверить полный ordered plan;
+  if (План корректен?) then (да)
+  else (нет)
+    :Освободить lock; BLOCKED;\nбез applyBatch и commit страницы;
+    stop
+  endif
+  while (Остался sub-batch?) is (да)
+    :Проверить cancellation и fence;
+    if (Работа актуальна?) then (да)
+      :applyBatch: не более 50 операций;
     else (нет)
-      :Obsolete — следующий sub-batch\nне начинается;
+      :Освободить lock; Obsolete;\ncheckpoint не продвигается;
       stop
     endif
-
-    if (provider call подтверждён?) then (да)
-      :Запомнить insert row IDs;
-      :Переписать cross-batch references\nдля следующего sub-batch;
-    else (нет / ambiguous)
-      note right
-        Подтверждённый префикс page может остаться видимым,
-        но повтор той же page идемпотентен по ServerId.
-      end note
-      if (transaction too large\nи window > 1?) then (да)
-        :Уменьшить window и enqueue continuation;
-      else (нет)
-        :BLOCKED: CALENDAR_PROVIDER;
-      endif
-      :Checkpoint и новый SyncKey не сохраняются;
+    if (Вызов подтверждён?) then (да)
+      :Запомнить row IDs и confirmed prefix;
+    else (ошибка / unknown)
+      :Освободить lock;\ncheckpoint остаётся прежним;
+      :Capacity -> меньшее window / minimum block;\nиначе -> BLOCKED;
       stop
     endif
   endwhile (нет)
-
-  :Освободить mutation lock;
-  :LocalPageOutcome.Applied;
+  :Освободить lock;
 }
-
-partition "Durable checkpoint commit (:core + DataStore)" {
-  if (fence всё ещё актуален?) then (да)
-    :Одна state update сохраняет\npage.nextCheckpoints, включая новый SyncKey;
-    note right
-      Commit выполняется только после успеха
-      всех provider sub-batches страницы.
-    end note
+partition "Durable state" {
+  if (Fence актуален?) then (да)
+    :Commit next checkpoints, включая SyncKey;
   else (нет)
-    :Obsolete — checkpoint пропущен;
+    :Obsolete; commit пропущен;
     stop
   endif
-
-  if (MoreAvailable?) then (да)
-    if (slice limits достигнуты?) then (да)
-      :phase = QUEUED;
-      :Enqueue continuation\nс тем же generation/runToken;
-      stop
-    else (нет)
-      :Эта page завершена; перейти к следующей\nитерации текущего bounded slice;
-      stop
-    endif
-  else (нет)
-    :phase = IDLE\nили QUEUED при followUpRequested;
-    :Сохранить last successful time;
-  endif
+  :MoreAvailable -> следующая page / continuation;\nиначе -> last success, IDLE или follow-up;
 }
-
 stop
-
+legend bottom
+До applyBatch: remote/validation failure не продвигает checkpoint.
+Разрыв зеркала / invalid key -> fenced full reset.
+Сетевые retries и лимиты описаны в таблицах рядом.
+Ошибка позднего sub-batch может оставить видимый префикс;
+повтор страницы идемпотентен по ServerId.
+endlegend
 @enduml

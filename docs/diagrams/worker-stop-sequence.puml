@@ -1,0 +1,49 @@
+@startuml
+title Отмена, отключение и повтор очистки
+skinparam shadowing false
+skinparam backgroundColor white
+skinparam sequenceMessageAlign center
+autonumber
+actor "UI / startup / permission recovery" as Trigger
+control Lifecycle
+database SyncState
+queue WorkManager
+participant "Owned calendar" as Calendar
+
+group Cancel активного запуска
+  Trigger -> Lifecycle : cancel
+  Lifecycle -> SyncState : под mutation lock: run token++, CANCELLING
+  Lifecycle -> WorkManager : cancel unique execution
+  Lifecycle -> SyncState : IDLE
+  note over SyncState, Calendar
+  Committed checkpoint и зеркало сохраняются.
+  Periodic work остаётся.
+  end note
+end
+
+group Disable
+  Trigger -> Lifecycle : disable
+  Lifecycle -> SyncState : под mutation lock: invalidate,\nDISABLED + checkpoints EMPTY
+  Lifecycle -> WorkManager : cancel execution + periodic
+  Lifecycle -> Calendar : deleteOwnedCalendar(disabled fence)
+  alt cleanup успешен
+    Lifecycle -> SyncState : очистить pending cleanup
+  else permission / provider failure
+    Lifecycle -> SyncState : pending cleanup + actionable problem
+  end
+end
+
+group Повтор pending cleanup
+  Trigger -> Lifecycle : user retry / startup / permission recovery
+  Lifecycle -> Calendar : идемпотентный cleanup
+  alt успех
+    Lifecycle -> SyncState : очистить pending cleanup и проблему
+  else ошибка
+    Lifecycle -> SyncState : сохранить cleanup intent и проблему
+  end
+  note over Lifecycle, WorkManager
+  Состояние остаётся DISABLED, профиль сохранён.
+  Сеть и schedules не включаются.
+  end note
+end
+@enduml

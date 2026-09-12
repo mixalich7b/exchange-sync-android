@@ -1,137 +1,89 @@
 @startuml
-title Запуск, продолжение и остановка background workers
-
+title Как выполняется фоновая синхронизация
 skinparam shadowing false
+skinparam backgroundColor white
 skinparam sequenceMessageAlign center
-skinparam responseMessageBelowArrow true
-autonumber
+skinparam ParticipantPadding 15
+skinparam maxMessageSize 180
+hide footbox
 
-actor Пользователь as User
-boundary SettingsViewModel as ViewModel
-control SynchronizationLifecycle as Lifecycle
-control RequestSynchronizationNow as ManualRequest
-control RequestPeriodicSynchronization as PeriodicRequest
-database "SyncStateRepository" as State
-control WorkManagerSyncScheduler as Scheduler
-queue WorkManager as WorkManager
-control PeriodicSyncTriggerWorker as PeriodicWorker
-control SynchronizationExecutionWorker as ExecutionWorker
-control ExecuteSynchronizationSlice as Slice
-control RemoteCalendarPort as Remote
-control OwnedCalendarPort as Local
+actor "Пользователь /\nрасписание" as Trigger
+control "Координатор\nзапусков" as Core
+database "Сохранённое\nсостояние" as State
+queue "Фоновая работа\nWorkManager" as Work
+participant "Обработка страницы\nExchange → Android" as Calendar
 
-group Profile activation / Enable
-  User -> ViewModel : Save profile / Enable
-  ViewModel -> Lifecycle : activateProfile(profile) через SaveConnection\n/ enable()
-  Lifecycle -> State : new generation + runToken\nphase = QUEUED
-  Lifecycle -> Local : deleteOwnedCalendar(fence)\nпосле permission check
-  Local --> Lifecycle : Completed
-  Lifecycle -> Scheduler : schedulePeriodic(generation)
-  Scheduler -> WorkManager : enqueueUniquePeriodicWork(UPDATE)\nnetwork, interval = 15 min
-  Lifecycle -> Scheduler : enqueueExecution(generation, runToken)
-  Scheduler -> WorkManager : enqueueUniqueWork(REPLACE)\nnetwork + exponential backoff
-end
-
-group Manual trigger
-  User -> ViewModel : Sync Now
-  ViewModel -> ManualRequest : execute()
-  ManualRequest -> State : requestRun(MANUAL)
-  alt IDLE / BLOCKED → Queued
-    State --> ManualRequest : runToken++, phase = QUEUED
-    ManualRequest -> Scheduler : enqueueExecution(generation, runToken)
-    Scheduler -> WorkManager : unique execution (REPLACE)
-  else уже QUEUED / running / CANCELLING
-    State --> ManualRequest : Coalesced\nfollowUpRequested = true
-  else DISABLED
-    State --> ManualRequest : Ignored
+group 1а. Активировать профиль / включить синхронизацию
+  Trigger -> Core : сохранить новый/изменённый профиль\nпосле проверки / включить
+  Core -> State : новая generation и run token;\nQUEUED, сброс checkpoints
+  Core -> Work : отменить прежнюю execution и periodic work
+  Core -> Calendar : проверить permissions и fence;\nочистить календарь приложения
+  alt очистка успешна, поколение актуально
+    Core -> Work : periodic: UPDATE;\nexecution: REPLACE
+    Work --> Core : подтвердить постановку
+  else проблема permissions / cleanup / scheduling
+    Core -> State : BLOCKED + проблема;\ncommit профиля не откатывается
   end
 end
 
-group Periodic trigger
-  WorkManager -> PeriodicWorker : doWork(generation)
-  PeriodicWorker -> PeriodicRequest : execute(expectedGeneration)
-  PeriodicRequest -> State : проверить generation и eligibility
-  alt generation актуальна и запуск разрешён
-    State --> PeriodicRequest : Queued
-    PeriodicRequest -> Scheduler : enqueueExecution(generation, runToken)
-    Scheduler -> WorkManager : unique execution (REPLACE)
-  else устаревшая generation или persistent BLOCKED
-    State --> PeriodicRequest : Ignored
+note over Trigger, State
+Save неизменённого профиля не активирует sync.
+Новый профиль заменяет прежний запуск, даже если тот ещё работает.
+Граница проверки и commit — на схеме подключения.
+end note
+
+group 1б. Запросить обычный запуск
+  Trigger -> Core : запустить сейчас / очередной период
+  Core -> State : проверить, можно ли запустить
+  alt запуск разрешён
+    State --> Core : run token++; «Ожидает запуска»
+    Core -> Work : execution: REPLACE
+    Work --> Core : подтвердить постановку
+  else работа уже идёт
+    State --> Core : запомнить одну повторную проверку
+  else запуск недопустим
+    State --> Core : не запускать
   end
-  PeriodicWorker --> WorkManager : Result.success()
 end
 
-group Unique execution chain
-  WorkManager -> ExecutionWorker : doWork(generation, runToken)
-  ExecutionWorker -> Slice : execute(SyncFence)
-  Slice -> State : проверить enabled + generation/runToken
-
-  alt fence устарел
-    State --> Slice : Obsolete
-    Slice --> ExecutionWorker : Obsolete
-    ExecutionWorker --> WorkManager : Result.success()
-  else fence актуален
-    loop успешные pages: не более 10 и 4 минут
-      Slice -> Remote : fetchPage(...)
-      Remote --> Slice : RemoteCalendarPage
-      Slice -> Local : applyPage(fence, page)
-      Local --> Slice : Applied / failure
-      Slice -> State : commit next checkpoints\nтолько после полного apply
-    end
-
-    alt terminal page и нет follow-up
-      Slice -> State : phase = IDLE, last success
-      Slice --> ExecutionWorker : Completed
-      ExecutionWorker --> WorkManager : Result.success()
-    else MoreAvailable / slice limit / recoverable reset
-      Slice -> State : phase = QUEUED
-      Slice -> Scheduler : enqueueContinuation(generation, runToken)
-      Scheduler -> WorkManager : unique execution (APPEND_OR_REPLACE)
-      Slice --> ExecutionWorker : Continued
-      ExecutionWorker --> WorkManager : Result.success()
-    else transient failure, attempt < 5
-      Slice -> State : phase = QUEUED, attempts++
-      Slice --> ExecutionWorker : Retry
-      ExecutionWorker --> WorkManager : Result.retry()
-      note right of WorkManager
-        Exponential backoff начинается с 30 секунд.
-        Тот же unique work получает тот же fence.
-      end note
-    else persistent problem / attempts = 5
-      Slice -> State : phase = BLOCKED + safe problem
-      Slice --> ExecutionWorker : Blocked
-      ExecutionWorker --> WorkManager : Result.success()
+group 2. Выполнить задачу, когда Android её запустит
+  Work -> State : проверить актуальность запуска
+  break запуск отменён или заменён
+    Work -> Work : Obsolete -> Result.success();\nбез новых действий
+  end
+  loop до конца данных, ошибки или лимита участка
+    Work -> Calendar : получить страницу и записать в календарь
+    alt страница полностью записана
+      Calendar --> Work : успех
+      Work -> State : сохранить позицию синхронизации\n(checkpoint), если запуск актуален
+      Work -> Work : если есть ещё страницы:\nдостигнуты 10 страниц или 4 минуты?
+    else ошибка
+      Calendar --> Work : причина сбоя
+      Work -> Work : checkpoint страницы не продвигать;\nвыйти из цикла страниц
     end
   end
 end
 
-group Cooperative Cancel
-  User -> ViewModel : Cancel
-  ViewModel -> Lifecycle : cancel()
-  Lifecycle -> State : под mutation lock:\nrunToken++, phase = CANCELLING
-  Lifecycle -> Scheduler : cancelExecution()
-  Scheduler -> WorkManager : cancelUniqueWork(execution)
-  Lifecycle -> State : phase = IDLE
-  note over State, Local
-    Committed calendar и checkpoints сохраняются.
-    Старый worker теряет fence и не начинает новый side effect.
-  end note
-end
-
-group Disable
-  User -> ViewModel : Disable
-  ViewModel -> Lifecycle : disable()
-  Lifecycle -> State : под mutation lock:\nenabled = false, generation++, runToken++\nphase = DISABLED, checkpoints = EMPTY
-  Lifecycle -> Scheduler : cancelAll()
-  Scheduler -> WorkManager : cancel unique execution + periodic work
-  Lifecycle -> Local : deleteOwnedCalendar(disabled fence)
-  alt cleanup failed / permission missing
-    Local --> Lifecycle : Failed
-    Lifecycle -> State : calendarCleanupPending + problem
-  else cleanup completed
-    Local --> Lifecycle : Completed
-    Lifecycle -> State : calendarCleanupPending = false
+group 3. Завершить или продолжить
+  alt всё получено, повторная проверка не запрошена
+    Work -> State : «Готова к запуску» + время успеха
+    Work -> Work : Completed -> Result.success()
+  else MoreAvailable / follow-up / восстановление
+    Work -> State : «Ожидает запуска»
+    Work -> Work : continuation: APPEND_OR_REPLACE;\nтот же generation/run token\nContinued -> Result.success()
+  else временный сбой, попыток меньше пяти
+    Work -> State : «Ожидает запуска»; attempts++
+    Work -> Work : Retry -> Result.retry(); та же задача,\nexponential backoff от 30 секунд
+  else постоянная ошибка / пятый временный сбой
+    Work -> State : «Требует внимания» + проблема
+    Work -> Work : Blocked -> Result.success();\nбез автоматического backoff
   end
 end
 
+legend bottom
+Перед новыми запросами и записью проверяется актуальность запуска.
+Лимиты проверяются после успешной страницы, а не по жёсткому таймеру.
+Новая задача продолжения сохраняет generation/run token.
+Повторы, уменьшение окна и полный сброс описаны в таблице ошибок.
+endlegend
 @enduml
