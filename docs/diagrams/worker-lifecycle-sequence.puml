@@ -13,12 +13,31 @@ database "Сохранённое\nсостояние" as State
 queue "Фоновая работа\nWorkManager" as Work
 participant "Обработка страницы\nExchange → Android" as Calendar
 
-group 1. Запросить запуск
-  Trigger -> Core : сохранить профиль / включить /\nзапустить сейчас / очередной период
+group 1а. Активировать профиль / включить синхронизацию
+  Trigger -> Core : сохранить новый/изменённый профиль\nпосле проверки / включить
+  Core -> State : новая generation и run token;\nQUEUED, сброс checkpoints
+  Core -> Work : отменить прежнюю execution и periodic work
+  Core -> Calendar : проверить permissions и fence;\nочистить календарь приложения
+  alt очистка успешна, поколение актуально
+    Core -> Work : periodic: UPDATE;\nexecution: REPLACE
+    Work --> Core : подтвердить постановку
+  else проблема permissions / cleanup / scheduling
+    Core -> State : BLOCKED + проблема;\ncommit профиля не откатывается
+  end
+end
+
+note over Trigger, State
+Save неизменённого профиля не активирует sync.
+Новый профиль заменяет прежний запуск, даже если тот ещё работает.
+Граница проверки и commit — на схеме подключения.
+end note
+
+group 1б. Запросить обычный запуск
+  Trigger -> Core : запустить сейчас / очередной период
   Core -> State : проверить, можно ли запустить
   alt запуск разрешён
-    State --> Core : сохранить «Ожидает запуска»
-    Core -> Work : поставить единственную задачу
+    State --> Core : run token++; «Ожидает запуска»
+    Core -> Work : execution: REPLACE
     Work --> Core : подтвердить постановку
   else работа уже идёт
     State --> Core : запомнить одну повторную проверку
@@ -27,16 +46,10 @@ group 1. Запросить запуск
   end
 end
 
-note over Core, Work
-При новом профиле или включении:
-сначала очистить календарь приложения,
-затем настроить запуск и периодическую задачу.
-end note
-
 group 2. Выполнить задачу, когда Android её запустит
   Work -> State : проверить актуальность запуска
   break запуск отменён или заменён
-    Work -> Work : завершить без новых действий
+    Work -> Work : Obsolete -> Result.success();\nбез новых действий
   end
   loop до конца данных, ошибки или лимита участка
     Work -> Calendar : получить страницу и записать в календарь
@@ -54,11 +67,16 @@ end
 group 3. Завершить или продолжить
   alt всё получено, повторная проверка не запрошена
     Work -> State : «Готова к запуску» + время успеха
-  else осталось продолжение
+    Work -> Work : Completed -> Result.success()
+  else MoreAvailable / follow-up / восстановление
     Work -> State : «Ожидает запуска»
-    Work -> Work : поставить следующую задачу\nс тем же номером запуска
-  else ошибка
-    Work -> State : возможен повтор / восстановление:\n«Ожидает запуска»; иначе — «Требует внимания»
+    Work -> Work : continuation: APPEND_OR_REPLACE;\nтот же generation/run token\nContinued -> Result.success()
+  else временный сбой, попыток меньше пяти
+    Work -> State : «Ожидает запуска»; attempts++
+    Work -> Work : Retry -> Result.retry(); та же задача,\nexponential backoff от 30 секунд
+  else постоянная ошибка / пятый временный сбой
+    Work -> State : «Требует внимания» + проблема
+    Work -> Work : Blocked -> Result.success();\nбез автоматического backoff
   end
 end
 

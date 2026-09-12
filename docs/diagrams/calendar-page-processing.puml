@@ -7,14 +7,42 @@ skinparam activity {
   DiamondBackgroundColor #E8F3FF
 }
 start
-:Проверить enabled, fence и permissions;
+if (Синхронизация включена\nи fence актуален?) then (да)
+else (нет)
+  :Obsolete; без side effects;
+  stop
+endif
+if (Есть READ/WRITE_CALENDAR?) then (да)
+else (нет)
+  :BLOCKED: CALENDAR_PERMISSION;\nбез сети и записи календаря;
+  stop
+endif
 partition "Remote adapter" {
   :Capabilities + основная папка;
   :Sync -> bounded HTTP -> WBXML -> page;
 }
+if (Страница получена?) then (да)
+else (typed failure)
+  :Новый SyncKey не сохраняется;\nretry / меньшее window /\nfenced full reset / BLOCKED\nпо категории ошибки;
+  stop
+endif
 partition "Calendar Provider: mutation lock на всю page" {
-  :Проверить fence; resolveOwned; clean snapshots;
+  if (Fence всё ещё актуален?) then (да)
+  else (нет)
+    :Освободить lock; Obsolete;\nProvider не вызывается;
+    stop
+  endif
+  :resolveOwned; прочитать owned snapshots;
+  if (Обнаружен разрыв зеркала?) then (да)
+    :Освободить lock; FullResetRequired;\nстраница не применяется;\nfenced full reset вместо commit страницы;
+    stop
+  endif
   :Построить и проверить полный ordered plan;
+  if (План корректен?) then (да)
+  else (нет)
+    :Освободить lock; BLOCKED;\nбез applyBatch и commit страницы;
+    stop
+  endif
   while (Остался sub-batch?) is (да)
     :Проверить cancellation и fence;
     if (Работа актуальна?) then (да)

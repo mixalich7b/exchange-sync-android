@@ -186,6 +186,37 @@ WorkManager поддерживает одну `unique periodic work` и одну
 (`durable enqueue`); после пересоздания процесса сверяет сохранённое состояние
 с необходимыми задачами (`reconciliation`).
 
+### Политики WorkManager
+
+Периодический `PeriodicSyncTriggerWorker` только проверяет generation и условия
+запуска и запрашивает execution work. Получение и запись страниц выполняются
+в `SynchronizationExecutionWorker` через core execution slice.
+
+| Операция scheduler | Политика unique work | Назначение |
+|---|---|---|
+| Настроить periodic work | `ExistingPeriodicWorkPolicy.UPDATE` | Обновить единственное расписание для generation; интервал 15 минут |
+| Начать новый запуск | `ExistingWorkPolicy.REPLACE` | Заменить прежнюю execution chain работой с новым fence |
+| Восстановить execution work после перезапуска процесса | `ExistingWorkPolicy.KEEP` | Создать работу, если её нет; сохранить уже поставленную |
+| Продолжить текущий запуск | `ExistingWorkPolicy.APPEND_OR_REPLACE` | Добавить continuation в execution chain с теми же generation/run token |
+
+Все эти задачи требуют сети. Новый или изменённый профиль создаёт новое
+поколение, отменяет прежние задачи и очищает календарь перед постановкой работы.
+Он не объединяется с текущим запуском через `followUpRequested`: объединение
+относится к обычным ручным и периодическим запросам.
+
+| Результат core slice | Результат execution worker | Что произойдёт дальше |
+|---|---|---|
+| `Retry` | `Result.retry()` | WorkManager повторяет ту же задачу с тем же fence и exponential backoff от 30 секунд |
+| `Continued` | `Result.success()` | Отдельная continuation уже поставлена через `APPEND_OR_REPLACE` |
+| `Completed` | `Result.success()` | Текущая работа завершена |
+| `Blocked`, `PermissionRequired` | `Result.success()` | Проблема сохранена в sync state; автоматический backoff не запускается |
+| `Obsolete`, `Cancelled` | `Result.success()` | Для этого запуска продолжение не требуется |
+
+`Result.success()` означает завершение задачи WorkManager, а не обязательно
+успешную синхронизацию. Её результат определяется сохранённым sync state.
+Отмена coroutine со стороны WorkManager пробрасывается как cancellation,
+а не преобразуется в результат `Cancelled` из таблицы.
+
 Работа не привязана к Activity, Compose или ViewModel и не использует
 foreground service. Из итогового manifest явно удалены добавляемые WorkManager
 `SystemForegroundService` и `FOREGROUND_SERVICE`.
